@@ -4,6 +4,9 @@ FROM pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime
 # Set a working directory
 WORKDIR /app
 
+# Copy source code into the container
+COPY . /app
+
 # Install system dependencies needed for PyQt5 and Selenium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
@@ -12,13 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source code into the container
-COPY . /app
-
-RUN pip install --no-cache-dir -e .
-
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+ENV PYTHONPATH=/app
 
 # Expose the LangGraph API port
 EXPOSE 2024
