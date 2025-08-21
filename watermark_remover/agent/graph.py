@@ -1,4 +1,4 @@
-"""
+﻿"""
 Graph definition for orchestrating the Watermark Remover pipeline.
 
 This module builds a simple linear workflow using LangGraph's

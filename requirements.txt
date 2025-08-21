@@ -10,3 +10,4 @@ reportlab
 langchain
 langchain-ollama
 langgraph
+langgraph-cli[inmem]
