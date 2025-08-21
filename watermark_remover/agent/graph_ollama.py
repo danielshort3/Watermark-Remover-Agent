@@ -41,7 +41,9 @@ import urllib.request
 import logging
 
 from langchain_core.messages import BaseMessage, HumanMessage
-from langgraph.schema import RunnableConfig
+# We avoid importing RunnableConfig from langgraph.schema because that module may not
+# be available in all LangGraph installations.  Instead, we accept any mapping
+# type for the config argument in the input loader.
 
 class WMState(TypedDict, total=False):
     """State type for the LLM graph.
@@ -194,7 +196,7 @@ def agent_node(state: WMState) -> WMState:
 # that fields like ``instruction``, ``input_dir`` or ``output_pdf`` are
 # accessible regardless of how the API structures the incoming state.
 
-def input_loader_node(state: WMState, config: Optional[RunnableConfig] = None) -> WMState:
+def input_loader_node(state: WMState, config: Optional[Dict[str, Any]] = None) -> WMState:
     """Normalize incoming inputs into chat messages and structured params.
 
     When using LangGraph via the Assistants API or Studio, the initial
@@ -212,10 +214,11 @@ def input_loader_node(state: WMState, config: Optional[RunnableConfig] = None) -
     state : WMState
         Current graph state.  May contain a ``__start__`` mapping with user
         inputs or previously assembled ``messages``/``params``.
-    config : RunnableConfig, optional
+    config : dict, optional
         The runnable configuration provided by LangGraph.  Values under
-        ``config.configurable.values`` are merged with the ``__start__``
-        payload to extract additional parameters when present.
+        ``config['configurable']['values']`` (if present) are merged with
+        the ``__start__`` payload to extract additional parameters when
+        present.
 
     Returns
     -------
@@ -227,16 +230,22 @@ def input_loader_node(state: WMState, config: Optional[RunnableConfig] = None) -
     # return an empty update to leave the state unchanged.
     if state.get("messages"):
         return {}
-    # Gather potential inputs from the reserved __start__ key
+    # Gather potential inputs from three sources:
+    # 1) The reserved ``__start__`` key when using the Assistants API.
+    # 2) The ``values`` key used by the LangGraph SDK when calling runs directly.
+    # 3) The ``config['configurable']['values']`` mapping provided via runnable config.
     start_payload: Dict[str, Any] = {}
     start_raw = state.get("__start__")
     if isinstance(start_raw, dict):
         start_payload = dict(start_raw)
-    # Additionally merge in values from config.configurable.values when present.
+    values_payload: Dict[str, Any] = {}
+    values_raw = state.get("values")
+    if isinstance(values_raw, dict):
+        values_payload = dict(values_raw)
     cfg_values: Dict[str, Any] = {}
     try:
         if config and isinstance(config, dict):  # type: ignore[redundant-expr]
-            # RunnableConfig is a Mapping; get nested values defensively
+            # The configuration is treated as a generic mapping; get nested values defensively
             cfg = config.get("configurable", {})  # type: ignore[index]
             if isinstance(cfg, dict):
                 vals = cfg.get("values", {})  # type: ignore[index]
@@ -246,7 +255,7 @@ def input_loader_node(state: WMState, config: Optional[RunnableConfig] = None) -
         # Ignore malformed config
         cfg_values = {}
     # Combine the two dicts, giving precedence to __start__ over config values
-    merged: Dict[str, Any] = {**cfg_values, **start_payload}
+    merged: Dict[str, Any] = {**cfg_values, **start_payload, **values_payload}
     if not merged:
         # Nothing to do
         return {}
