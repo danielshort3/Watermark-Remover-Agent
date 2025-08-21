@@ -226,10 +226,18 @@ def input_loader_node(state: WMState, config: Optional[Dict[str, Any]] = None) -
         A partial state update containing new ``messages`` and/or ``params``
         keys.  If no new inputs are found, an empty dict is returned.
     """
-    # If messages already exist, assume they've been populated correctly and
-    # return an empty update to leave the state unchanged.
+    # Always start by preserving any existing chat messages or params.  In
+    # LangGraph 0.3.x the default state reducer replaces the entire state
+    # with the dict returned by this node.  If we returned an empty dict
+    # here, ``messages`` and ``params`` would be lost.  Instead, copy them
+    # into the update so that downstream nodes continue to see them.
+    update: WMState = {}
     if state.get("messages"):
-        return {}
+        # Preserve existing messages
+        update["messages"] = list(state.get("messages", []))
+    if state.get("params"):
+        # Preserve existing structured parameters
+        update["params"] = dict(state.get("params", {}))  # type: ignore[dict-assign]
     # Gather potential inputs from three sources:
     # 1) The reserved ``__start__`` key when using the Assistants API.
     # 2) The ``values`` key used by the LangGraph SDK when calling runs directly.
@@ -257,20 +265,18 @@ def input_loader_node(state: WMState, config: Optional[Dict[str, Any]] = None) -
     # Combine the two dicts, giving precedence to __start__ over config values
     merged: Dict[str, Any] = {**cfg_values, **start_payload, **values_payload}
     if not merged:
-        # Nothing to do
-        return {}
+        # Nothing else to merge; return the preserved update (messages/params)
+        return update
     # Extract the natural-language prompt.  Accept both 'instruction' and
     # 'prompt' for backwards compatibility.
     instruction = merged.pop("instruction", None) or merged.pop("prompt", None)
-    update: WMState = {}
     if instruction:
+        # Override any existing messages with the new instruction
         update["messages"] = [HumanMessage(content=str(instruction))]
     # The remainder of the merged dict are structured parameters
     if merged:
-        # Initialise params with existing values if present
-        current_params: Dict[str, Any] = {}
-        if isinstance(state.get("params"), dict):
-            current_params = dict(state["params"])  # type: ignore[index]
+        # Start with any preserved params from the update
+        current_params: Dict[str, Any] = dict(update.get("params", {}))  # type: ignore[dict-assign]
         # Only add keys that aren't already present in params
         for k, v in merged.items():
             current_params.setdefault(k, v)
