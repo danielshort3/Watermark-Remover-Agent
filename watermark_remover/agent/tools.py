@@ -1,35 +1,35 @@
 """
-Tool definitions for the Watermark Remover agents.
+    Tool definitions for the Watermark Remover agents.
 
-Each function in this module is decorated with the
-``langchain.agents.tool`` decorator so that it can be invoked by
-LangChain agents.  The tools provide an abstraction over the core
-functionalities of the Watermark Remover project:
+    Each function in this module is decorated with the
+    ``langchain.agents.tool`` decorator so that it can be invoked by
+    LangChain agents.  The tools provide an abstraction over the core
+    functionalities of the Watermark Remover project:
 
-* ``scrape_music``: returns a directory containing sheet music images.
-  In this proof‑of‑concept implementation, no real scraping occurs; the
-  function merely returns a pre‑existing directory.  It is left as a
-  stub to be replaced with Selenium or API logic as needed.
+    * ``scrape_music``: returns a directory containing sheet music images.
+      In this proof‑of‑concept implementation, no real scraping occurs; the
+      function merely returns a pre‑existing directory.  It is left as a
+      stub to be replaced with Selenium or API logic as needed.
 
-* ``remove_watermark``: loads a UNet model and applies it to each
-  image found in the input directory, saving the watermark‑free
-  versions to a new directory.
+    * ``remove_watermark``: loads a UNet model and applies it to each
+      image found in the input directory, saving the watermark‑free
+      versions to a new directory.
 
-* ``upscale_images``: loads a VDSR model and applies it to each
-  image found in the input directory, saving the upscaled results to
-  a new directory.
+    * ``upscale_images``: loads a VDSR model and applies it to each
+      image found in the input directory, saving the upscaled results to
+      a new directory.
 
-* ``assemble_pdf``: collects all images from a directory and
-  assembles them into a multi‑page PDF.
+    * ``assemble_pdf``: collects all images from a directory and
+      assembles them into a multi‑page PDF.
 
-All tools return the path to the directory or file they produce.  If
-the specified model directory does not contain weights, the
-``load_best_model`` function silently fails and the model runs with
-randomly initialised weights; this keeps the example self‑contained
-and avoids bundling large model weights in the repository.  Users can
-populate the ``models/`` directories with their own trained
-checkpoints to achieve meaningful results.
-"""
+    All tools return the path to the directory or file they produce.  If
+    the specified model directory does not contain weights, the
+    ``load_best_model`` function silently fails and the model runs with
+    randomly initialised weights; this keeps the example self‑contained
+    and avoids bundling large model weights in the repository.  Users can
+    populate the ``models/`` directories with their own trained
+    checkpoints to achieve meaningful results.
+    """
 
 import os
 from typing import Optional
@@ -243,7 +243,8 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output.pdf") -> str:
         from reportlab.lib.pagesizes import letter  # type: ignore
     except ImportError as e:
         raise ImportError(
-            "reportlab is required for PDF assembly. Please install it via `pip install reportlab`."
+            "reportlab is required for PDF assembly. Please install it via \n"
+            "`pip install reportlab`."
         ) from e
 
     images = [

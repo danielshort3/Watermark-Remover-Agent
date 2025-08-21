@@ -1,13 +1,13 @@
 torch
-torchvision
-pillow
-pytorch_msssim
-PyQt5
-opencv-python
-selenium
-webdriver-manager
-reportlab
-langchain
-langchain-ollama
-langgraph
-langgraph-cli[inmem]
+    torchvision
+    pillow
+    pytorch_msssim
+    PyQt5
+    opencv-python
+    selenium
+    webdriver-manager
+    reportlab
+    langchain
+    langchain-ollama
+    langgraph
+    langgraph-cli[inmem]

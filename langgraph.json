@@ -1,6 +1,6 @@
 {
-  "dependencies": ["."],
-  "graphs": {
-    "agent": "./watermark_remover/agent/graph.py:graph"
-  }
-}
+      "dependencies": ["."],
+      "graphs": {
+        "agent": "./watermark_remover/agent/graph.py:graph"
+      }
+    }

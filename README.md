@@ -64,11 +64,19 @@ pip install langchain langgraph langchain-ollama
 
 ## Usage
 
-There are two ways to use this project:
+There are three primary ways to use this project:
 
 1. **GUI**: Launch the GUI by running the `sheet_music_pyqt5.ipynb` notebook.  Use the GUI to scrape sheet music from a specified website, run it through both the UNet and VDSR models, and compile the processed images into a PDF.  This interface remains unchanged from the original project.
 
-2. **Agentic pipeline**: Run `langgraph dev` in the repository root to start a local API server and open LangGraph Studio.  In Studio, select the `agent` assistant and provide a state with keys `title`, `instrument` and `key` to trigger the pipeline.  The tools defined in `watermark_remover/agent/tools.py` will execute sequentially, producing a PDF at the end.
+2. **Agentic pipeline via LangGraph**: Run `langgraph dev` in the repository root to start a local API server and open LangGraph Studio.  In Studio, select the `agent` assistant and provide a state with keys `title`, `instrument` and `key` to trigger the pipeline.  The tools defined in `watermark_remover/agent/tools.py` will execute sequentially, producing a PDF at the end.
+
+3. **Ollama‑powered chat agent**: If you have [Ollama](https://ollama.ai/) installed and have pulled a large language model such as `qwen3:30b`, you can interact with the pipeline through natural language.  First, start the Ollama server (e.g. by running `ollama serve`) and pull the desired model (`ollama pull qwen3:30b`).  Then run the interactive agent script:
+
+```bash
+python -m watermark_remover.agent.ollama_agent --model qwen3:30b
+```
+
+The script will connect to your local Ollama server, load the specified model and launch a simple REPL where you can type commands like "Remove watermarks from the images in `data/samples` and make a PDF."  The agent uses the model's reasoning capabilities to decide which tools to call and in what order, and will report back with the results.
 
 ## Project Structure
 

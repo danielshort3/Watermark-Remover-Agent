@@ -1,19 +1,19 @@
-﻿"""
-Graph definition for orchestrating the Watermark Remover pipeline.
-
-This module builds a simple linear workflow using LangGraph's
-``StateGraph``.  The graph contains four nodes: ``scraper``,
-``watermark_removal``, ``upscaler`` and ``assembler``.  Each node
-invokes a corresponding tool defined in ``tools.py`` and stores its
-output in the graph's mutable state.  The workflow proceeds from
-scraping to watermark removal to upscaling and finally PDF
-assembly.
-
-To visualise and interact with this graph using LangGraph Studio,
-run ``langgraph dev`` at the repository root.  The configuration in
-``langgraph.json`` points the CLI to the compiled graph defined
-here.
 """
+    Graph definition for orchestrating the Watermark Remover pipeline.
+
+    This module builds a simple linear workflow using LangGraph's
+    ``StateGraph``.  The graph contains four nodes: ``scraper``,
+    ``watermark_removal``, ``upscaler`` and ``assembler``.  Each node
+    invokes a corresponding tool defined in ``tools.py`` and stores its
+    output in the graph's mutable state.  The workflow proceeds from
+    scraping to watermark removal to upscaling and finally PDF
+    assembly.
+
+    To visualise and interact with this graph using LangGraph Studio,
+    run ``langgraph dev`` at the repository root.  The configuration in
+    ``langgraph.json`` points the CLI to the compiled graph defined
+    here.
+    """
 
 from __future__ import annotations
 
@@ -21,11 +21,14 @@ from typing import Any, Dict
 
 import os  # Needed for directory existence checks in scraper_node
 
-import os  # Needed for directory existence checks in scraper_node
-
 from langgraph.graph import StateGraph, START, END
 
-from watermark_remover.agent.tools import scrape_music, remove_watermark, upscale_images, assemble_pdf
+from watermark_remover.agent.tools import (
+    scrape_music,
+    remove_watermark,
+    upscale_images,
+    assemble_pdf,
+)
 
 
 class PipelineState(Dict[str, Any]):
@@ -38,6 +41,7 @@ class PipelineState(Dict[str, Any]):
     * ``title``: song title provided by the user.
     * ``instrument``: instrument name provided by the user.
     * ``key``: musical key provided by the user.
+    * ``input_dir``: optional path to the directory of images provided by the user.
     * ``download_path``: directory returned by the ``scrape_music`` tool.
     * ``processed_path``: directory returned by the ``remove_watermark`` tool.
     * ``upscaled_path``: directory returned by the ``upscale_images`` tool.
@@ -61,20 +65,23 @@ def scraper_node(state: PipelineState) -> PipelineState:
     title = state.get("title", "Unknown Title")
     instrument = state.get("instrument", "Unknown Instrument")
     key = state.get("key", "Unknown Key")
-    # Invoke the tool with structured input.  Provide the default
-    # input_dir explicitly; without it, the tool's default won't be
-    # applied when invoked via LangGraph.
+    # Determine which input directory to use.  If the user has provided
+    # an ``input_dir`` key in the state, use that; otherwise fall back to
+    # the default sample directory.  This allows callers to specify
+    # arbitrary image directories at runtime without modifying this code.
+    user_input_dir = state.get("input_dir", "data/samples")
     try:
         download_dir = scrape_music.invoke({
             "title": title,
             "instrument": instrument,
             "key": key,
-            "input_dir": "data/samples",
+            "input_dir": user_input_dir,
         })
     except Exception:
-        # In case of any error (e.g. directory missing), fallback to
-        # the default sample directory if it exists; otherwise set to None
-        download_dir = "data/samples" if os.path.isdir("data/samples") else None
+        # If scraping fails (e.g. directory missing), attempt to use the
+        # default sample directory if it exists.  Otherwise, leave as None.
+        fallback_dir = "data/samples"
+        download_dir = fallback_dir if os.path.isdir(fallback_dir) else None
     # Normalise return value to str if possible
     new_state["download_path"] = None
     if download_dir:
