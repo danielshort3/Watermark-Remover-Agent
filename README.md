@@ -30,7 +30,13 @@ A GUI built with PyQt5 is used to scrape sheet music from a specified website, r
 
 ## Agentic Workflow
 
-The `watermark_remover/agent` package contains a proof‑of‑concept multi‑agent workflow built with **LangChain** and **LangGraph**.  This workflow defines tools for scraping music, removing watermarks, upscaling images and assembling a PDF.  A `StateGraph` orchestrates these tools into a linear pipeline.  To run and visualise the workflow locally, install the dependencies listed below and run:
+The `watermark_remover/agent` package contains two agentic workflows built with **LangChain** and **LangGraph**:
+
+* **Sequential pipeline:** This graph defines tools for scraping music, removing watermarks, upscaling images and assembling a PDF and connects them in a fixed sequence.  It is exposed under the graph ID `agent` and can be visualised in Studio or invoked via the API.  Use this when you know the step order and simply want to run the pipeline.
+
+* **LLM‑driven pipeline:** A second graph (`agent_llm`) wraps a chat‑based agent powered by a local Ollama model.  You provide a natural‑language instruction under the `instruction` key of the graph's state (e.g. "Download sheet music for Fur Elise, remove the watermark and upscale it to a PDF").  The agent decides which tools to call and in what order to fulfil the request.  See below for details on running this graph.
+
+To run and visualise any of the graphs locally, install the dependencies listed below and run:
 
 ```bash
 pip install langgraph-cli[inmem]
@@ -68,9 +74,19 @@ There are three primary ways to use this project:
 
 1. **GUI**: Launch the GUI by running the `sheet_music_pyqt5.ipynb` notebook.  Use the GUI to scrape sheet music from a specified website, run it through both the UNet and VDSR models, and compile the processed images into a PDF.  This interface remains unchanged from the original project.
 
-2. **Agentic pipeline via LangGraph**: Run `langgraph dev` in the repository root to start a local API server and open LangGraph Studio.  In Studio, select the `agent` assistant and provide a state with keys `title`, `instrument` and `key` to trigger the pipeline.  The tools defined in `watermark_remover/agent/tools.py` will execute sequentially, producing a PDF at the end.
+2. **Sequential pipeline via LangGraph (`agent`)**: Run `langgraph dev` in the repository root to start a local API server and open LangGraph Studio.  In Studio, select the `agent` assistant and provide a state with keys `title`, `instrument`, `key` and (optionally) `input_dir` to trigger the pipeline.  The tools defined in `watermark_remover/agent/tools.py` will execute sequentially, producing a PDF at the end.
 
-3. **Ollama‑powered chat agent**: If you have [Ollama](https://ollama.ai/) installed and have pulled a large language model such as `qwen3:30b`, you can interact with the pipeline through natural language.  First, start the Ollama server (e.g. by running `ollama serve`) and pull the desired model (`ollama pull qwen3:30b`).  Then run the interactive agent script:
+3. **LLM‑driven pipeline via LangGraph (`agent_llm`)**: If you have [Ollama](https://ollama.ai/) installed and have pulled a large language model such as `qwen3:30b`, you can execute the entire pipeline by writing a single sentence.  Start the Ollama server (`ollama serve`) and pull the model (`ollama pull qwen3:30b`).  Then start the LangGraph API server with `langgraph dev` and, in Studio, select the graph ID `agent_llm`.  Provide a JSON payload like:
+
+```json
+{
+  "instruction": "Download sheet music for Fur Elise, remove the watermark, upscale it and save it as a PDF"
+}
+```
+
+The agent will parse your instruction and call the necessary tools automatically.  The final answer (success message or error) will be returned under the `result` key.
+
+4. **Ollama‑powered chat agent (CLI)**: You can also run the chat agent outside of LangGraph.  Start the Ollama server and pull your model, then run the interactive agent script:
 
 ```bash
 python -m watermark_remover.agent.ollama_agent --model qwen3:30b
