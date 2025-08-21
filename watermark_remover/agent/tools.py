@@ -32,6 +32,9 @@
     """
 
 import os
+import time
+import glob
+import logging
 from typing import Optional
 
 from langchain.agents import tool
@@ -58,6 +61,21 @@ except Exception as e:  # broad except to handle ImportError and others
     _import_error = e
 else:
     _import_error = None
+
+# Set up a module-level logger.  The log level can be controlled via the
+# LOG_LEVEL environment variable (e.g. export LOG_LEVEL=DEBUG).  If not set,
+# INFO is used by default.  Only configure the basicConfig once to avoid
+# interfering with parent application logging configuration.
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+try:
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+except Exception:
+    # basicConfig may have been called elsewhere; ignore errors
+    pass
+logger = logging.getLogger("wmra.tools")
 
 
 @tool
@@ -89,8 +107,21 @@ def scrape_music(title: str, instrument: str, key: str, input_dir: str = "data/s
     headless browser automation here and return a directory of
     downloaded images.
     """
+    start = time.perf_counter()
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
+    # Count how many images will be processed
+    imgs = [p for p in glob.glob(os.path.join(input_dir, "*")) if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
+    logger.info(
+        "SCRAPER: using directory '%s' (%d image file(s)) for title='%s', instrument='%s', key='%s'",
+        input_dir,
+        len(imgs),
+        title,
+        instrument,
+        key,
+    )
+    logger.debug("SCRAPER: sample files: %s", imgs[:5])
+    logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
     return input_dir
 
 
@@ -126,41 +157,47 @@ def remove_watermark(
     results but allows the pipeline to run end‑to‑end without
     bundling large model weights in the repository.
     """
+    start = time.perf_counter()
     if _import_error is not None:
         raise ImportError(
             f"Cannot import UNet and related utilities: {_import_error}. "
             "Ensure torch and watermark_remover dependencies are installed."
         )
-
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
-
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
     os.makedirs(output_dir, exist_ok=True)
-
+    # List images to process
+    images = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
+    if not images:
+        raise RuntimeError(f"WMR: no images found in {input_dir}")
     device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
     model = UNet().to(device)
-    # Attempt to load the best available checkpoint.  If none exist,
-    # ``load_best_model`` silently returns and the randomly initialised
-    # model will be used.
     try:
         load_best_model(model, model_dir)
     except Exception:
         # If model loading fails entirely, continue with random weights.
-        pass
+        logger.warning("WMR: failed to load checkpoints from %s; using random weights", model_dir)
     model.eval()
-
-    for fname in os.listdir(input_dir):
-        if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
-            continue
+    count = 0
+    for fname in images:
         in_path = os.path.join(input_dir, fname)
-        # Convert image to tensor and add batch dimension
         image_tensor = PIL_to_tensor(in_path).unsqueeze(0).to(device)
         with torch.no_grad():
             output = model(image_tensor)
-        # Remove batch dimension and convert back to PIL
         out_image = tensor_to_PIL(output.squeeze())
         out_image.save(os.path.join(output_dir, fname))
-
+        count += 1
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "WMR: processed %d image(s) from '%s' -> '%s' on %s in %.3fs",
+        count,
+        input_dir,
+        output_dir,
+        device,
+        elapsed,
+    )
     return output_dir
 
 
@@ -186,35 +223,45 @@ def upscale_images(
     str
         Path to the directory containing upscaled images.
     """
+    start = time.perf_counter()
     if _import_error is not None:
         raise ImportError(
             f"Cannot import VDSR and related utilities: {_import_error}. "
             "Ensure torch and watermark_remover dependencies are installed."
         )
-
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
-
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
     os.makedirs(output_dir, exist_ok=True)
-
+    images = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
+    if not images:
+        raise RuntimeError(f"VDSR: no images found in {input_dir}")
     device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
     model = VDSR().to(device)
     try:
         load_best_model(model, model_dir)
     except Exception:
-        pass
+        logger.warning("VDSR: failed to load checkpoints from %s; using random weights", model_dir)
     model.eval()
-
-    for fname in os.listdir(input_dir):
-        if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
-            continue
+    count = 0
+    for fname in images:
         in_path = os.path.join(input_dir, fname)
         image_tensor = PIL_to_tensor(in_path).unsqueeze(0).to(device)
         with torch.no_grad():
             output = model(image_tensor)
         out_image = tensor_to_PIL(output.squeeze())
         out_image.save(os.path.join(output_dir, fname))
-
+        count += 1
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "VDSR: processed %d image(s) from '%s' -> '%s' on %s in %.3fs",
+        count,
+        input_dir,
+        output_dir,
+        device,
+        elapsed,
+    )
     return output_dir
 
 
@@ -247,23 +294,28 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output.pdf") -> str:
             "`pip install reportlab`."
         ) from e
 
+    start = time.perf_counter()
     images = [
         f
         for f in sorted(os.listdir(image_dir))
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
     ]
     if not images:
         raise ValueError(f"No images found in {image_dir}")
-
-    # Determine absolute path for output PDF
     output_path = os.path.abspath(output_pdf)
     c = canvas.Canvas(output_path, pagesize=letter)
     width, height = letter
-
     for img in images:
         img_path = os.path.join(image_dir, img)
-        # Draw image to fill the page while preserving aspect ratio.
         c.drawImage(img_path, 0, 0, width=width, height=height, preserveAspectRatio=True, anchor='c')
         c.showPage()
     c.save()
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "ASSEMBLER: assembled %d image(s) from '%s' into PDF '%s' in %.3fs",
+        len(images),
+        image_dir,
+        output_path,
+        elapsed,
+    )
     return output_path

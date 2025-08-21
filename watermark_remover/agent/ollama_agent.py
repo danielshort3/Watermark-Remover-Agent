@@ -22,7 +22,7 @@ instructions on installing and running Ollama.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Any
 
 from langchain.agents import initialize_agent, AgentType
 from langchain_ollama import ChatOllama
@@ -33,6 +33,10 @@ from watermark_remover.agent.tools import (
     upscale_images,
     assemble_pdf,
 )
+
+import json
+import urllib.request
+import argparse
 
 
 def get_ollama_agent(
@@ -105,54 +109,58 @@ def get_ollama_agent(
     )
     return agent_executor
 
+def _ping(base_url: str, path: str) -> dict:
+    """Helper to fetch JSON from an Ollama API endpoint.
 
-def main() -> None:
-    """Entry point for running the Ollama-powered Watermark Remover agent.
+    Parameters
+    ----------
+    base_url : str
+        The root URL of the Ollama server.
+    path : str
+        API path starting with '/api'.
 
-    This function spawns a simple command-line loop that repeatedly prompts
-    the user for instructions and forwards them to the agent.  Responses
-    from the agent (including any tool outputs) are printed to stdout.  To
-    exit the loop, type ``exit`` or ``quit`` at the prompt.
+    Returns
+    -------
+    dict
+        Parsed JSON response.
     """
-    import argparse
+    with urllib.request.urlopen(f"{base_url.rstrip('/')}{path}", timeout=5) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-    parser = argparse.ArgumentParser(description="Run the Watermark Remover agent")
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("OLLAMA_MODEL", "qwen3:30b"),
-        help="Name of the Ollama model to use (default: qwen3:30b)",
-    )
-    parser.add_argument(
-        "--ollama-url",
-        dest="ollama_url",
-        default=os.environ.get("OLLAMA_URL", None),
-        help="Base URL of the Ollama server (default: value of OLLAMA_URL env or http://localhost:11434)",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature for the model (default: 0.0)",
-    )
-    parser.add_argument(
-        "--keep-alive",
-        default=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
-        help="Keep-alive duration for the model on the server (default: 30m)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging for the agent",
-    )
-    args = parser.parse_args()
 
-    agent = get_ollama_agent(
-        model_name=args.model,
-        base_url=args.ollama_url,
-        temperature=args.temperature,
-        keep_alive=args.keep_alive,
-        verbose=args.verbose,
-    )
+def diag() -> None:
+    """Diagnostic entry point to verify Ollama connectivity and model availability.
+
+    This function queries the Ollama server for its version, lists available
+    models and checks whether the requested model is present.  It also
+    performs a simple round-trip call to the model to ensure it can generate
+    a response.  The diagnostic information is printed as formatted JSON.
+    """
+    base = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
+    out: dict[str, Any] = {"base_url": base, "model": model}
+    try:
+        out["version"] = _ping(base, "/api/version")
+        tags = _ping(base, "/api/tags").get("models", [])
+        names = [m.get("name") or m.get("model") for m in tags]
+        out["models"] = names
+        out["has_model"] = model in names
+        # Perform a simple generation to confirm model works
+        llm = ChatOllama(model=model, base_url=base)
+        out["roundtrip"] = llm.invoke("Say READY.").content
+    except Exception as exc:
+        out["error"] = repr(exc)
+    print(json.dumps(out, indent=2))
+
+
+def repl(agent) -> None:
+    """Run an interactive loop for the agent, reading user instructions from stdin.
+
+    Parameters
+    ----------
+    agent : AgentExecutor
+        The agent to invoke for each user input.
+    """
     print(
         "\nWatermark Remover Agent (Ollama-powered)\n"
         "Enter a command describing what you want to do, or 'exit' to quit.\n"
@@ -167,11 +175,148 @@ def main() -> None:
         if not user_input:
             continue
         try:
-            response = agent.run(user_input)
-            print(response)
+            # Prefer invoke to run for improved API compatibility
+            response = agent.invoke({"input": user_input})
+            # Extract text if response is structured
+            if isinstance(response, dict):
+                result_text = response.get("output") or response.get("result") or response
+            else:
+                result_text = response
+            print(result_text)
         except Exception as exc:
             print(f"Error: {exc}")
     print("Goodbye!")
+
+
+def run_once(agent, instruction: str) -> None:
+    """Run a single instruction with the agent and print the result.
+
+    Parameters
+    ----------
+    agent : AgentExecutor
+        The agent to use.
+    instruction : str
+        The natural-language instruction to process.
+    """
+    try:
+        resp = agent.invoke({"input": instruction})
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return
+    if isinstance(resp, dict):
+        result_text = resp.get("output") or resp.get("result") or resp
+    else:
+        result_text = resp
+    print(result_text)
+
+
+def main() -> None:
+    """Entry point for running the Watermark Remover agent.
+
+    This function uses subcommands to expose different modes:
+
+    * ``diag``: print diagnostics about the Ollama server and model.
+    * ``repl``: run an interactive prompt powered by the agent.
+    * ``run``: execute a single instruction passed via ``--instruction``.
+
+    If no subcommand is provided, ``repl`` is the default.
+    """
+    parser = argparse.ArgumentParser(description="Watermark Remover Agent CLI")
+    subparsers = parser.add_subparsers(dest="command", required=False)
+    # diag subcommand
+    subparsers.add_parser("diag", help="Check connectivity to Ollama and model availability")
+    # repl subcommand
+    repl_parser = subparsers.add_parser("repl", help="Run the interactive agent REPL")
+    repl_parser.add_argument(
+        "--model",
+        default=os.environ.get("OLLAMA_MODEL", "qwen3:30b"),
+        help="Name of the Ollama model to use (default: qwen3:30b)",
+    )
+    repl_parser.add_argument(
+        "--ollama-url",
+        dest="ollama_url",
+        default=os.environ.get("OLLAMA_URL", None),
+        help="Base URL of the Ollama server (default: value of OLLAMA_URL env or http://localhost:11434)",
+    )
+    repl_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the model (default: 0.0)",
+    )
+    repl_parser.add_argument(
+        "--keep-alive",
+        default=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
+        help="Keep-alive duration for the model on the server (default: 30m)",
+    )
+    repl_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging for the agent",
+    )
+    # run subcommand
+    run_parser = subparsers.add_parser("run", help="Run the agent on a single instruction")
+    run_parser.add_argument(
+        "instruction",
+        help="Natural-language instruction for the agent to execute",
+    )
+    run_parser.add_argument(
+        "--model",
+        default=os.environ.get("OLLAMA_MODEL", "qwen3:30b"),
+        help="Name of the Ollama model to use (default: qwen3:30b)",
+    )
+    run_parser.add_argument(
+        "--ollama-url",
+        dest="ollama_url",
+        default=os.environ.get("OLLAMA_URL", None),
+        help="Base URL of the Ollama server (default: value of OLLAMA_URL env or http://localhost:11434)",
+    )
+    run_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the model (default: 0.0)",
+    )
+    run_parser.add_argument(
+        "--keep-alive",
+        default=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
+        help="Keep-alive duration for the model on the server (default: 30m)",
+    )
+    run_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging for the agent",
+    )
+    args = parser.parse_args()
+
+    # If no command is provided, default to repl
+    cmd = args.command or "repl"
+    if cmd == "diag":
+        diag()
+        return
+    elif cmd in {"repl", "run"}:
+        # Determine base_url and model from command-specific args (may be None)
+        base_url = getattr(args, "ollama_url", None)
+        model_name = getattr(args, "model", os.environ.get("OLLAMA_MODEL", "qwen3:30b"))
+        temp = getattr(args, "temperature", 0.0)
+        keep_alive = getattr(args, "keep_alive", os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
+        verbose = getattr(args, "verbose", False)
+        agent = get_ollama_agent(
+            model_name=model_name,
+            base_url=base_url,
+            temperature=temp,
+            keep_alive=keep_alive,
+            verbose=verbose,
+        )
+        if cmd == "repl":
+            repl(agent)
+            return
+        else:  # cmd == "run"
+            run_once(agent, args.instruction)
+            return
+    else:
+        parser.error(f"Unknown command: {cmd}")
+
 
 
 if __name__ == "__main__":
