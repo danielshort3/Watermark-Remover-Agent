@@ -125,13 +125,25 @@ def agent_node(state: LLMState) -> LLMState:
         diagnostics about the call.
     """
     logger = logging.getLogger("wmra.agent_node")
+    # Log the entire incoming state at debug level for thorough diagnostics
+    try:
+        serialized_state = json.dumps(state, default=str)
+        logger.debug("agent_node received state: %s", serialized_state)
+    except Exception:
+        # Fallback if state contains non-serialisable objects
+        logger.debug("agent_node received state keys: %s", list(state.keys()))
+    # Always log the received keys at info level so they appear even when DEBUG is off
+    logger.info("agent_node: received state keys=%s", list(state.keys()))
     # Copy incoming state to avoid mutating in place
     new_state: LLMState = dict(state)
+    # Always record which keys were received for debugging
+    new_state["received_state"] = list(state.keys())
     instruction = (state.get("instruction") or "").strip()
     if not instruction:
         msg = (
             "No 'instruction' provided. Please supply an 'instruction' string in the"
-            " input JSON (e.g. {\"instruction\": \"Say ONLY READY.\"})."
+            " input JSON (e.g. {\"instruction\": \"Say ONLY READY.\"}). "
+            f"Received keys: {list(state.keys())}"
         )
         logger.warning(msg)
         new_state.update({"ok": False, "result": msg})
@@ -164,9 +176,11 @@ def agent_node(state: LLMState) -> LLMState:
         new_state.update({"ok": False, "result": msg, "diag": diag})
         return new_state
     try:
-        # Use .invoke or .run depending on agent API; here we use .invoke for
-        # consistency with LangChain LLM interface.
+        # Use .invoke to call the agent.  Some agents return a dict with
+        # 'output' or 'result', others return a plain string.  We'll log the
+        # raw response for debugging.
         response = agent.invoke({"input": instruction})
+        logger.debug("agent.invoke returned: %s", response)
     except Exception as exc:
         msg = f"Agent error: {exc}"
         logger.exception(msg)
