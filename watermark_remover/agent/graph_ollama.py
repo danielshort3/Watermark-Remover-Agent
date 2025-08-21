@@ -210,6 +210,34 @@ def agent_node(state: LLMState) -> LLMState:
     return new_state
 
 
+# -----------------------------------------------------------------------------
+# Graph definition
+#
+# The agent graph expects the user's input to be supplied under the ``instruction``
+# key at the top level of the state.  However, when using the LangGraph API, the
+# initial state is often nested under a reserved ``__start__`` key.  The
+# ``input_loader_node`` defined below merges any ``__start__`` values into the
+# top‑level state before execution continues to the agent node.  This ensures
+# that fields like ``instruction``, ``input_dir`` or ``output_pdf`` are
+# accessible regardless of how the API structures the incoming state.
+
+def input_loader_node(state: LLMState) -> LLMState:
+    """Merge nested ``__start__`` values into the top-level state.
+
+    The LangGraph API wraps the user-provided input dict under a ``__start__``
+    key.  This node detects such a mapping and flattens it into the main state
+    so that subsequent nodes can access the instruction and other parameters
+    directly.
+    """
+    new_state: LLMState = dict(state)
+    start_payload = state.get("__start__")
+    if isinstance(start_payload, dict):
+        # Merge values without overwriting existing top-level keys
+        for k, v in start_payload.items():
+            new_state.setdefault(k, v)
+    return new_state
+
+
 def compile_graph() -> Any:
     """Construct and compile the LangGraph for the Ollama agent.
 
@@ -219,8 +247,11 @@ def compile_graph() -> Any:
         A compiled graph that can be executed or served via the LangGraph API.
     """
     graph = StateGraph(LLMState)
+    # First flatten any nested input payload under '__start__'
+    graph.add_node("input_loader", input_loader_node)
     graph.add_node("agent", agent_node)
-    graph.add_edge(START, "agent")
+    graph.add_edge(START, "input_loader")
+    graph.add_edge("input_loader", "agent")
     graph.add_edge("agent", END)
     return graph.compile()
 
