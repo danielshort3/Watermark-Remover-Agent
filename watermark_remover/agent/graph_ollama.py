@@ -138,7 +138,16 @@ def agent_node(state: LLMState) -> LLMState:
     new_state: LLMState = dict(state)
     # Always record which keys were received for debugging
     new_state["received_state"] = list(state.keys())
-    instruction = (state.get("instruction") or "").strip()
+    # Extract the instruction.  Look on the top-level first, then search
+    # nested mappings for a key called "instruction" to handle state wrappers.
+    instruction_raw = state.get("instruction")
+    if instruction_raw is None:
+        # Sometimes the state is nested (e.g. under '__start__' or other keys).
+        for val in state.values():
+            if isinstance(val, dict) and "instruction" in val:
+                instruction_raw = val.get("instruction")
+                break
+    instruction = (instruction_raw or "").strip()
     if not instruction:
         msg = (
             "No 'instruction' provided. Please supply an 'instruction' string in the"
