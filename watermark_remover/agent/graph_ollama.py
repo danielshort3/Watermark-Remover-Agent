@@ -95,64 +95,69 @@ class LLMState(Dict[str, Any]):
 def agent_node(state: LLMState) -> LLMState:
     """Run the Ollama-backed agent on the user's instruction with diagnostics.
 
-    This implementation performs several checks before invoking the LLM:
+    The agent node performs several checks before invoking the LLM:
 
-    * It validates that an ``instruction`` is present in the state.  If
-      missing or empty, a helpful message is returned immediately.
-    * It pings the Ollama server specified by the environment variables
-      (or defaults) to verify connectivity and model availability.  If the
-      server cannot be reached or the model isn't available, a
-      descriptive error and diagnostics are returned.
-    * When the checks pass, it initialises the agent via
+    * Validates that an ``instruction`` is present somewhere in the input
+      state.  It recursively searches nested mappings for an ``instruction``
+      key to accommodate various state shapes produced by LangGraph or API
+      wrappers.  If none is found, it returns a helpful error.
+    * Pings the Ollama server specified by the environment variables (or
+      defaults) to verify connectivity and model availability.  If the
+      server cannot be reached or the model isn't available, it returns
+      diagnostics describing the failure.
+    * If connectivity checks pass, it initialises the agent via
       :func:`get_ollama_agent` and runs it on the instruction.  Any
       exceptions raised during agent construction or invocation are
       captured and returned as part of the response.
 
     The final result (success or error message) is stored under the
-    ``result`` key.  Additional fields ``ok``, ``diag`` and
-    ``elapsed_s`` may be present to aid debugging.
-
-    Parameters
-    ----------
-    state : LLMState
-        The current state of the graph.  Must contain an ``instruction`` key
-        with the user's request.
-
-    Returns
-    -------
-    LLMState
-        A new state dict containing the ``result`` of the agent run and
-        diagnostics about the call.
+    ``result`` key.  Additional fields ``ok``, ``diag`` and ``elapsed_s`` may
+    be present to aid debugging.
     """
     logger = logging.getLogger("wmra.agent_node")
-    # Log the entire incoming state at debug level for thorough diagnostics
+
+    def _extract_from_state(container: Any, key: str) -> Optional[str]:
+        """Recursively search for ``key`` in nested mappings and lists.
+
+        Returns the first found value or ``None`` if not present.
+        """
+        if isinstance(container, dict):
+            if key in container:
+                return container[key]
+            for v in container.values():
+                found = _extract_from_state(v, key)
+                if found is not None:
+                    return found
+        elif isinstance(container, (list, tuple, set)):
+            for item in container:
+                found = _extract_from_state(item, key)
+                if found is not None:
+                    return found
+        return None
+
+    # Log the incoming state at debug level.  Fallback to repr if JSON fails.
     try:
         serialized_state = json.dumps(state, default=str)
-        logger.debug("agent_node received state: %s", serialized_state)
+        logger.debug("agent_node received state (json): %s", serialized_state)
     except Exception:
-        # Fallback if state contains non-serialisable objects
-        logger.debug("agent_node received state keys: %s", list(state.keys()))
+        logger.debug("agent_node received state (repr): %r", state)
     # Always log the received keys at info level so they appear even when DEBUG is off
-    logger.info("agent_node: received state keys=%s", list(state.keys()))
+    try:
+        keys = list(state.keys())
+    except Exception:
+        keys = []
+    logger.info("agent_node: received state keys=%s", keys)
     # Copy incoming state to avoid mutating in place
     new_state: LLMState = dict(state)
-    # Always record which keys were received for debugging
-    new_state["received_state"] = list(state.keys())
-    # Extract the instruction.  Look on the top-level first, then search
-    # nested mappings for a key called "instruction" to handle state wrappers.
-    instruction_raw = state.get("instruction")
-    if instruction_raw is None:
-        # Sometimes the state is nested (e.g. under '__start__' or other keys).
-        for val in state.values():
-            if isinstance(val, dict) and "instruction" in val:
-                instruction_raw = val.get("instruction")
-                break
-    instruction = (instruction_raw or "").strip()
+    new_state["received_state"] = keys
+    # Recursively extract the instruction
+    raw_instruction = _extract_from_state(state, "instruction")
+    instruction = (raw_instruction or "").strip() if isinstance(raw_instruction, str) else ""
     if not instruction:
         msg = (
             "No 'instruction' provided. Please supply an 'instruction' string in the"
             " input JSON (e.g. {\"instruction\": \"Say ONLY READY.\"}). "
-            f"Received keys: {list(state.keys())}"
+            f"Received keys: {keys}"
         )
         logger.warning(msg)
         new_state.update({"ok": False, "result": msg})
