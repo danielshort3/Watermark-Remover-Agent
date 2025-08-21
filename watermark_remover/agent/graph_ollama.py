@@ -292,7 +292,10 @@ def compile_graph() -> Any:
     compiled_graph
         A compiled graph ready for execution or serving via LangGraph.
     """
-    graph = StateGraph(WMState)
+    # Use a plain dict for the state type to allow arbitrary top-level keys
+    # such as 'values' or '__start__'.  Using a TypedDict here would
+    # discard unknown keys before they reach the input loader.
+    graph = StateGraph(dict)  # type: ignore[type-arg]
     # Register nodes
     graph.add_node("input_loader", input_loader_node)
     graph.add_node("agent", agent_node)
