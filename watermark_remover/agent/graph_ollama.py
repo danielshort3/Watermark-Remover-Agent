@@ -25,9 +25,12 @@ requested operations.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Sequence
+
+from typing_extensions import TypedDict
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 
 from watermark_remover.agent.ollama_agent import get_ollama_agent
 
@@ -36,6 +39,26 @@ import json
 import time
 import urllib.request
 import logging
+
+from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.schema import RunnableConfig
+
+class WMState(TypedDict, total=False):
+    """State type for the LLM graph.
+
+    - ``messages`` accumulates a sequence of chat messages.  The ``add_messages``
+      reducer will append new messages when nodes return ``{"messages": ...}``.
+    - ``params`` holds structured arguments (e.g. input_dir, output_pdf) for
+      downstream tools or nodes.  Nodes should read from and write to this
+      dictionary rather than creating arbitrary top-level keys.
+    - ``result`` stores the final agent output.
+    - ``received_state`` logs the keys seen by the agent node for debugging.
+    """
+
+    messages: Sequence[BaseMessage]
+    params: Dict[str, Any]
+    result: str
+    received_state: Sequence[str]
 
 
 def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
@@ -80,93 +103,48 @@ def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
     return out
 
 
-class LLMState(Dict[str, Any]):
-    """State passed between nodes in the LLM agent graph.
-
-    Keys:
-
-    - ``instruction``: (str) the natural-language instruction provided by 
-      the user.
-    - ``result``: (str) the textual output produced by the LLM agent.  This 
-      will only be populated after the agent node has run.
-    """
+# Backwards-compatibility type alias.  Older code may refer to LLMState;
+# point it to WMState so the graph continues to work.
+class LLMState(WMState):  # type: ignore
+    pass
 
 
-def agent_node(state: LLMState) -> LLMState:
-    """Run the Ollama-backed agent on the user's instruction with diagnostics.
+def agent_node(state: WMState) -> WMState:
+    """Run the Ollama-backed agent using the last user message as the prompt.
 
-    The agent node performs several checks before invoking the LLM:
-
-    * Validates that an ``instruction`` is present somewhere in the input
-      state.  It recursively searches nested mappings for an ``instruction``
-      key to accommodate various state shapes produced by LangGraph or API
-      wrappers.  If none is found, it returns a helpful error.
-    * Pings the Ollama server specified by the environment variables (or
-      defaults) to verify connectivity and model availability.  If the
-      server cannot be reached or the model isn't available, it returns
-      diagnostics describing the failure.
-    * If connectivity checks pass, it initialises the agent via
-      :func:`get_ollama_agent` and runs it on the instruction.  Any
-      exceptions raised during agent construction or invocation are
-      captured and returned as part of the response.
-
-    The final result (success or error message) is stored under the
-    ``result`` key.  Additional fields ``ok``, ``diag`` and ``elapsed_s`` may
-    be present to aid debugging.
+    This node expects a ``messages`` list on the state containing at least one
+    :class:`HumanMessage`.  It extracts the most recent user message, uses it
+    as the instruction for the LangChain agent, and stores the output under
+    the ``result`` key.  All structured arguments for the task (e.g.
+    ``input_dir`` or ``output_pdf``) should be stored in ``params`` by
+    ``input_loader_node``.
     """
     logger = logging.getLogger("wmra.agent_node")
-
-    def _extract_from_state(container: Any, key: str) -> Optional[str]:
-        """Recursively search for ``key`` in nested mappings and lists.
-
-        Returns the first found value or ``None`` if not present.
-        """
-        if isinstance(container, dict):
-            if key in container:
-                return container[key]
-            for v in container.values():
-                found = _extract_from_state(v, key)
-                if found is not None:
-                    return found
-        elif isinstance(container, (list, tuple, set)):
-            for item in container:
-                found = _extract_from_state(item, key)
-                if found is not None:
-                    return found
-        return None
-
-    # Log the incoming state at debug level.  Fallback to repr if JSON fails.
-    try:
-        serialized_state = json.dumps(state, default=str)
-        logger.debug("agent_node received state (json): %s", serialized_state)
-    except Exception:
-        logger.debug("agent_node received state (repr): %r", state)
-    # Always log the received keys at info level so they appear even when DEBUG is off
-    try:
-        keys = list(state.keys())
-    except Exception:
-        keys = []
+    # Log the state keys for debugging
+    keys = list(state.keys())
     logger.info("agent_node: received state keys=%s", keys)
     # Copy incoming state to avoid mutating in place
-    new_state: LLMState = dict(state)
-    new_state["received_state"] = keys
-    # Recursively extract the instruction
-    raw_instruction = _extract_from_state(state, "instruction")
-    instruction = (raw_instruction or "").strip() if isinstance(raw_instruction, str) else ""
+    new_state: WMState = dict(state)
+    new_state["received_state"] = keys  # record for debugging
+    # Extract latest user message
+    messages = list(state.get("messages", []))
+    instruction: Optional[str] = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            instruction = msg.content
+            break
     if not instruction:
         msg = (
-            "No 'instruction' provided. Please supply an 'instruction' string in the"
-            " input JSON (e.g. {\"instruction\": \"Say ONLY READY.\"}). "
-            f"Received keys: {keys}"
+            "No user message found. Ensure that a HumanMessage is present in the"
+            " 'messages' list before agent_node runs."
         )
         logger.warning(msg)
         new_state.update({"ok": False, "result": msg})
         return new_state
-
+    instruction = instruction.strip()
     # Determine server URL and model from environment, with sensible defaults
     base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
     model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
-
     # Ping the Ollama server and check for the model
     diag = _ping_ollama(base_url, model)
     if not diag.get("ok", False):
@@ -179,7 +157,6 @@ def agent_node(state: LLMState) -> LLMState:
         logger.error(msg)
         new_state.update({"ok": False, "result": msg, "diag": diag})
         return new_state
-
     # Instantiate and run the agent
     start_time = time.perf_counter()
     try:
@@ -190,9 +167,6 @@ def agent_node(state: LLMState) -> LLMState:
         new_state.update({"ok": False, "result": msg, "diag": diag})
         return new_state
     try:
-        # Use .invoke to call the agent.  Some agents return a dict with
-        # 'output' or 'result', others return a plain string.  We'll log the
-        # raw response for debugging.
         response = agent.invoke({"input": instruction})
         logger.debug("agent.invoke returned: %s", response)
     except Exception as exc:
@@ -201,7 +175,6 @@ def agent_node(state: LLMState) -> LLMState:
         new_state.update({"ok": False, "result": msg, "diag": diag})
         return new_state
     elapsed = time.perf_counter() - start_time
-    # Ensure response is string-like (some agents return dict or messages)
     if isinstance(response, dict):
         result_text = str(response.get("output") or response.get("result") or response)
     else:
@@ -221,35 +194,100 @@ def agent_node(state: LLMState) -> LLMState:
 # that fields like ``instruction``, ``input_dir`` or ``output_pdf`` are
 # accessible regardless of how the API structures the incoming state.
 
-def input_loader_node(state: LLMState) -> LLMState:
-    """Merge nested ``__start__`` values into the top-level state.
+def input_loader_node(state: WMState, config: Optional[RunnableConfig] = None) -> WMState:
+    """Normalize incoming inputs into chat messages and structured params.
 
-    The LangGraph API wraps the user-provided input dict under a ``__start__``
-    key.  This node detects such a mapping and flattens it into the main state
-    so that subsequent nodes can access the instruction and other parameters
-    directly.
+    When using LangGraph via the Assistants API or Studio, the initial
+    user-provided dictionary is often nested under the special ``__start__``
+    key on the state or under ``config.configurable.values`` in the node
+    configuration.  This loader flattens those structures and converts them
+    into a standard representation: natural language prompts are stored in
+    ``messages`` as a list of :class:`~langchain_core.messages.HumanMessage`
+    instances, while all remaining key/value pairs are stored in the
+    ``params`` dictionary.  If a ``messages`` list already exists on the
+    state, this loader returns an empty update to avoid overwriting it.
+
+    Parameters
+    ----------
+    state : WMState
+        Current graph state.  May contain a ``__start__`` mapping with user
+        inputs or previously assembled ``messages``/``params``.
+    config : RunnableConfig, optional
+        The runnable configuration provided by LangGraph.  Values under
+        ``config.configurable.values`` are merged with the ``__start__``
+        payload to extract additional parameters when present.
+
+    Returns
+    -------
+    WMState
+        A partial state update containing new ``messages`` and/or ``params``
+        keys.  If no new inputs are found, an empty dict is returned.
     """
-    new_state: LLMState = dict(state)
-    start_payload = state.get("__start__")
-    if isinstance(start_payload, dict):
-        # Merge values without overwriting existing top-level keys
-        for k, v in start_payload.items():
-            new_state.setdefault(k, v)
-    return new_state
+    # If messages already exist, assume they've been populated correctly and
+    # return an empty update to leave the state unchanged.
+    if state.get("messages"):
+        return {}
+    # Gather potential inputs from the reserved __start__ key
+    start_payload: Dict[str, Any] = {}
+    start_raw = state.get("__start__")
+    if isinstance(start_raw, dict):
+        start_payload = dict(start_raw)
+    # Additionally merge in values from config.configurable.values when present.
+    cfg_values: Dict[str, Any] = {}
+    try:
+        if config and isinstance(config, dict):  # type: ignore[redundant-expr]
+            # RunnableConfig is a Mapping; get nested values defensively
+            cfg = config.get("configurable", {})  # type: ignore[index]
+            if isinstance(cfg, dict):
+                vals = cfg.get("values", {})  # type: ignore[index]
+                if isinstance(vals, dict):
+                    cfg_values = dict(vals)
+    except Exception:
+        # Ignore malformed config
+        cfg_values = {}
+    # Combine the two dicts, giving precedence to __start__ over config values
+    merged: Dict[str, Any] = {**cfg_values, **start_payload}
+    if not merged:
+        # Nothing to do
+        return {}
+    # Extract the natural-language prompt.  Accept both 'instruction' and
+    # 'prompt' for backwards compatibility.
+    instruction = merged.pop("instruction", None) or merged.pop("prompt", None)
+    update: WMState = {}
+    if instruction:
+        update["messages"] = [HumanMessage(content=str(instruction))]
+    # The remainder of the merged dict are structured parameters
+    if merged:
+        # Initialise params with existing values if present
+        current_params: Dict[str, Any] = {}
+        if isinstance(state.get("params"), dict):
+            current_params = dict(state["params"])  # type: ignore[index]
+        # Only add keys that aren't already present in params
+        for k, v in merged.items():
+            current_params.setdefault(k, v)
+        update["params"] = current_params
+    return update
 
 
 def compile_graph() -> Any:
     """Construct and compile the LangGraph for the Ollama agent.
 
+    This graph contains two nodes: an ``input_loader`` that normalises
+    incoming API payloads into chat messages and structured parameters,
+    and an ``agent`` node that delegates execution to the Ollama-backed
+    chat agent.  The state type is :class:`WMState`, which defines
+    keys for accumulated ``messages``, ``params`` and the ``result``.
+
     Returns
     -------
     compiled_graph
-        A compiled graph that can be executed or served via the LangGraph API.
+        A compiled graph ready for execution or serving via LangGraph.
     """
-    graph = StateGraph(LLMState)
-    # First flatten any nested input payload under '__start__'
+    graph = StateGraph(WMState)
+    # Register nodes
     graph.add_node("input_loader", input_loader_node)
     graph.add_node("agent", agent_node)
+    # Define control flow: START -> input_loader -> agent -> END
     graph.add_edge(START, "input_loader")
     graph.add_edge("input_loader", "agent")
     graph.add_edge("agent", END)
