@@ -25,7 +25,7 @@ import os  # Needed for directory existence checks in scraper_node
 
 from langgraph.graph import StateGraph, START, END
 
-from .tools import scrape_music, remove_watermark, upscale_images, assemble_pdf
+from watermark_remover.agent.tools import scrape_music, remove_watermark, upscale_images, assemble_pdf
 
 
 class PipelineState(Dict[str, Any]):
