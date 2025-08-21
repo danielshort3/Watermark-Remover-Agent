@@ -1,7 +1,7 @@
 {
-      "dependencies": ["."],
-      "graphs": {
+  "dependencies": ["."],
+  "graphs": {
     "agent": "./watermark_remover/agent/graph.py:graph",
     "agent_llm": "./watermark_remover/agent/graph_ollama.py:graph"
-      }
-    }
+  }
+}

@@ -13,10 +13,9 @@ stored under the ``result`` key in the state.
 Users can invoke this graph via LangGraph Studio or the API by
 providing a JSON object with an ``instruction`` string.  For example:
 
-.. code-block:: json
-
     {
-        "instruction": "Download sheet music for Fur Elise, remove the watermark, upscale it and save it as a PDF"
+        "instruction": "Download sheet music for Fur Elise, remove the 
+        watermark, upscale it and save it as a PDF"
     }
 
 The graph will then spin up the Ollama agent (if not already loaded)
@@ -86,9 +85,10 @@ class LLMState(Dict[str, Any]):
 
     Keys:
 
-    - ``instruction``: (str) the natural-language instruction provided by the user.
-    - ``result``: (str) the textual output produced by the LLM agent.  This will
-      only be populated after the agent node has run.
+    - ``instruction``: (str) the natural-language instruction provided by 
+      the user.
+    - ``result``: (str) the textual output produced by the LLM agent.  This 
+      will only be populated after the agent node has run.
     """
 
 

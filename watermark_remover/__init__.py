@@ -4,7 +4,7 @@ Top-level package for the Watermark Remover project.
 This package originally provided a PyQt-based GUI application for
 scraping sheet music from the web, removing watermarks using a UNet
 model and upscaling images via a VDSR model.  In addition to the GUI
-components, the repository now includes a `agent` subpackage which
+components, the repository now includes an `agent` subpackage which
 contains tools and a LangGraph definition for orchestrating the
 watermark removal pipeline in an agentic fashion.  See
 `watermark_remover/agent/graph.py` for the workflow and

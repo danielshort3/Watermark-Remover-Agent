@@ -1,7 +1,7 @@
-"""Agent orchestrator for the Watermark Remover using an Ollama-backed LLM.
+"""Agent orchestrator for the Watermark Remover using an Ollama‑backed LLM.
 
 This module exposes a simple function that constructs a LangChain agent
-powered by a local Ollama model (such as `qwen3:30b`) and a set of tools
+powered by a local Ollama model (such as ``qwen3:30b``) and a set of tools
 defined in :mod:`watermark_remover.agent.tools`.  The agent can reason
 about user instructions in natural language and decide when to call
 individual tools like ``scrape_music``, ``remove_watermark``, ``upscale_images``
@@ -21,10 +21,13 @@ instructions on installing and running Ollama.
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
-from typing import Optional, Any
+import urllib.request
+from typing import Any, Optional
 
-from langchain.agents import initialize_agent, AgentType
+from langchain.agents import AgentType, initialize_agent
 from langchain_ollama import ChatOllama
 
 from watermark_remover.agent.tools import (
@@ -33,10 +36,6 @@ from watermark_remover.agent.tools import (
     upscale_images,
     assemble_pdf,
 )
-
-import json
-import urllib.request
-import argparse
 
 
 def get_ollama_agent(
@@ -52,8 +51,8 @@ def get_ollama_agent(
     Parameters
     ----------
     model_name : str, optional
-        Name of the Ollama model to use (default is ``"qwen3:30b"``).  Make sure
-        this model has been pulled onto the Ollama server.
+        Name of the Ollama model to use (default is ``"qwen3:30b"``).  Make
+        sure this model has been pulled onto the Ollama server.
     base_url : str, optional
         Base URL of the Ollama server.  If not provided, the environment
         variable ``OLLAMA_URL`` is consulted, falling back to
@@ -78,7 +77,6 @@ def get_ollama_agent(
     # via the function argument or the OLLAMA_URL environment variable.
     if base_url is None:
         base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-
     # Instantiate the chat model.  We explicitly set ``keep_alive`` so the
     # model stays resident in the Ollama server between successive tool
     # invocations; this avoids the overhead of unloading and reloading the
@@ -88,15 +86,12 @@ def get_ollama_agent(
         base_url=base_url,
         temperature=temperature,
         keep_alive=keep_alive,
-        # Setting ``verbose`` on the model influences logging of API requests.
         verbose=verbose,
     )
-
-    # Use the @tool-decorated callables directly.  The LangChain agent will
+    # Use the @tool‑decorated callables directly.  The LangChain agent will
     # inspect their signatures and docstrings to construct the tool schemas.
     tools = [scrape_music, remove_watermark, upscale_images, assemble_pdf]
-
-    # Construct a structured chat agent that uses function-calling style
+    # Construct a structured chat agent that uses function‑calling style
     # reasoning (ReAct).  This agent reads the tool descriptions and
     # determines when to call them based on the user's input.  Structured
     # chat helps ensure that complex arguments (like JSON structures) are
@@ -109,33 +104,15 @@ def get_ollama_agent(
     )
     return agent_executor
 
+
 def _ping(base_url: str, path: str) -> dict:
-    """Helper to fetch JSON from an Ollama API endpoint.
-
-    Parameters
-    ----------
-    base_url : str
-        The root URL of the Ollama server.
-    path : str
-        API path starting with '/api'.
-
-    Returns
-    -------
-    dict
-        Parsed JSON response.
-    """
+    """Helper to fetch JSON from an Ollama API endpoint."""
     with urllib.request.urlopen(f"{base_url.rstrip('/')}{path}", timeout=5) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def diag() -> None:
-    """Diagnostic entry point to verify Ollama connectivity and model availability.
-
-    This function queries the Ollama server for its version, lists available
-    models and checks whether the requested model is present.  It also
-    performs a simple round-trip call to the model to ensure it can generate
-    a response.  The diagnostic information is printed as formatted JSON.
-    """
+    """Diagnostic entry point to verify Ollama connectivity and model availability."""
     base = os.environ.get("OLLAMA_URL", "http://localhost:11434")
     model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
     out: dict[str, Any] = {"base_url": base, "model": model}
@@ -154,13 +131,7 @@ def diag() -> None:
 
 
 def repl(agent) -> None:
-    """Run an interactive loop for the agent, reading user instructions from stdin.
-
-    Parameters
-    ----------
-    agent : AgentExecutor
-        The agent to invoke for each user input.
-    """
+    """Run an interactive loop for the agent, reading user instructions from stdin."""
     print(
         "\nWatermark Remover Agent (Ollama-powered)\n"
         "Enter a command describing what you want to do, or 'exit' to quit.\n"
@@ -189,15 +160,7 @@ def repl(agent) -> None:
 
 
 def run_once(agent, instruction: str) -> None:
-    """Run a single instruction with the agent and print the result.
-
-    Parameters
-    ----------
-    agent : AgentExecutor
-        The agent to use.
-    instruction : str
-        The natural-language instruction to process.
-    """
+    """Run a single instruction with the agent and print the result."""
     try:
         resp = agent.invoke({"input": instruction})
     except Exception as exc:
@@ -288,14 +251,11 @@ def main() -> None:
         help="Enable verbose logging for the agent",
     )
     args = parser.parse_args()
-
-    # If no command is provided, default to repl
     cmd = args.command or "repl"
     if cmd == "diag":
         diag()
         return
     elif cmd in {"repl", "run"}:
-        # Determine base_url and model from command-specific args (may be None)
         base_url = getattr(args, "ollama_url", None)
         model_name = getattr(args, "model", os.environ.get("OLLAMA_MODEL", "qwen3:30b"))
         temp = getattr(args, "temperature", 0.0)
@@ -316,7 +276,6 @@ def main() -> None:
             return
     else:
         parser.error(f"Unknown command: {cmd}")
-
 
 
 if __name__ == "__main__":

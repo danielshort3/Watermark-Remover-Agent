@@ -1,19 +1,19 @@
 """
-    Graph definition for orchestrating the Watermark Remover pipeline.
+Graph definition for orchestrating the Watermark Remover pipeline.
 
-    This module builds a simple linear workflow using LangGraph's
-    ``StateGraph``.  The graph contains four nodes: ``scraper``,
-    ``watermark_removal``, ``upscaler`` and ``assembler``.  Each node
-    invokes a corresponding tool defined in ``tools.py`` and stores its
-    output in the graph's mutable state.  The workflow proceeds from
-    scraping to watermark removal to upscaling and finally PDF
-    assembly.
+This module builds a simple linear workflow using LangGraph's
+``StateGraph``.  The graph contains four nodes: ``scraper``,
+``watermark_removal``, ``upscaler`` and ``assembler``.  Each node
+invokes a corresponding tool defined in ``tools.py`` and stores its
+output in the graph's mutable state.  The workflow proceeds from
+scraping to watermark removal to upscaling and finally PDF
+assembly.
 
-    To visualise and interact with this graph using LangGraph Studio,
-    run ``langgraph dev`` at the repository root.  The configuration in
-    ``langgraph.json`` points the CLI to the compiled graph defined
-    here.
-    """
+To visualise and interact with this graph using LangGraph Studio,
+run ``langgraph dev`` at the repository root.  The configuration in
+``langgraph.json`` points the CLI to the compiled graph defined
+here.
+"""
 
 from __future__ import annotations
 
@@ -41,9 +41,11 @@ class PipelineState(Dict[str, Any]):
     * ``title``: song title provided by the user.
     * ``instrument``: instrument name provided by the user.
     * ``key``: musical key provided by the user.
-    * ``input_dir``: optional path to the directory of images provided by the user.
+    * ``input_dir``: optional path to the directory of images provided by 
+      the user.
     * ``download_path``: directory returned by the ``scrape_music`` tool.
-    * ``processed_path``: directory returned by the ``remove_watermark`` tool.
+    * ``processed_path``: directory returned by the ``remove_watermark`` 
+      tool.
     * ``upscaled_path``: directory returned by the ``upscale_images`` tool.
     * ``final_pdf``: path to the PDF created by the ``assemble_pdf`` tool.
     """

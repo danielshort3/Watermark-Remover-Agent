@@ -1,40 +1,40 @@
+"""Tool definitions for the Watermark Remover agents.
+
+Each function in this module is decorated with the ``langchain.agents.tool``
+decorator so that it can be invoked by LangChain agents.  The tools provide
+an abstraction over the core functionalities of the Watermark Remover
+project:
+
+* ``scrape_music``: returns a directory containing sheet music images.  In
+  this proof‑of‑concept implementation, no real scraping occurs; the
+  function merely returns a pre‑existing directory.  It is left as a stub
+  to be replaced with Selenium or API logic as needed.
+
+* ``remove_watermark``: loads a U‑Net model and applies it to each image
+  found in the input directory, saving the watermark‑free versions to a new
+  directory.
+
+* ``upscale_images``: loads a VDSR model and applies it to each image
+  found in the input directory, saving the upscaled results to a new
+  directory.
+
+* ``assemble_pdf``: collects all images from a directory and assembles
+  them into a multi‑page PDF.
+
+All tools return the path to the directory or file they produce.  If the
+specified model directory does not contain weights, the ``load_best_model``
+function silently fails and the model runs with randomly initialised weights;
+this keeps the example self‑contained and avoids bundling large model
+weights in the repository.  Users can populate the ``models/`` directories
+with their own trained checkpoints to achieve meaningful results.
 """
-    Tool definitions for the Watermark Remover agents.
 
-    Each function in this module is decorated with the
-    ``langchain.agents.tool`` decorator so that it can be invoked by
-    LangChain agents.  The tools provide an abstraction over the core
-    functionalities of the Watermark Remover project:
+from __future__ import annotations
 
-    * ``scrape_music``: returns a directory containing sheet music images.
-      In this proof‑of‑concept implementation, no real scraping occurs; the
-      function merely returns a pre‑existing directory.  It is left as a
-      stub to be replaced with Selenium or API logic as needed.
-
-    * ``remove_watermark``: loads a UNet model and applies it to each
-      image found in the input directory, saving the watermark‑free
-      versions to a new directory.
-
-    * ``upscale_images``: loads a VDSR model and applies it to each
-      image found in the input directory, saving the upscaled results to
-      a new directory.
-
-    * ``assemble_pdf``: collects all images from a directory and
-      assembles them into a multi‑page PDF.
-
-    All tools return the path to the directory or file they produce.  If
-    the specified model directory does not contain weights, the
-    ``load_best_model`` function silently fails and the model runs with
-    randomly initialised weights; this keeps the example self‑contained
-    and avoids bundling large model weights in the repository.  Users can
-    populate the ``models/`` directories with their own trained
-    checkpoints to achieve meaningful results.
-    """
-
-import os
-import time
 import glob
 import logging
+import os
+import time
 from typing import Optional
 
 from langchain.agents import tool
@@ -44,9 +44,8 @@ from langchain.agents import tool
 # pytorch_msssim.  To avoid import errors when those libraries are not
 # installed, we catch ImportError and provide a helpful message at
 # runtime.
-
 try:
-    import torch
+    import torch  # type: ignore
     from watermark_remover.inference.model_functions import (
         UNet,
         VDSR,
@@ -62,7 +61,7 @@ except Exception as e:  # broad except to handle ImportError and others
 else:
     _import_error = None
 
-# Set up a module-level logger.  The log level can be controlled via the
+# Set up a module‑level logger.  The log level can be controlled via the
 # LOG_LEVEL environment variable (e.g. export LOG_LEVEL=DEBUG).  If not set,
 # INFO is used by default.  Only configure the basicConfig once to avoid
 # interfering with parent application logging configuration.
@@ -101,11 +100,10 @@ def scrape_music(title: str, instrument: str, key: str, input_dir: str = "data/s
 
     Notes
     -----
-    This function is a placeholder for the real scraping logic
-    originally implemented in the PyQt GUI with Selenium.  In a
-    production system, you could implement network requests or
-    headless browser automation here and return a directory of
-    downloaded images.
+    This function is a placeholder for the real scraping logic originally
+    implemented in the PyQt GUI with Selenium.  In a production system, you
+    could implement network requests or headless browser automation here and
+    return a directory of downloaded images.
     """
     start = time.perf_counter()
     if not os.path.isdir(input_dir):
@@ -126,11 +124,7 @@ def scrape_music(title: str, instrument: str, key: str, input_dir: str = "data/s
 
 
 @tool
-def remove_watermark(
-    input_dir: str,
-    model_dir: str = "models/Watermark_Removal",
-    output_dir: str = "processed",
-) -> str:
+def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal", output_dir: str = "processed") -> str:
     """Remove watermarks from all images in ``input_dir`` using a UNet model.
 
     Parameters
@@ -150,12 +144,12 @@ def remove_watermark(
 
     Notes
     -----
-    If PyTorch or the UNet implementation cannot be imported, this
-    function will raise an ImportError when called.  If the model
-    directory contains no checkpoints, the UNet model will run with
-    randomly initialised weights, which will not produce meaningful
-    results but allows the pipeline to run end‑to‑end without
-    bundling large model weights in the repository.
+    If PyTorch or the UNet implementation cannot be imported, this function
+    will raise an ImportError when called.  If the model directory
+    contains no checkpoints, the UNet model will run with randomly
+    initialised weights, which will not produce meaningful results but
+    allows the pipeline to run end‑to‑end without bundling large model
+    weights in the repository.
     """
     start = time.perf_counter()
     if _import_error is not None:
@@ -202,11 +196,7 @@ def remove_watermark(
 
 
 @tool
-def upscale_images(
-    input_dir: str,
-    model_dir: str = "models/VDSR",
-    output_dir: str = "upscaled",
-) -> str:
+def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: str = "upscaled") -> str:
     """Upscale all images in ``input_dir`` using a VDSR model.
 
     Parameters
@@ -284,16 +274,14 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output.pdf") -> str:
     """
     if not os.path.isdir(image_dir):
         raise FileNotFoundError(f"Image directory {image_dir} does not exist.")
-
     try:
         from reportlab.pdfgen import canvas  # type: ignore
         from reportlab.lib.pagesizes import letter  # type: ignore
     except ImportError as e:
         raise ImportError(
-            "reportlab is required for PDF assembly. Please install it via \n"
+            "reportlab is required for PDF assembly. Please install it via\n"
             "`pip install reportlab`."
         ) from e
-
     start = time.perf_counter()
     images = [
         f
