@@ -92,15 +92,37 @@ def run_instruction(instruction: str) -> str:
             f"are missing. Original error: {exc}"
         )
     try:
-        agent = get_ollama_agent(model_name=model, base_url=base_url, verbose=False)
+        # Request verbose output from the agent.  When verbose=True the
+        # underlying LangChain agent will print its reasoning to stdout.
+        agent = get_ollama_agent(model_name=model, base_url=base_url, verbose=True)
     except Exception as exc:
         return f"Failed to create Ollama agent: {exc}"
     try:
         response = agent.invoke({"input": prompt})
     except Exception as exc:
         return f"Error executing instruction: {exc}"
+    # Extract the answer from the agent response.  The LLM may return
+    # structured objects or plain strings.  When using the Ollama backend
+    # with the provided prompt instructions, the 'output' key will include
+    # both the agent's reasoning (between <think> tags) and the final
+    # answer.  We capture this string as the answer.
     if isinstance(response, dict):
         answer = response.get("output") or response.get("result") or response
     else:
         answer = response
+    # Persist the thought process and steps to a log file under the
+    # output directory.  Each invocation appends to the log with the
+    # instruction and the model's full response.  This allows users to
+    # inspect how the agent reasoned about the task and which tools were
+    # invoked.  If the file cannot be written, we silently ignore
+    # errors.
+    try:
+        out_dir = os.path.join(os.getcwd(), "output")
+        os.makedirs(out_dir, exist_ok=True)
+        log_path = os.path.join(out_dir, "thoughts_and_steps.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"Instruction: {prompt}\n")
+            f.write(str(answer) + "\n\n")
+    except Exception:
+        pass
     return str(answer)

@@ -4,9 +4,5 @@
 /models
 /data
 /.vs
-/langchain/__pycache__
-/langchain/agents/__pycache__
-/langchain_core/__pycache__
-/langgraph/__pycache__
-/langgraph/graph/__pycache__
-/tests/__pycache__
+/output
+*.pyc

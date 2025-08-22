@@ -15,6 +15,9 @@ dependencies = [
   "opencv-python",
   # numpy is implicitly required by torchvision and opencv.
   "numpy",
+  "selenium",
+  "webdriver-manager",
+  "requests",
 ]
 
 [tool.setuptools.packages.find]

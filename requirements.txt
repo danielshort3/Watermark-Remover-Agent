@@ -7,5 +7,8 @@ Pillow
 torchvision
 pytorch-msssim
 opencv-python
+selenium
+webdriver-manager
+requests
 pytest
 numpy

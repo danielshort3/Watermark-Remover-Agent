@@ -85,14 +85,44 @@ print(result)
 Both methods return a string with the result or a diagnostic error if
 the Ollama server cannot be reached or the model is missing.
 
-## Notes on scraping
+## Notes on scraping and key selection
 
-The `scrape_music` tool in this repository is still a stub: it simply
-returns the contents of a directory you provide (by default
-`data/samples`).  To integrate actual scraping logic (e.g. Selenium or
-API calls to download sheet music) replace the body of
-`scrape_music` with your implementation.  The agent's reasoning flow
-will remain the same.
+The `scrape_music` tool has been extended beyond a stub.  Its search
+strategy is now:
+
+1. **Local search:** It looks under `data/samples` for a directory whose
+   name contains the requested `title` (case insensitive).  Each
+   subdirectory within that title is treated as a key or arrangement.
+   If the requested `key` is present, that folder is returned.
+2. **Transposition suggestions:** If the title exists but the key
+   doesn’t, the tool computes direct and closest alternatives using the
+   transposition helpers from `watermark_remover.utils.transposition_utils`.
+   It raises a `ValueError` with a helpful message containing the
+   available keys and suggested instrument/key combinations.  The
+   LangChain agent can interpret this message and ask the user whether an
+   alternate key or instrument would work.
+3. **Online scraping:** If no title is found locally, the tool
+   automatically uses Selenium to search PraiseCharts for the piece,
+   click the first result, iterate through the preview images, download
+   them via HTTP and save them into
+   `data/samples/<sanitized_title>/<norm_key>`.  The provided
+   `Dockerfile` now automatically downloads and installs the most
+   recent stable Google Chrome binary and its dependencies at build
+   time.  This means Selenium can run a headless Chrome browser out
+   of the box without requiring you to mount a browser from the host.
+   If you prefer to use a different browser (such as Chromium or
+   Firefox) you can modify the Dockerfile accordingly.  Should the
+   scraping logic fail for any reason (e.g. no network connectivity or
+   website changes), `_scrape_with_selenium` returns `None` and
+   `scrape_music` falls back to raising a `FileNotFoundError`.
+
+If you wish to refine the scraping logic—such as selecting specific
+instruments, keys or orchestration parts—you can extend
+`_scrape_with_selenium` in `watermark_remover/agent/tools.py`.  The
+current implementation downloads whatever preview images are available
+for the first search result.  See the original
+**Watermark‑Remover** repository’s `download/` and `threads/` modules for
+detailed examples.
 
 ## Model weights
 
@@ -101,3 +131,27 @@ to keep the project lightweight.  You can place your own `.pth` files
 into `models/Watermark_Removal` and `models/VDSR` respectively.  If no
 checkpoints are found the models will run with random weights, producing
 nonsensical outputs but exercising the full pipeline end‑to‑end.
+
+## Output and logging
+
+When the agent assembles a PDF it now writes the file into the
+`output` directory by default (for example, `output/output.pdf`).  Make
+sure to mount this directory from your host (e.g. `-v $(pwd)/output:/app/output`)
+so that the generated PDF persists after the container exits.
+
+The agent and tools also record their actions to help you understand the
+reasoning and execution order:
+
+* **Thoughts and steps:** After each call to `run_instruction()` the
+  full LLM output—including the `<think>` block and the final answer—is
+  appended to `output/thoughts_and_steps.log`.  Each entry lists the
+  instruction followed by the model’s reasoning and response.
+* **Pipeline log:** The `wmra.tools` logger writes an execution log to
+  `output/pipeline.log`.  This file records messages such as which
+  directory the scraper used, which images were processed by the
+  watermark removal and upscaling models, and when the PDF assembly
+  completed.  The log level is controlled by the `LOG_LEVEL`
+  environment variable (e.g. `DEBUG`, `INFO`).
+
+These logs provide insight into the agent’s internal decision‑making
+process and the concrete steps performed by each tool.
