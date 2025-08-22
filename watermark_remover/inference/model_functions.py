@@ -15,6 +15,8 @@ operations clamp outputs into the [0, 1] range to produce valid
 images.
 """
 
+from __future__ import annotations
+
 import os
 import threading
 from typing import Any, Dict, List
@@ -27,7 +29,6 @@ from torchvision import transforms
 from torchvision.models import vgg19
 from torchvision.models.vgg import VGG19_Weights
 from pytorch_msssim import SSIM
-
 
 # Lock to guard model loading and file I/O.  When multiple threads are
 # creating models or reading from disk concurrently this prevents
@@ -191,7 +192,8 @@ def load_best_model(model: nn.Module, directory: str) -> None:
         save_dict = torch.load(best_model_path)
     # Remove 'module.' or '_orig_mod.' prefixes from keys for DataParallel
     new_state_dict = {
-        k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in save_dict["state_dict"].items()
+        k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in 
+save_dict["state_dict"].items()
     }
     model.load_state_dict(new_state_dict)
     print(
@@ -215,7 +217,8 @@ def load_model(model: nn.Module, model_path: str) -> None:
         print(f"No validation loss value found in {model_path}")
         return
     new_state_dict = {
-        k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in save_dict["state_dict"].items()
+        k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in 
+save_dict["state_dict"].items()
     }
     model.load_state_dict(new_state_dict)
     print(f"Model loaded from {model_path}")

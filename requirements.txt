@@ -1,13 +1,11 @@
-torch
-torchvision
-pillow
-pytorch_msssim
-PyQt5
-opencv-python
-selenium
-webdriver-manager
-reportlab
+# Core dependencies for the Watermark Remover Agent with full model support.
+# PyTorch and CUDA are provided by the base Docker image.
 langchain
 langchain-ollama
-langgraph
-langgraph-cli[inmem]
+reportlab
+Pillow
+torchvision
+pytorch-msssim
+opencv-python
+pytest
+numpy

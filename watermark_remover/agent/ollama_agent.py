@@ -27,8 +27,18 @@ import os
 import urllib.request
 from typing import Any, Optional
 
-from langchain.agents import AgentType, initialize_agent
-from langchain_ollama import ChatOllama
+# AgentType and initialize_agent are imported lazily within get_ollama_agent to
+# avoid raising ImportError on module import when langchain is missing.  See
+# get_ollama_agent below.
+
+# ChatOllama is part of the optional langchain-ollama package.  Try to import
+# it, but allow this module to be imported even if the dependency is
+# unavailable.  When ChatOllama cannot be imported the agent will
+# subsequently raise an ImportError when invoked.
+try:
+    from langchain_ollama import ChatOllama  # type: ignore
+except Exception:
+    ChatOllama = None  # type: ignore
 
 from watermark_remover.agent.tools import (
     scrape_music,
@@ -77,6 +87,21 @@ def get_ollama_agent(
     # via the function argument or the OLLAMA_URL environment variable.
     if base_url is None:
         base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    # Ensure the required dependencies are available.  We lazily import
+    # AgentType and initialize_agent to allow this module to be imported
+    # without langchain installed.  The chat model is also optional.
+    if ChatOllama is None:
+        raise ImportError(
+            "The langchain-ollama package is not installed. "
+            "Install it to enable Ollama-backed agents."
+        )
+    try:
+        from langchain.agents import AgentType, initialize_agent  # type: ignore[import]
+    except Exception:
+        raise ImportError(
+            "The langchain package is not installed. "
+            "Install it to enable agent construction."
+        )
     # Instantiate the chat model.  We explicitly set ``keep_alive`` so the
     # model stays resident in the Ollama server between successive tool
     # invocations; this avoids the overhead of unloading and reloading the
@@ -163,120 +188,6 @@ def run_once(agent, instruction: str) -> None:
     """Run a single instruction with the agent and print the result."""
     try:
         resp = agent.invoke({"input": instruction})
+        print(resp)
     except Exception as exc:
         print(f"Error: {exc}")
-        return
-    if isinstance(resp, dict):
-        result_text = resp.get("output") or resp.get("result") or resp
-    else:
-        result_text = resp
-    print(result_text)
-
-
-def main() -> None:
-    """Entry point for running the Watermark Remover agent.
-
-    This function uses subcommands to expose different modes:
-
-    * ``diag``: print diagnostics about the Ollama server and model.
-    * ``repl``: run an interactive prompt powered by the agent.
-    * ``run``: execute a single instruction passed via ``--instruction``.
-
-    If no subcommand is provided, ``repl`` is the default.
-    """
-    parser = argparse.ArgumentParser(description="Watermark Remover Agent CLI")
-    subparsers = parser.add_subparsers(dest="command", required=False)
-    # diag subcommand
-    subparsers.add_parser("diag", help="Check connectivity to Ollama and model availability")
-    # repl subcommand
-    repl_parser = subparsers.add_parser("repl", help="Run the interactive agent REPL")
-    repl_parser.add_argument(
-        "--model",
-        default=os.environ.get("OLLAMA_MODEL", "qwen3:30b"),
-        help="Name of the Ollama model to use (default: qwen3:30b)",
-    )
-    repl_parser.add_argument(
-        "--ollama-url",
-        dest="ollama_url",
-        default=os.environ.get("OLLAMA_URL", None),
-        help="Base URL of the Ollama server (default: value of OLLAMA_URL env or http://localhost:11434)",
-    )
-    repl_parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature for the model (default: 0.0)",
-    )
-    repl_parser.add_argument(
-        "--keep-alive",
-        default=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
-        help="Keep-alive duration for the model on the server (default: 30m)",
-    )
-    repl_parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging for the agent",
-    )
-    # run subcommand
-    run_parser = subparsers.add_parser("run", help="Run the agent on a single instruction")
-    run_parser.add_argument(
-        "instruction",
-        help="Natural-language instruction for the agent to execute",
-    )
-    run_parser.add_argument(
-        "--model",
-        default=os.environ.get("OLLAMA_MODEL", "qwen3:30b"),
-        help="Name of the Ollama model to use (default: qwen3:30b)",
-    )
-    run_parser.add_argument(
-        "--ollama-url",
-        dest="ollama_url",
-        default=os.environ.get("OLLAMA_URL", None),
-        help="Base URL of the Ollama server (default: value of OLLAMA_URL env or http://localhost:11434)",
-    )
-    run_parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature for the model (default: 0.0)",
-    )
-    run_parser.add_argument(
-        "--keep-alive",
-        default=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
-        help="Keep-alive duration for the model on the server (default: 30m)",
-    )
-    run_parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose logging for the agent",
-    )
-    args = parser.parse_args()
-    cmd = args.command or "repl"
-    if cmd == "diag":
-        diag()
-        return
-    elif cmd in {"repl", "run"}:
-        base_url = getattr(args, "ollama_url", None)
-        model_name = getattr(args, "model", os.environ.get("OLLAMA_MODEL", "qwen3:30b"))
-        temp = getattr(args, "temperature", 0.0)
-        keep_alive = getattr(args, "keep_alive", os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
-        verbose = getattr(args, "verbose", False)
-        agent = get_ollama_agent(
-            model_name=model_name,
-            base_url=base_url,
-            temperature=temp,
-            keep_alive=keep_alive,
-            verbose=verbose,
-        )
-        if cmd == "repl":
-            repl(agent)
-            return
-        else:  # cmd == "run"
-            run_once(agent, args.instruction)
-            return
-    else:
-        parser.error(f"Unknown command: {cmd}")
-
-
-if __name__ == "__main__":
-    main()

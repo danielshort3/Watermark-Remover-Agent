@@ -3,14 +3,18 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "watermark-remover-agent"
+name = "watermark-remover-agent-modified"
 version = "0.0.1"
 dependencies = [
-  "langgraph-cli[inmem]",
   "langchain",
+  "langchain-ollama",
   "reportlab",
-  "torch",
+  "Pillow",
   "torchvision",
+  "pytorch-msssim",
+  "opencv-python",
+  # numpy is implicitly required by torchvision and opencv.
+  "numpy",
 ]
 
 [tool.setuptools.packages.find]

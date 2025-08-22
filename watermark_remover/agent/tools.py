@@ -78,49 +78,121 @@ logger = logging.getLogger("wmra.tools")
 
 
 @tool
-def scrape_music(title: str, instrument: str, key: str, input_dir: str = "data/samples") -> str:
+def scrape_music(
+    title: str,
+    instrument: str,
+    key: str,
+    input_dir: str = "data/samples",
+) -> str:
     """Return the path to a directory of sheet music images.
+
+    This stub implementation simply returns a directory on disk.  If the
+    specified ``input_dir`` exists, it is returned directly.  If it does not
+    exist, the function attempts to locate a fallback directory under
+    ``data/samples`` that contains image files.  The first such directory
+    discovered is used.  If no suitable fallback is found, a FileNotFoundError
+    is raised.
 
     Parameters
     ----------
     title : str
-        The title of the piece to search for.  Ignored in this stub implementation.
+        The title of the piece to search for.  Used to help locate
+        alternative directories if the specified ``input_dir`` does not
+        exist.  Matching is case‑insensitive and partial.
     instrument : str
-        The instrument requested.  Ignored in this stub implementation.
+        The instrument requested.  Unused in this stub but provided for
+        future expansion.
     key : str
-        The musical key requested.  Ignored in this stub implementation.
-    input_dir : str
+        The musical key requested.  Unused in this stub but provided for
+        future expansion.
+    input_dir : str, optional
         A directory on disk containing images to process.  Defaults to
-        ``data/samples`` relative to the project root.
+        ``"data/samples"`` relative to the project root.
 
     Returns
     -------
     str
-        The same directory specified by ``input_dir``.
+        Path to the directory containing images.  This may be the
+        ``input_dir`` provided or a fallback under ``data/samples``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If neither the specified ``input_dir`` nor any fallback directory
+        exists.
 
     Notes
     -----
-    This function is a placeholder for the real scraping logic originally
-    implemented in the PyQt GUI with Selenium.  In a production system, you
-    could implement network requests or headless browser automation here and
-    return a directory of downloaded images.
+    This function acts as a bridge between the LLM‑driven agent and the
+    underlying storage.  In a production system you would replace this
+    implementation with actual scraping logic (e.g. Selenium or API calls)
+    that downloads sheet music based on the provided ``title``,
+    ``instrument`` and ``key``.
     """
     start = time.perf_counter()
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
-    # Count how many images will be processed
-    imgs = [p for p in glob.glob(os.path.join(input_dir, "*")) if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
-    logger.info(
-        "SCRAPER: using directory '%s' (%d image file(s)) for title='%s', instrument='%s', key='%s'",
-        input_dir,
-        len(imgs),
-        title,
-        instrument,
-        key,
+    # If the requested directory exists, use it directly.
+    if os.path.isdir(input_dir):
+        imgs = [
+            p
+            for p in glob.glob(os.path.join(input_dir, "*"))
+            if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+        ]
+        logger.info(
+            "SCRAPER: using directory '%s' (%d image file(s)) for title='%s', instrument='%s', key='%s'",
+            input_dir,
+            len(imgs),
+            title,
+            instrument,
+            key,
+        )
+        logger.debug("SCRAPER: sample files: %s", imgs[:5])
+        logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
+        return input_dir
+    # Requested directory does not exist.  Search under data/samples for a
+    # fallback directory.  Use the provided title to try to find a match.
+    # We search for directories containing image files and whose name
+    # contains the title (case‑insensitive).  If none match, we select
+    # the first directory with any images.  If data/samples does not
+    # exist or no directories contain images, we raise FileNotFoundError.
+    root_dir = "data/samples"
+    fallback: Optional[str] = None
+    title_lower = (title or "").lower()
+    if os.path.isdir(root_dir):
+        # Walk immediate subdirectories of root_dir (non‑recursive) to find
+        # candidate directories.  This avoids descending into deeply nested
+        # structures and keeps fallback selection simple.
+        for candidate in sorted(os.listdir(root_dir)):
+            cand_path = os.path.join(root_dir, candidate)
+            if not os.path.isdir(cand_path):
+                continue
+            # Gather image files in this candidate directory
+            images = [
+                f
+                for f in os.listdir(cand_path)
+                if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+            ]
+            if not images:
+                continue
+            # If the directory name contains the title string, prefer it.
+            if title_lower and title_lower in candidate.lower():
+                fallback = cand_path
+                break
+            # Otherwise record it as a potential fallback if we haven't
+            # found a title match yet.
+            if fallback is None:
+                fallback = cand_path
+        if fallback:
+            logger.warning(
+                "SCRAPER: directory '%s' not found; falling back to '%s'",
+                input_dir,
+                fallback,
+            )
+            logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
+            return fallback
+    # No fallback found; raise an error.
+    raise FileNotFoundError(
+        f"Input directory {input_dir} does not exist and no fallback directories were found in '{root_dir}'."
     )
-    logger.debug("SCRAPER: sample files: %s", imgs[:5])
-    logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
-    return input_dir
 
 
 @tool
@@ -168,31 +240,27 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
         raise RuntimeError(f"WMR: no images found in {input_dir}")
     device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
     model = UNet().to(device)
+    # Load the best checkpoint if available.  If loading fails, the model
+    # will continue with random weights so the pipeline still runs.
     try:
-        load_best_model(model, model_dir)
+        load_best_model(model, model_dir)  # type: ignore[misc]
     except Exception:
-        # If model loading fails entirely, continue with random weights.
         logger.warning("WMR: failed to load checkpoints from %s; using random weights", model_dir)
     model.eval()
-    count = 0
+    processed_dir = output_dir
     for fname in images:
-        in_path = os.path.join(input_dir, fname)
-        image_tensor = PIL_to_tensor(in_path).unsqueeze(0).to(device)
+        inp_path = os.path.join(input_dir, fname)
+        out_path = os.path.join(processed_dir, fname)
         with torch.no_grad():
-            output = model(image_tensor)
-        out_image = tensor_to_PIL(output.squeeze())
-        out_image.save(os.path.join(output_dir, fname))
-        count += 1
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "WMR: processed %d image(s) from '%s' -> '%s' on %s in %.3fs",
-        count,
-        input_dir,
-        output_dir,
-        device,
-        elapsed,
-    )
-    return output_dir
+            tensor = PIL_to_tensor(inp_path)
+            tensor = tensor.unsqueeze(0).to(device)
+            output = model(tensor)
+            img = tensor_to_PIL(output.squeeze(0).cpu())
+        os.makedirs(processed_dir, exist_ok=True)
+        img.save(out_path)
+        logger.info("WMR: processed %s -> %s", inp_path, out_path)
+    logger.info("WMR completed in %.3fs", time.perf_counter() - start)
+    return processed_dir
 
 
 @tool
@@ -202,7 +270,7 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
     Parameters
     ----------
     input_dir : str
-        Directory containing images to upscale.
+        Directory containing watermark‑free images.
     model_dir : str
         Directory containing VDSR checkpoint files.
     output_dir : str
@@ -212,6 +280,15 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
     -------
     str
         Path to the directory containing upscaled images.
+
+    Notes
+    -----
+    If PyTorch or the VDSR implementation cannot be imported, this function
+    will raise an ImportError when called.  If the model directory
+    contains no checkpoints, the VDSR model will run with randomly
+    initialised weights, which will not produce meaningful results but
+    allows the pipeline to run end‑to‑end without bundling large model
+    weights in the repository.
     """
     start = time.perf_counter()
     if _import_error is not None:
@@ -226,84 +303,73 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
     os.makedirs(output_dir, exist_ok=True)
     images = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
     if not images:
-        raise RuntimeError(f"VDSR: no images found in {input_dir}")
+        raise RuntimeError(f"UPSCALE: no images found in {input_dir}")
     device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
     model = VDSR().to(device)
+    # Load the best checkpoint if available.  If loading fails the model
+    # will continue with random weights so the pipeline still runs.
     try:
-        load_best_model(model, model_dir)
+        load_best_model(model, model_dir)  # type: ignore[misc]
     except Exception:
         logger.warning("VDSR: failed to load checkpoints from %s; using random weights", model_dir)
     model.eval()
-    count = 0
+    processed_dir = output_dir
     for fname in images:
-        in_path = os.path.join(input_dir, fname)
-        image_tensor = PIL_to_tensor(in_path).unsqueeze(0).to(device)
+        inp_path = os.path.join(input_dir, fname)
+        out_path = os.path.join(processed_dir, fname)
         with torch.no_grad():
-            output = model(image_tensor)
-        out_image = tensor_to_PIL(output.squeeze())
-        out_image.save(os.path.join(output_dir, fname))
-        count += 1
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "VDSR: processed %d image(s) from '%s' -> '%s' on %s in %.3fs",
-        count,
-        input_dir,
-        output_dir,
-        device,
-        elapsed,
-    )
-    return output_dir
+            tensor = PIL_to_tensor(inp_path)
+            tensor = tensor.unsqueeze(0).to(device)
+            output = model(tensor)
+            img = tensor_to_PIL(output.squeeze(0).cpu())
+        os.makedirs(processed_dir, exist_ok=True)
+        img.save(out_path)
+        logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
+    logger.info("UPSCALE completed in %.3fs", time.perf_counter() - start)
+    return processed_dir
 
 
 @tool
 def assemble_pdf(image_dir: str, output_pdf: str = "output.pdf") -> str:
-    """Assemble all images in ``image_dir`` into a single PDF.
+    """Assemble images from a directory into a single PDF file.
 
     Parameters
     ----------
     image_dir : str
-        Directory containing images to assemble.
+        Directory containing images to assemble into a PDF.
     output_pdf : str
-        Filename of the resulting PDF.  If the directory part is omitted,
-        the file will be created in the current working directory.
+        Name of the output PDF file.  If not provided, defaults to
+        ``"output.pdf"``.
 
     Returns
     -------
     str
-        Path to the created PDF.
+        Path to the created PDF file.
+
+    Notes
+    -----
+    If reportlab cannot be imported, this function will raise an
+    ImportError.  The PDF will contain one page per image, preserving
+    the original aspect ratio.
     """
+    start = time.perf_counter()
     if not os.path.isdir(image_dir):
         raise FileNotFoundError(f"Image directory {image_dir} does not exist.")
     try:
-        from reportlab.pdfgen import canvas  # type: ignore
-        from reportlab.lib.pagesizes import letter  # type: ignore
-    except ImportError as e:
-        raise ImportError(
-            "reportlab is required for PDF assembly. Please install it via\n"
-            "`pip install reportlab`."
-        ) from e
-    start = time.perf_counter()
-    images = [
-        f
-        for f in sorted(os.listdir(image_dir))
-        if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
-    ]
+        from reportlab.lib.pagesizes import letter
+        from reportlab.pdfgen import canvas
+    except Exception as e:
+        raise ImportError(f"reportlab is required for PDF assembly: {e}")
+    images = [f for f in sorted(os.listdir(image_dir)) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
     if not images:
-        raise ValueError(f"No images found in {image_dir}")
-    output_path = os.path.abspath(output_pdf)
-    c = canvas.Canvas(output_path, pagesize=letter)
+        raise RuntimeError(f"PDF: no images found in {image_dir}")
+    c = canvas.Canvas(output_pdf, pagesize=letter)
     width, height = letter
-    for img in images:
-        img_path = os.path.join(image_dir, img)
-        c.drawImage(img_path, 0, 0, width=width, height=height, preserveAspectRatio=True, anchor='c')
+    for fname in images:
+        path = os.path.join(image_dir, fname)
+        c.drawImage(path, 0, 0, width=width, height=height, preserveAspectRatio=True)
         c.showPage()
     c.save()
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "ASSEMBLER: assembled %d image(s) from '%s' into PDF '%s' in %.3fs",
-        len(images),
-        image_dir,
-        output_path,
-        elapsed,
-    )
-    return output_path
+    logger.info("ASSEMBLER: wrote %d pages to %s", len(images), output_pdf)
+    logger.info("ASSEMBLER completed in %.3fs", time.perf_counter() - start)
+    return output_pdf

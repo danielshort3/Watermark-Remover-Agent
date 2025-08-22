@@ -80,10 +80,12 @@ def scraper_node(state: PipelineState) -> PipelineState:
             "input_dir": user_input_dir,
         })
     except Exception:
-        # If scraping fails (e.g. directory missing), attempt to use the
-        # default sample directory if it exists.  Otherwise, leave as None.
-        fallback_dir = "data/samples"
-        download_dir = fallback_dir if os.path.isdir(fallback_dir) else None
+        # If the tool raises, set download_dir to None.  The missing
+        # directory will be handled downstream by the watermark removal
+        # step, which will raise its own error.  We do not attempt a
+        # fallback here because ``scrape_music`` implements its own
+        # fallback logic.
+        download_dir = None
     # Normalise return value to str if possible
     new_state["download_path"] = None
     if download_dir:

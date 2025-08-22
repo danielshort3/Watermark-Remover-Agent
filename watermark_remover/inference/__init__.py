@@ -14,4 +14,13 @@ missing or invalid files) and to convert between PIL images and
 torch tensors.
 """
 
-from .model_functions import VDSR, UNet, PIL_to_tensor, tensor_to_PIL, load_best_model  # noqa: F401
+from .model_functions import (
+    VDSR,
+    UNet,
+    PIL_to_tensor,
+    tensor_to_PIL,
+    load_best_model,
+    load_model,
+    PerceptualLoss,
+    CombinedLoss,
+)  # noqa: F401
