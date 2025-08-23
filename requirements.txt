@@ -12,3 +12,13 @@ webdriver-manager
 requests
 pytest
 numpy
+
+# Additional packages required for LangGraph support.  The ``langgraph`` package
+# provides the core graph abstractions while ``langgraph-cli`` installs the
+# ``langgraph`` command line interface used to launch the local API server.  The
+# ``[inmem]`` extra is included so that the CLI can run with the built‑in
+# in‑memory runtime, which is required for local development.  Without this
+# extra, you may encounter missing dependency errors when starting the
+# development server.
+langgraph>=0.2.0
+langgraph-cli[inmem]>=0.2.0

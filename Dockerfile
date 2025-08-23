@@ -43,6 +43,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Expose a port for future use (e.g. LangGraph Studio or a web server)
 EXPOSE 2024
 
-# By default, drop into bash for interactive debugging.  You can override
-# the CMD when running the container to start your own process.
-CMD ["bash"]
+# Set the default command to launch the LangGraph development server.
+# The langgraph-cli dependency installed via requirements.txt provides the
+# `langgraph` entrypoint.  Running `langgraph dev` exposes the compiled
+# graph defined in langgraph.json via a FastAPI server, with a GUI for
+# interactive control available via LangGraph Studio.  The host and port
+# are set so that the server binds to all interfaces on port 2024.
+CMD ["langgraph", "dev", "--host", "0.0.0.0", "--port", "2024"]
