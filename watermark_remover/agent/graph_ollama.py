@@ -139,6 +139,7 @@ def run_instruction(instruction: str) -> str:
             # Map action names to tool functions
             from watermark_remover.agent.tools import (
                 scrape_music,
+                remove_watermark,
                 upscale_images,
                 assemble_pdf,
             )
