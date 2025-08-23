@@ -1,5 +1,4 @@
-# Core dependencies for the Watermark Remover Agent with full model support.
-# PyTorch and CUDA are provided by the base Docker image.
+# Core dependencies for the Watermark Remover Agent
 langchain
 langchain-ollama
 reportlab

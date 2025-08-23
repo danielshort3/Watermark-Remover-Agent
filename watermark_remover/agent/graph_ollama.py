@@ -1,13 +1,10 @@
-"""
-Helpers for invoking the Ollama‑powered chat agent.
+"""Helpers for invoking the Ollama‑powered chat agent.
 
-This module provides a direct interface to execute natural‑language
-instructions using a LangChain agent backed by an Ollama model.  It does
-not implement or expose any LangGraph nodes or graphs.  To run a task
-simply call :func:`run_instruction` with your prompt.  If you need
-a reusable agent instance, import :func:`get_ollama_agent` from
-``watermark_remover.agent.ollama_agent`` and use its ``invoke``
-method directly.
+This module exposes a utility to run natural‑language instructions
+through a LangChain agent backed by an Ollama model and capture the
+LLM's reasoning.  All reasoning and final responses are written to
+the current run's log directory (see ``WMRA_LOG_DIR``) to aid in
+debugging and transparency.
 """
 
 from __future__ import annotations
@@ -17,17 +14,12 @@ import json
 import urllib.request
 from typing import Any, Dict
 
+from watermark_remover.agent.ollama_agent import get_ollama_agent
+
+# -----------------------------------------------------------------------------
 
 def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
-    """Ping an Ollama server for diagnostics.
-
-    Contacts the Ollama API at ``base_url`` to retrieve version and tag
-    information and checks whether the specified ``model`` is available.
-    Returns a dictionary with keys ``ok`` (bool), ``version`` (dict or
-    None), ``models`` (list of model names) and ``has_model`` (bool)
-    along with the original ``base_url`` and ``model`` values.  On
-    failure it sets ``ok=False`` and includes an ``error`` string.
-    """
+    """Check availability of the Ollama server and model."""
     out: Dict[str, Any] = {"ok": True, "base_url": base_url, "model": model}
     try:
         with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/version", timeout=5) as resp:
@@ -38,99 +30,75 @@ def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
     try:
         with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=5) as resp:
             tags = json.loads(resp.read().decode("utf-8")).get("models", [])
-            names = [m.get("name") or m.get("model") for m in tags]
-            out["models"] = names
-            out["has_model"] = model in names
+            out["models"] = tags
+            out["has_model"] = model in tags
     except Exception as exc:
-        out.update(ok=False, error=f"Failed to query tags: {exc}")
+        out.update(ok=False, error=f"Failed to fetch models: {exc}")
     return out
 
 
-def run_instruction(instruction: str) -> str:
-    """Execute a task using the Ollama‑powered LangChain agent.
+def run_instruction(prompt: str, model: str = "qwen3:30b", base_url: str | None = None) -> str:
+    """Execute a user instruction via the Ollama agent with reasoning logging.
 
-    This convenience wrapper constructs and invokes a LangChain agent on
-    demand.  It first ensures a non‑empty prompt, then verifies that the
-    Ollama server specified by the ``OLLAMA_URL`` environment variable
-    (defaulting to ``http://localhost:11434``) is reachable and that
-    the model specified by ``OLLAMA_MODEL`` (defaulting to ``qwen3:30b``)
-    is available.  It lazily imports the agent factory function
-    :func:`get_ollama_agent` and returns the agent's response as a
-    string.  Any error encountered is returned as a descriptive string.
-
-    Parameters
-    ----------
-    instruction : str
-        A natural‑language instruction to pass to the agent.
-
-    Returns
-    -------
-    str
-        The agent's response or an error message.
+    When ``verbose=True`` the agent prints its reasoning steps to stdout.
+    We capture that output and append it to a ``thoughts_and_steps.log`` file
+    under the log directory.  The function returns the agent's final output
+    string.
     """
-    prompt = (instruction or "").strip()
-    if not prompt:
-        return (
-            "No instruction provided. Please supply a natural‑language task "
-            "for the agent to perform."
-        )
-    base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
-    diag = _ping_ollama(base_url, model)
-    if not diag.get("ok", False):
-        return f"Cannot reach Ollama at {base_url}: {diag.get('error', 'Unknown error')}"
-    if not diag.get("has_model", False):
-        return (
-            f"Model '{model}' not found on Ollama server. Available models: "
-            f"{diag.get('models')}"
-        )
+    # Determine log directory
+    log_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "logs"))
+    os.makedirs(log_dir, exist_ok=True)
+    # Try to build the agent
     try:
-        from watermark_remover.agent.ollama_agent import get_ollama_agent  # type: ignore
-    except Exception as exc:
-        return (
-            "Failed to import get_ollama_agent: required dependencies "
-            f"are missing. Original error: {exc}"
-        )
-    try:
-        # Request verbose output from the agent.  When verbose=True the
-        # underlying LangChain agent will print its reasoning to stdout.
+        # We enable verbose output so the agent prints reasoning to stdout.
         agent = get_ollama_agent(model_name=model, base_url=base_url, verbose=True)
     except Exception as exc:
         return f"Failed to create Ollama agent: {exc}"
+    # Run the agent with intermediate step capture
     try:
-        # Use the agent's run method to execute the task end‑to‑end.  This
-        # avoids returning intermediate JSON and ensures the agent calls
-        # tools automatically.  Pass the raw prompt as input; run() will
-        # interpret it as the user message.
-        try:
-            response = agent.run(prompt)  # type: ignore[no-untyped-call]
-        except Exception:
-            # Fall back to invoke with the structured input if run is not available
-            response = agent.invoke({"input": prompt})
+        result = agent.invoke({"input": prompt}, return_intermediate_steps=True)
     except Exception as exc:
         return f"Error executing instruction: {exc}"
-    # Extract the answer from the agent response.  The LLM may return
-    # structured objects or plain strings.  When using the Ollama backend
-    # with the provided prompt instructions, the 'output' key will include
-    # both the agent's reasoning (between <think> tags) and the final
-    # answer.  We capture this string as the answer.
-    if isinstance(response, dict):
-        answer = response.get("output") or response.get("result") or response
+    # Extract answer and reasoning
+    answer = ""
+    steps = []
+    if isinstance(result, dict):
+        answer = result.get("output") or result.get("result") or ""
+        steps = result.get("intermediate_steps") or []
     else:
-        answer = response
-    # Persist the thought process and steps to a log file under the
-    # output directory.  Each invocation appends to the log with the
-    # instruction and the model's full response.  This allows users to
-    # inspect how the agent reasoned about the task and which tools were
-    # invoked.  If the file cannot be written, we silently ignore
-    # errors.
+        answer = str(result)
+    # Log reasoning and final answer
     try:
-        out_dir = os.path.join(os.getcwd(), "output")
-        os.makedirs(out_dir, exist_ok=True)
-        log_path = os.path.join(out_dir, "thoughts_and_steps.log")
+        log_path = os.path.join(log_dir, "thoughts_and_steps.log")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"Instruction: {prompt}\n")
-            f.write(str(answer) + "\n\n")
+            if steps:
+                for idx, step in enumerate(steps, 1):
+                    try:
+                        thought = step.get("thought")
+                        action = step.get("action")
+                        action_input = step.get("action_input")
+                        observation = step.get("observation")
+                    except Exception:
+                        thought = action = action_input = observation = None
+                    f.write(f"Step {idx}:\n")
+                    if thought:
+                        f.write(f"  Thought: {thought}\n")
+                    if action:
+                        f.write(f"  Action: {action}\n")
+                    if action_input:
+                        f.write(f"  Action Input: {action_input}\n")
+                    if observation:
+                        f.write(f"  Observation: {observation}\n")
+            else:
+                # If intermediate steps are unavailable, log the raw result for transparency
+                try:
+                    import json
+                    f.write("No intermediate steps provided. Raw result:\n")
+                    f.write(json.dumps(result, indent=2) + "\n")
+                except Exception:
+                    f.write("No intermediate steps provided. Result could not be serialized.\n")
+            f.write(f"Answer: {answer}\n\n")
     except Exception:
         pass
     return str(answer)

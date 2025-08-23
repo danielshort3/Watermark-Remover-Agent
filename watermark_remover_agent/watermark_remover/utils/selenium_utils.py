@@ -95,25 +95,6 @@ class SeleniumHelper:
         """
         try:
             with selenium_lock:
-                # Determine a human‑readable label for the element before waiting.  Use the
-                # XPath mapping as an initial guess; this may be overwritten later
-                init_label = xpath_labels.get(xpath, "element")
-                # Determine log and screenshot base directory
-                base_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "output"))
-                screenshots_dir = os.path.join(base_dir, "screenshots")
-                os.makedirs(screenshots_dir, exist_ok=True)
-                # Build a filename using timestamp prefix and safe label
-                ts_pref = int(time.time() * 1000)
-                safe_label_init = ''.join(c if c.isalnum() else '_' for c in init_label)[:30] or 'element'
-                pre_filename = f"{ts_pref}_{safe_label_init}.png"
-                pre_path = os.path.join(screenshots_dir, pre_filename)
-                # Capture full viewport screenshot before attempting to locate element
-                try:
-                    driver.save_screenshot(pre_path)
-                except Exception:
-                    pass
-                # Log will include this pre-click screenshot regardless of success
-                screenshot_path = pre_path
                 # Wait for the element to be clickable
                 if log_func:
                     log_func(f"[DEBUG] Waiting for element to be clickable: {xpath}")
@@ -137,13 +118,19 @@ class SeleniumHelper:
                 # attempts yield nothing.
                 label = ""
                 try:
+                    # Strategy 1: element.text property
                     label = (element.text or "").strip()
+                    # Strategy 2: get innerText attribute
                     if not label:
                         label = (element.get_attribute("innerText") or "").strip()
+                    # Strategy 3: get textContent attribute (covers some
+                    # elements that store text only in textContent)
                     if not label:
                         label = (element.get_attribute("textContent") or "").strip()
+                    # Strategy 4: get aria-label for accessibility
                     if not label:
                         label = (element.get_attribute("aria-label") or "").strip()
+                    # Strategy 5: execute JS to get node's text content
                     if not label and driver is not None:
                         try:
                             label = (
@@ -153,52 +140,64 @@ class SeleniumHelper:
                                 or ""
                             ).strip()
                         except Exception:
+                            # ignore JS errors
                             pass
                 except Exception:
                     label = ""
+
+                # If no label was discovered, fall back to a predefined
+                # mapping of XPath strings to labels.  This allows us to
+                # provide human‑readable names for buttons that do not have
+                # visible text (e.g. icons or dropdown toggles).  See
+                # `xpath_labels` defined at module level.
                 if not label:
                     mapped = xpath_labels.get(xpath)
                     if mapped:
                         label = mapped
-                # Now capture a screenshot with bounding box overlay using updated label
-                try:
-                    ts2 = int(time.time() * 1000)
-                    safe_label_now = ''.join(c if c.isalnum() else '_' for c in (label or 'element'))[:30] or 'element'
-                    filename = f"{ts2}_{safe_label_now}.png"
-                    full_path = os.path.join(screenshots_dir, filename)
-                    # Save full screenshot
-                    driver.save_screenshot(full_path)
-                    # Highlight element by drawing a red rectangle
-                    try:
-                        from PIL import Image, ImageDraw
-                        img = Image.open(full_path)
-                        draw = ImageDraw.Draw(img)
-                        rect = element.rect
-                        left, top = rect['x'], rect['y']
-                        right, bottom = left + rect['width'], top + rect['height']
-                        draw.rectangle([left, top, right, bottom], outline="red", width=3)
-                        img.save(full_path)
-                        screenshot_path = full_path
-                    except Exception:
-                        screenshot_path = full_path
-                except Exception:
-                    # fallback to pre-path if we cannot take highlight screenshot
-                    screenshot_path = pre_path
-                # Capture the current URL for context
+                # Capture the current URL for context.  This helps when
+                # reviewing logs to understand which page the click is
+                # occurring on.  If obtaining the URL fails, leave it
+                # blank.
                 url = ""
                 try:
                     url = driver.current_url
                 except Exception:
                     url = ""
-                # Log the click attempt
+
+                # Prepare a placeholder for the screenshot path.  This
+                # variable will be populated before the actual click and
+                # reused when logging the success message.  Define it
+                # here to ensure it exists across the nested scopes.
+                screenshot_path = ""
+                # Log the click attempt with the label, xpath and URL.  Pass the
+                # structured data via the extra dict so that the CSV handler can
+                # populate separate columns for button_text, xpath and url.
                 if log_func:
+                    # Build the human‑readable message
                     if label:
                         msg_attempt = f"[DEBUG] Attempting click on element: '{label}' ({xpath})"
                     else:
                         msg_attempt = f"[DEBUG] Attempting click on element: {xpath}"
                     if url:
                         msg_attempt += f" at {url}"
-                    log_func(msg_attempt, extra={"button_text": label, "xpath": xpath, "url": url, "screenshot": screenshot_path})
+                    try:
+                        # Prepare screenshot of the entire viewport to show where the click will occur
+                        screenshot_path = ""
+                        try:
+                            # Determine the base directory for logs/screenshots.  Use the
+                            # WMRA_LOG_DIR environment variable if set by tools.py; fall
+                            # back to a local ``output`` directory otherwise.
+                            base_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "output"))
+                            out_dir = os.path.join(base_dir, "screenshots")
+                            os.makedirs(out_dir, exist_ok=True)
+                            # Build a filename using the label and timestamp
+                            ts = int(time.time() * 1000)
+                            safe_label = ''.join(c if c.isalnum() else '_' for c in (label or 'element'))[:30]
+                            filename = f"{safe_label}_{ts}.png"
+                            file_path = os.path.join(out_dir, filename)
+                            # Capture full viewport screenshot
+                            driver.save_screenshot(file_path)
+                            # Highlight the element on the screenshot by drawing a red rectangle
                             try:
                                 # Determine element bounds relative to the current viewport.
                                 rect = element.rect  # x, y relative to the viewport in CSS pixels

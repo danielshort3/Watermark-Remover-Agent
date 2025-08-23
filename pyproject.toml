@@ -1,24 +1,23 @@
+[tool.poetry]
+name = "watermark-remover-agent"
+version = "0.1.0"
+description = "Watermark Remover Agent with enhanced scraping and logging"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+langchain = "*"
+langchain-ollama = "*"
+reportlab = "*"
+Pillow = "*"
+torchvision = "*"
+pytorch-msssim = "*"
+opencv-python = "*"
+selenium = "*"
+webdriver-manager = "*"
+requests = "*"
+numpy = "*"
+
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "watermark-remover-agent-modified"
-version = "0.0.1"
-dependencies = [
-  "langchain",
-  "langchain-ollama",
-  "reportlab",
-  "Pillow",
-  "torchvision",
-  "pytorch-msssim",
-  "opencv-python",
-  # numpy is implicitly required by torchvision and opencv.
-  "numpy",
-  "selenium",
-  "webdriver-manager",
-  "requests",
-]
-
-[tool.setuptools.packages.find]
-include = ["watermark_remover*"]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

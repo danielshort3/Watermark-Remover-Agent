@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "watermark-remover-agent-modified"
+version = "0.0.1"
+dependencies = [
+  "langchain",
+  "langchain-ollama",
+  "reportlab",
+  "Pillow",
+  "torchvision",
+  "pytorch-msssim",
+  "opencv-python",
+  # numpy is implicitly required by torchvision and opencv.
+  "numpy",
+  "selenium",
+  "webdriver-manager",
+  "requests",
+]
+
+[tool.setuptools.packages.find]
+include = ["watermark_remover*"]
