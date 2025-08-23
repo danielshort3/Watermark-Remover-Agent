@@ -730,10 +730,9 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         song_index,
                         e,
                     )
-                    # Refresh the search results and restart iteration
-                    song_candidates = perform_search()
-                    found_candidate = False
-                    break
+                    # If we cannot extract the song URL we simply skip this candidate.
+                    # Do not re‑run the search; continue with the next candidate in the list.
+                    continue
                 # Save current window handle and open the candidate in a new tab
                 original_window = driver.current_window_handle
                 try:
@@ -745,22 +744,22 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         href,
                         e,
                     )
-                    song_candidates = perform_search()
-                    found_candidate = False
-                    break
+                    # If opening the new tab fails, skip this candidate and continue.
+                    continue
                 # Switch to the newly opened tab
                 try:
                     driver.switch_to.window(driver.window_handles[-1])
                 except Exception:
-                    # If switching fails, close the tab and continue
+                    # If switching fails, close the tab and skip this candidate
                     try:
                         driver.close()
                     except Exception:
                         pass
-                    driver.switch_to.window(original_window)
-                    song_candidates = perform_search()
-                    found_candidate = False
-                    break
+                    try:
+                        driver.switch_to.window(original_window)
+                    except Exception:
+                        pass
+                    continue
                 # Allow the page to load
                 time.sleep(random.uniform(1.0, 2.0))
                 # Now operate within the new tab: click chords and orchestration
@@ -777,7 +776,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 except Exception:
                     orch_ok = False
                 if not orch_ok:
-                    # Close the tab and switch back to search results
+                    # Close the tab and switch back to the original search results tab.
                     try:
                         driver.close()
                     except Exception:
@@ -790,10 +789,8 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         "SCRAPER: candidate '%s' has no orchestration; skipping",
                         cand.get('title', 'unknown'),
                     )
-                    # Refresh the search results and restart iteration
-                    song_candidates = perform_search()
-                    found_candidate = False
-                    break
+                    # Skip to the next candidate without re‑running the search.
+                    continue
                 else:
                     # Orchestration opened successfully in the new tab
                     selected = cand
