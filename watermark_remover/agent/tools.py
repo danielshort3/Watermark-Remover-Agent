@@ -440,7 +440,7 @@ def scrape_music(
 # scraping fails for any reason, the function returns ``None`` so
 # ``scrape_music`` can fall back to other logic.
 
-def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str]:
+def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool = False) -> Optional[str]:
     """Attempt to scrape sheet music from an online catalogue.
 
     This helper uses a headless Chrome browser (via Selenium WebDriver) to
@@ -557,133 +557,266 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
             return None
         # Allow suggestions/results to render
         time.sleep(2)
-        # Click the Songs tab to filter results.  The PraiseCharts search page
-        # groups results into categories (Songs, Artists, Albums, etc.).  By
-        # default, it may highlight the last used category or include albums.
-        # Click the button labelled 'Songs' if present to ensure we only
-        # iterate over song results.  Ignore any failure to find or click.
-        try:
-            songs_tab_xpath = "//button[contains(., 'Songs')]"
-            songs_tab = SeleniumHelper.find_element(driver, songs_tab_xpath, timeout=3, log_func=logger.debug)
-            if songs_tab:
-                SeleniumHelper.click_element(driver, songs_tab)
-                time.sleep(random.uniform(0.5, 1.5))
-        except Exception as e:
-            logger.debug("SCRAPER: unable to click Songs tab: %s", e)
-        # Gather search results: titles and artists
-        song_candidates: list[dict[str, Any]] = []
-        songs_parent = SeleniumHelper.find_element(driver, XPATHS['songs_parent'], timeout=10, log_func=logger.debug)
-        if songs_parent:
-            songs_children = songs_parent.find_elements("xpath", './app-product-list-item')
-            for idx, child in enumerate(songs_children, 1):
+        # We no longer click the Songs tab here.  Instead, the perform_search
+        # helper will handle filtering the results and waiting for the
+        # loading spinner to disappear.  This avoids duplicating logic and
+        # ensures consistent timing across retries.
+        # ------------------------------------------------------------------
+        # Helper to perform a search and compile song candidates
+        # ------------------------------------------------------------------
+        def perform_search() -> list[dict[str, Any]]:
+            """Navigate to the search page, enter the title, click the Songs filter and
+            return a list of song candidate dictionaries.
+
+            Each dictionary contains the DOM index, song title, artist (if available)
+            and text3 (metadata containing keys) for each result.  Albums and
+            non-song results are excluded.
+            """
+            # Navigate to the search URL
+            try:
+                driver.get(search_url)
+            except Exception:
+                return []
+            # Enter the title in the search bar
+            if not SeleniumHelper.send_keys_to_element(driver, XPATHS['search_bar'], title, timeout=5, log_func=logger.debug):
+                return []
+            # Allow suggestions to render
+            time.sleep(random.uniform(0.5, 1.5))
+            # Click the Songs tab to filter results.  Use the XPath string directly
+            # and ignore errors if the element cannot be clicked.  After clicking,
+            # wait for the loading spinner to disappear before collecting
+            # search results.  PraiseCharts shows an animated ``app-loading-spinner``
+            # element while filtering the results; if we proceed before the
+            # spinner disappears, attempts to click the first result may fail.
+            try:
+                songs_tab_xpath = "//button[contains(., 'Songs')]"
+                SeleniumHelper.click_element(driver, songs_tab_xpath, timeout=5, log_func=logger.debug)
+                # After clicking the Songs tab, wait for the loading spinner
+                # to appear and then disappear.  PraiseCharts renders a
+                # <app-loading-spinner> element inside the search bar
+                # when filtering; we first wait up to 5 seconds for it to
+                # appear, then wait up to an additional 10 seconds for it
+                # to vanish.  This prevents premature access to the DOM.
+                spinner_xpath = "//app-loading-spinner"
+                # Wait for the spinner to appear (if it ever does)
+                # Wait up to a few seconds for the spinner to appear.  In some
+                # cases the spinner appears after a brief delay.  If it
+                # never appears, we will proceed to the disappear wait.
+                appear_deadline = time.time() + 7
+                while time.time() < appear_deadline:
+                    try:
+                        if driver.find_elements(By.XPATH, spinner_xpath):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                # Wait for the spinner to disappear.  Some searches can take up to
+                # 15 seconds to refresh the results, so allow a generous
+                # timeout here.  Poll every 0.3 seconds until no spinner
+                # elements are present or until the deadline is reached.
+                disappear_deadline = time.time() + 15
+                while time.time() < disappear_deadline:
+                    try:
+                        spinners = driver.find_elements(By.XPATH, spinner_xpath)
+                    except Exception:
+                        spinners = []
+                    if not spinners:
+                        break
+                    time.sleep(0.3)
+                # Brief additional pause to allow DOM to stabilise
+                time.sleep(random.uniform(0.5, 1.0))
+            except Exception:
+                # If clicking the songs tab or waiting for the spinner fails, just continue
+                pass
+            # Locate the songs container
+            songs_parent_el = SeleniumHelper.find_element(driver, XPATHS['songs_parent'], timeout=10, log_func=logger.debug)
+            if not songs_parent_el:
+                return []
+            # Collect children list items
+            children = songs_parent_el.find_elements("xpath", './app-product-list-item')
+            candidates: list[dict[str, Any]] = []
+            for idx, child in enumerate(children, 1):
                 song_title = ''
                 artist_name = ''
-                # Title
+                text3 = ''
+                # Extract title
                 try:
                     title_el = child.find_element("xpath", XPATHS['song_title'])
                     song_title = title_el.text.strip()
                 except Exception:
                     pass
-                # text3 (e.g. key list)
-                text3 = ''
+                # Extract text3 (keys or 'Album')
                 try:
                     text3_el = child.find_element("xpath", XPATHS['song_text3'])
                     text3 = text3_el.text.strip()
                 except Exception:
                     text3 = ''
-                # text2 (artist) only if text3 exists
+                # Skip entries without text3 or containing 'album'
+                if not text3:
+                    continue
+                if 'album' in text3.lower():
+                    continue
+                # Extract artist (text2) if present
                 text2 = ''
-                if text3:
-                    try:
-                        text2_el = child.find_element("xpath", XPATHS['song_text2'])
-                        # Only take the first line of text2
-                        text2 = text2_el.text.split("\n")[0].strip()
-                    except Exception:
-                        text2 = ''
-                # Determine artist: in the GUI, if text3 exists, text2 is the artist name
-                if text3 and text2 and text3 != text2:
+                try:
+                    text2_el = child.find_element("xpath", XPATHS['song_text2'])
+                    text2 = text2_el.text.split("\n")[0].strip()
+                except Exception:
+                    text2 = ''
+                if text2 and text3 and text3 != text2:
                     artist_name = text2
                 if song_title:
-                    song_candidates.append({
+                    candidates.append({
                         'index': idx,
                         'title': song_title,
                         'artist': artist_name,
                         'text3': text3,
                     })
-        # Log candidate titles for debugging
-        if song_candidates:
-            try:
-                choices_str = ', '.join([
-                    f"{c['title']}" + (f" by {c['artist']}" if c['artist'] else '')
-                    for c in song_candidates[:5]
-                ])
-                logger.info("SCRAPER: search results: %s", choices_str)
-            except Exception:
-                pass
-        # Iterate over search candidates until one with orchestration is found.  Some
-        # songs may not have orchestrations (e.g. chord charts only).  When we
-        # encounter a candidate without the required orchestration menu, we
-        # return to the search results and try the next candidate.  For each
-        # candidate we also log which result is being evaluated so the user
-        # can follow the agent's decision process in the logs.
+            # Log first few candidates
+            if candidates:
+                try:
+                    choices_str = ', '.join([
+                        f"{c['title']}" + (f" by {c['artist']}" if c['artist'] else '')
+                        for c in candidates[:5]
+                    ])
+                    logger.info("SCRAPER: search results: %s", choices_str)
+                except Exception:
+                    pass
+            return candidates
+
+        # Build the initial list of song candidates
+        song_candidates = perform_search()
+        # Set of attempted song identifiers to avoid infinite loops
+        attempted: set[tuple[str, str]] = set()
         selected = None
         artist_name = ''
         song_index = None
-        for cand in song_candidates:
-            artist_name = cand.get('artist', '') or ''
-            song_index = cand['index']
-            # Log the candidate being evaluated
-            try:
-                logger.info(
-                    "SCRAPER: evaluating candidate '%s'%s",
-                    cand.get('title', 'unknown'),
-                    f" by {cand.get('artist')}" if cand.get('artist') else '',
-                )
-            except Exception:
-                pass
-            # Click the candidate.  If this fails, skip to the next candidate.
-            if not SeleniumHelper.click_dynamic_element(
-                driver, XPATHS['click_song'], song_index, timeout=5, log_func=logger.debug
-            ):
-                logger.error("SCRAPER: failed to click song result at index %d", song_index)
-                continue
-            # Random pause after clicking a search result to mimic human behaviour
-            time.sleep(random.uniform(0.4, 1.2))
-            # Click the chords button if present (harmless if not present)
-            SeleniumHelper.click_element(
-                driver, XPATHS['chords_button'], timeout=5, log_func=logger.debug
-            )
-            # Pause to allow the page to update
-            time.sleep(random.uniform(0.3, 0.8))
-            # Try to click the orchestration header; if this fails, the song may
-            # not have orchestration.  Log the failure and return to search results.
-            orch_ok = SeleniumHelper.click_element(
-                driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug
-            )
-            # Add a brief random delay after attempting to open orchestration
-            time.sleep(random.uniform(0.3, 0.8))
-            if not orch_ok:
-                logger.info(
-                    "SCRAPER: candidate '%s' has no orchestration; skipping",
-                    cand.get('title', 'unknown'),
-                )
-                # Go back to search results and try the next candidate
+        # Loop until a song with orchestration is found or candidates are exhausted
+        while True:
+            found_candidate = False
+            # Iterate through current candidates
+            for cand in song_candidates:
+                # Unique identifier: (title, artist)
+                ident = (cand.get('title', ''), cand.get('artist', ''))
+                if ident in attempted:
+                    continue
+                attempted.add(ident)
+                artist_name = cand.get('artist', '') or ''
+                song_index = cand['index']
+                # Log candidate being evaluated
                 try:
-                    driver.back()
-                    time.sleep(1)
+                    logger.info(
+                        "SCRAPER: evaluating candidate '%s'%s",
+                        cand.get('title', 'unknown'),
+                        f" by {cand.get('artist')}" if cand.get('artist') else '',
+                    )
                 except Exception:
                     pass
-                continue
-            # At this point the orchestration header was clicked successfully.
-            selected = cand
-            break
-        # If no candidate with orchestration was found, log and return None
-        if not selected:
-            logger.error(
-                "SCRAPER: no orchestration found for any search result of '%s'",
-                title,
-            )
-            return None
+                # Instead of clicking the candidate in the same tab, open it in a new tab.
+                # Retrieve the anchor element for this candidate to extract its href.
+                try:
+                    candidate_xpath = XPATHS['click_song'].format(index=song_index)
+                    candidate_div = SeleniumHelper.find_element(
+                        driver, candidate_xpath, timeout=5, log_func=logger.debug
+                    )
+                    if not candidate_div:
+                        raise Exception("candidate_div not found")
+                    # The clickable div is inside an <a> tag; get the parent anchor
+                    parent_anchor = candidate_div.find_element(By.XPATH, "..")
+                    href = parent_anchor.get_attribute("href")
+                except Exception as e:
+                    logger.error(
+                        "SCRAPER: failed to obtain URL for song result at index %d: %s",
+                        song_index,
+                        e,
+                    )
+                    # Refresh the search results and restart iteration
+                    song_candidates = perform_search()
+                    found_candidate = False
+                    break
+                # Save current window handle and open the candidate in a new tab
+                original_window = driver.current_window_handle
+                try:
+                    driver.execute_script("window.open(arguments[0], '_blank');", href)
+                except Exception as e:
+                    logger.error(
+                        "SCRAPER: failed to open new tab for '%s' (%s): %s",
+                        cand.get('title', 'unknown'),
+                        href,
+                        e,
+                    )
+                    song_candidates = perform_search()
+                    found_candidate = False
+                    break
+                # Switch to the newly opened tab
+                try:
+                    driver.switch_to.window(driver.window_handles[-1])
+                except Exception:
+                    # If switching fails, close the tab and continue
+                    try:
+                        driver.close()
+                    except Exception:
+                        pass
+                    driver.switch_to.window(original_window)
+                    song_candidates = perform_search()
+                    found_candidate = False
+                    break
+                # Allow the page to load
+                time.sleep(random.uniform(1.0, 2.0))
+                # Now operate within the new tab: click chords and orchestration
+                try:
+                    SeleniumHelper.click_element(
+                        driver, XPATHS['chords_button'], timeout=5, log_func=logger.debug
+                    )
+                    # Pause briefly
+                    time.sleep(random.uniform(0.5, 1.0))
+                    orch_ok = SeleniumHelper.click_element(
+                        driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug
+                    )
+                    time.sleep(random.uniform(0.5, 1.0))
+                except Exception:
+                    orch_ok = False
+                if not orch_ok:
+                    # Close the tab and switch back to search results
+                    try:
+                        driver.close()
+                    except Exception:
+                        pass
+                    try:
+                        driver.switch_to.window(original_window)
+                    except Exception:
+                        pass
+                    logger.info(
+                        "SCRAPER: candidate '%s' has no orchestration; skipping",
+                        cand.get('title', 'unknown'),
+                    )
+                    # Refresh the search results and restart iteration
+                    song_candidates = perform_search()
+                    found_candidate = False
+                    break
+                else:
+                    # Orchestration opened successfully in the new tab
+                    selected = cand
+                    found_candidate = True
+                    break
+            # Break outer loop if a candidate with orchestration was found
+            if found_candidate:
+                break
+            # If no candidates left after filtering and we didn't find any, log and abort
+            if not song_candidates or all((c.get('title', ''), c.get('artist', '')) in attempted for c in song_candidates):
+                logger.error(
+                    "SCRAPER: no orchestration found for any search result of '%s'",
+                    title,
+                )
+                # Retry once by restarting search if not yet retried
+                if not _retry:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                    return _scrape_with_selenium(title, instrument, key, _retry=True)
+                return None
+        # End of candidate selection loop
         # At this point we are on the product page for the selected song.  We
         # assume the orchestration header was successfully opened.  Proceed to
         # gather keys and instruments.

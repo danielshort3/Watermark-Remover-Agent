@@ -193,7 +193,13 @@ class SeleniumHelper:
                             # Build a filename using the label and timestamp
                             ts = int(time.time() * 1000)
                             safe_label = ''.join(c if c.isalnum() else '_' for c in (label or 'element'))[:30]
-                            filename = f"{safe_label}_{ts}.png"
+                            # Prepend the timestamp to the filename so that
+                            # screenshots sort in chronological order.  The
+                            # timestamp is placed at the beginning of the
+                            # filename, followed by a sanitized label.  This
+                            # ensures all screenshots are unique and easy to
+                            # order when reviewing a large number of images.
+                            filename = f"{ts}_{safe_label}.png"
                             file_path = os.path.join(out_dir, filename)
                             # Capture full viewport screenshot
                             driver.save_screenshot(file_path)

@@ -118,6 +118,47 @@ def run_instruction(instruction: str) -> str:
         answer = response.get("output") or response.get("result") or response
     else:
         answer = response
+    # Fallback: if the answer looks like a plan (contains an action and action_input)
+    # but the agent did not execute the tool, parse and run the tool manually.
+    try:
+        # If answer is a dict with 'action', treat it as a plan
+        plan = None
+        if isinstance(answer, dict) and 'action' in answer:
+            plan = answer
+        elif isinstance(answer, str) and answer.strip().startswith('{'):
+            import json as _json
+            try:
+                parsed = _json.loads(answer)
+                if isinstance(parsed, dict) and 'action' in parsed:
+                    plan = parsed
+            except Exception:
+                plan = None
+        if plan:
+            action_name = plan.get('action')
+            action_input = plan.get('action_input', {}) or {}
+            # Map action names to tool functions
+            from watermark_remover.agent.tools import (
+                scrape_music,
+                upscale_images,
+                assemble_pdf,
+            )
+            tool_map = {
+                'scrape_music': scrape_music,
+                'remove_watermark': remove_watermark,
+                'upscale_images': upscale_images,
+                'assemble_pdf': assemble_pdf,
+            }
+            func = tool_map.get(action_name)
+            if func:
+                try:
+                    result_val = func(**action_input)
+                    # Overwrite answer with actual result
+                    answer = result_val
+                except Exception as tool_exc:
+                    answer = f"Error running tool {action_name}: {tool_exc}"
+    except Exception:
+        # If fallback fails, ignore and keep original answer
+        pass
     # Persist the thought process and steps to a log file under the
     # output directory.  Each invocation appends to the log with the
     # instruction and the model's full response.  This allows users to
