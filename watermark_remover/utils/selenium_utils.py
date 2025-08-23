@@ -273,3 +273,36 @@ class SeleniumHelper:
     def send_keys_to_element(driver: Any, xpath: str, keys: str, timeout: float = 2, log_func: Optional[Any] = None) -> bool:
         """Alias for :meth:`send_keys` to maintain compatibility with older code."""
         return SeleniumHelper.send_keys(driver, xpath, keys, timeout, log_func)
+
+    @staticmethod
+    def click_dynamic_element(
+        driver: Any,
+        xpath_template: str,
+        index: int,
+        timeout: float = 2,
+        log_func: Optional[Any] = None,
+    ) -> bool:
+        """Click an element whose XPath is parameterised by an index.
+
+        Many of the PraiseCharts result pages use numbered list items (e.g.
+        ``app-product-list-item[1]``).  This helper formats the provided
+        ``xpath_template`` with the given ``index`` and delegates to
+        :meth:`click_element`.  The template should contain a ``{index}``
+        placeholder.
+
+        Args:
+            driver: Selenium WebDriver instance.
+            xpath_template: XPath string with ``{index}`` placeholder.
+            index: 1-based index to insert into the XPath template.
+            timeout: Maximum time to wait for the element to become clickable.
+            log_func: Optional logger function for debug messages.
+
+        Returns:
+            True if the click succeeded, False otherwise.
+        """
+        try:
+            xpath = xpath_template.format(index=index)
+        except Exception:
+            # If formatting fails, fall back to template as-is
+            xpath = xpath_template
+        return SeleniumHelper.click_element(driver, xpath, timeout, log_func)
