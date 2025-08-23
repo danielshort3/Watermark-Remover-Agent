@@ -717,16 +717,66 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
                 text = btn.text.strip()
                 if text:
                     available_keys.append(text)
-            # Choose requested key if available
+            # Choose requested key if available or closest fallback
             requested_norm = normalize_key(key)
+            # Determine target semitone if possible
+            try:
+                from watermark_remover.utils.transposition_utils import KEY_TO_SEMITONE
+                target_semitone = KEY_TO_SEMITONE.get(normalize_key(requested_norm), None)
+            except Exception:
+                target_semitone = None
+            # Attempt to select the requested key exactly
             for btn in key_buttons:
-                if btn.text.strip().lower() == requested_norm.lower():
-                    selected_key = btn.text.strip()
-                    btn.click()
+                try:
+                    btn_text = btn.text.strip()
+                except Exception:
+                    continue
+                if btn_text and btn_text.lower() == requested_norm.lower():
+                    selected_key = btn_text
+                    try:
+                        btn.click()
+                    except Exception:
+                        pass
                     break
+            # If not selected and we know the target semitone, choose the closest key (prefer downward)
+            if not selected_key and target_semitone is not None and key_buttons:
+                closest = None
+                for btn in key_buttons:
+                    try:
+                        btn_text = btn.text.strip()
+                    except Exception:
+                        continue
+                    if not btn_text:
+                        continue
+                    # Some key buttons may show enharmonic equivalents separated by '/'
+                    name_parts = [normalize_key(part) for part in btn_text.split('/')]
+                    # Map to semitones (pick the first valid mapping)
+                    semitone_vals = [KEY_TO_SEMITONE.get(p) for p in name_parts if p in KEY_TO_SEMITONE]
+                    if not semitone_vals:
+                        continue
+                    semitone = semitone_vals[0]
+                    # Compute signed distance from target key (mod 12)
+                    diff = (semitone - target_semitone) % 12
+                    if diff > 6:
+                        diff -= 12
+                    # Candidate tuple: minimize absolute diff, then prefer negative diff (downward)
+                    candidate = (abs(diff), 0 if diff < 0 else 1, diff, btn_text, btn)
+                    if closest is None or candidate < closest:
+                        closest = candidate
+                if closest:
+                    _, _, _, sel_text, sel_btn = closest
+                    selected_key = sel_text
+                    try:
+                        sel_btn.click()
+                    except Exception:
+                        pass
+            # Fallback: pick first available if no other key selected
             if not selected_key and key_buttons:
                 selected_key = key_buttons[0].text.strip()
-                key_buttons[0].click()
+                try:
+                    key_buttons[0].click()
+                except Exception:
+                    pass
         # Close key menu (click again)
         SeleniumHelper.click_element(
             driver, XPATHS['key_button'], timeout=5, log_func=logger.debug
