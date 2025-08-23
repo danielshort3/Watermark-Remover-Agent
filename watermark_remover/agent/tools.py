@@ -32,14 +32,20 @@ with their own trained checkpoints to achieve meaningful results.
 from __future__ import annotations
 
 import glob
+import datetime
+import shutil
 import logging
 import os
 import time
-from typing import Optional
+from typing import Optional, Any
 
 import requests  # used for downloading images during online scraping
 
-from langchain.agents import tool
+# Import the tool decorator from the core tools package.  The decorator used to
+# live under ``langchain.agents``, but in recent versions it has moved to
+# ``langchain_core.tools``.  We import from the latter to ensure compatibility
+# with modern LangChain versions.
+from langchain_core.tools import tool
 
 # Import transposition helper from utils.  This allows the scraper to
 # compute alternate instrument/key suggestions when the requested key
@@ -51,40 +57,11 @@ from watermark_remover.utils.transposition_utils import (
     normalize_key,
 )
 
-# Minimal subset of XPaths used for scraping via Selenium.  These values
-# originate from the original Watermark Remover project (see
-# watermark_remover/download/selenium_utils.py) and are hard‑coded here
-# to avoid importing that module.  Only the keys necessary for search
-# and basic navigation are included.
-# XPaths used by the Selenium scraper.  These values are copied from the
-# original Watermark Remover project (see watermark_remover/download/selenium_utils.py).
-# Additional keys have been added here to support discovery of song titles,
-# artist names, key choices and instrument parts on the PraiseCharts site.
-XPATHS = {
-    # Search page
-    "search_bar": "//*[@id=\"search-input-wrap\"]/input",
-    "songs_parent": "//*[@id='page-wrapper']/ion-router-outlet/app-page-search/ion-content/div/div/div/app-search/div",
-    # Individual song result fields
-    "song_title": "./div/a/div/h5",
-    "song_text3": "./div/a/div/span/span",
-    "song_text2": "./div/a/div/span",
-    "song_image": "./div/div[1]/div/app-product-audio-preview-image/div/img",
-    # Template for clicking the nth song in search results; index is 1‑based
-    "click_song": "//*[@id='page-wrapper']/ion-router-outlet/app-page-search/ion-content/div/div/div/app-search/div/app-product-list-item[{index}]/div/a/div",
-    # Product page buttons and containers
-    "chords_button": "//*[@id='page-wrapper']/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[1]/button",
-    # Header element that toggles the orchestration section; used to ensure the
-    # orchestrations (keys/parts) are loaded.
-    "orchestration_header": "//h3[contains(text(), 'Orchestration')]/ancestor::div[4]",
-    "key_button": "//*[@id='page-wrapper']/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[3]/app-product-selector-key/div/button",
-    "key_parent": "//*[@id='page-wrapper']/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[3]/app-product-selector-key/div/ul",
-    "parts_button": "//*[@id='page-wrapper']/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[2]/div/button",
-    "parts_parent": "//*[@id='page-wrapper']/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[2]/div/ul",
-    "parts_list": "//*[@id='page-wrapper']/ion-router-outlet/app-product-page/ion-content//ul/li/button",
-    # Preview image element and next page button
-    "image_element": "//*[@id='preview-sheets']/div/div[1]/div/img",
-    "next_button": "//button[contains(@class, 'sheet-nav-gradient-button-right')]",
-}
+# Import Selenium helper and unified XPath definitions from the original project.  These
+# definitions mirror those used by the Watermark Remover GUI and ensure that
+# our agent navigates PraiseCharts using the same selectors.  See
+# watermark_remover/utils/selenium_utils.py for details.
+from watermark_remover.utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 
 # Import model definitions lazily.  These imports can be heavy and
 # require optional dependencies such as torch, torchvision and
@@ -123,6 +100,16 @@ except Exception:
     pass
 logger = logging.getLogger("wmra.tools")
 
+# Global state used by the music scraping and assembly pipeline.  When
+# ``scrape_music`` runs, it records metadata about the selected song, artist,
+# instrument and key here.  Subsequent steps (e.g. PDF assembly) use this
+# metadata to construct meaningful output paths.  ``TEMP_DIRS`` tracks any
+# temporary directories created during scraping, watermark removal and
+# upscaling so that they can be cleaned up after the final PDF is
+# generated.
+SCRAPE_METADATA: dict[str, str] = {}
+TEMP_DIRS: list[str] = []
+
 # If an output directory is mounted (e.g. /app/output) configure the logger
 # to also write its events to a file in that directory.  This helps users
 # inspect the sequence of steps executed by the tools.  We append to the
@@ -130,22 +117,69 @@ logger = logging.getLogger("wmra.tools")
 # first import.  Ignore any errors configuring the file handler (for
 # example when running in a read‑only environment).
 try:
-    output_dir = os.path.join(os.getcwd(), "output")
+    # Compute a timestamped log directory under ``Log``.  This ensures that
+    # each run's logs and screenshots are stored separately.  We also
+    # expose this directory via the WMRA_LOG_DIR environment variable so
+    # helper modules (such as selenium_utils) can write screenshots to
+    # the same location.
+    _run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(os.getcwd(), "Log", _run_ts)
     os.makedirs(output_dir, exist_ok=True)
+    # Expose the log directory to other modules via an environment variable.
+    os.environ["WMRA_LOG_DIR"] = output_dir
+    # Configure a plain‑text file handler for the pipeline log
     file_handler = logging.FileHandler(os.path.join(output_dir, "pipeline.log"))
     file_handler.setLevel(getattr(logging, _log_level, logging.INFO))
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
     file_handler.setFormatter(formatter)
-    # Avoid adding duplicate handlers if this module is imported multiple
-    # times in the same interpreter session
-    if not any(
-        isinstance(h, logging.FileHandler)
-        and getattr(h, "baseFilename", "").endswith("pipeline.log")
-        for h in logger.handlers
-    ):
+    # Configure a CSV file handler for structured logging.  Each row in
+    # pipeline.csv will contain four columns: timestamp, level, logger
+    # name and message.  Surround the message in quotes to preserve
+    # commas inside the text.  The newline terminator is omitted by
+    # default and will be added by the logging module.
+    csv_handler = logging.FileHandler(os.path.join(output_dir, "pipeline.csv"))
+    csv_handler.setLevel(getattr(logging, _log_level, logging.INFO))
+    # Define a custom formatter that adds missing custom attributes with
+    # empty strings.  This allows our CSV logs to include columns for
+    # button_text, xpath and url even when they are not provided.
+    class CsvFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+            # Populate optional fields if they are missing
+            if not hasattr(record, "button_text"):
+                setattr(record, "button_text", "")
+            if not hasattr(record, "xpath"):
+                setattr(record, "xpath", "")
+            if not hasattr(record, "url"):
+                setattr(record, "url", "")
+            if not hasattr(record, "screenshot"):
+                setattr(record, "screenshot", "")
+            # Sanitise newlines in all fields to prevent premature row breaks
+            for attr in ("button_text", "xpath", "url", "screenshot", "msg", "message"):
+                try:
+                    val = getattr(record, attr)
+                except AttributeError:
+                    continue
+                if isinstance(val, str):
+                    sanitized = val.replace("\n", " ").replace("\r", " ")
+                    setattr(record, attr, sanitized)
+            return super().format(record)
+
+    csv_formatter = CsvFormatter(
+        "%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,\"%(message)s\""
+    )
+    csv_handler.setFormatter(csv_formatter)
+    # Avoid adding duplicate handlers if this module is imported
+    # multiple times in the same interpreter session.  We identify
+    # existing handlers by their output file names.
+    existing_files = [
+        getattr(h, "baseFilename", "") for h in logger.handlers if isinstance(h, logging.FileHandler)
+    ]
+    if not any(f.endswith("pipeline.log") for f in existing_files):
         logger.addHandler(file_handler)
+    if not any(f.endswith("pipeline.csv") for f in existing_files):
+        logger.addHandler(csv_handler)
 except Exception:
     # Best‑effort: if we cannot set up file logging, continue silently
     pass
@@ -214,8 +248,13 @@ def scrape_music(
     start = time.perf_counter()
     # Normalise key for matching and suggestions
     norm_key = normalize_key(key)
-    # Fast path: if an explicit directory is provided and exists, use it
-    if os.path.isdir(input_dir):
+    # Fast path: if a custom directory (different from the default library root)
+    # is provided and exists, return it directly.  This allows callers to
+    # override the search logic by specifying a specific path.  We do not
+    # treat the default library root as an explicit directory; instead, we
+    # perform a search within it to locate the requested title/key.
+    root_dir = "data/samples"
+    if input_dir and input_dir != root_dir and os.path.isdir(input_dir):
         imgs = [
             p
             for p in glob.glob(os.path.join(input_dir, "*"))
@@ -414,6 +453,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
     options.add_argument('--headless')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
+    # Set a larger window size to capture more of the page.  A larger viewport
+    # (1920x1080) improves screenshot annotations and ensures UI elements
+    # appear at predictable coordinates.
+    options.add_argument('--window-size=1920,1080')
     # If a system-installed Chromium binary exists, use it; this is
     # necessary when running inside a container where Chrome is installed
     # under /usr/bin.
@@ -451,45 +494,45 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
         search_url = "https://www.praisecharts.com/search"
         driver.get(search_url)
         wait = WebDriverWait(driver, 10)
-        # Locate the search bar and enter the title
-        search_xpath = XPATHS['search_bar']
-        search_el = wait.until(EC.presence_of_element_located((By.XPATH, search_xpath)))
-        search_el.clear()
-        search_el.send_keys(title)
-        # Small pause to allow suggestions/results to render
+        # Use the helper to send keys to the search bar
+        if not SeleniumHelper.send_keys_to_element(driver, XPATHS['search_bar'], title, timeout=5, log_func=logger.debug):
+            logger.error("SCRAPER: failed to locate or send keys to search bar")
+            return None
+        # Allow suggestions/results to render
         time.sleep(2)
-        # Gather search results: titles, artists (if available), and index
-        song_candidates = []
-        try:
-            songs_parent = wait.until(EC.presence_of_element_located((By.XPATH, XPATHS['songs_parent'])))
-            songs_children = songs_parent.find_elements(By.XPATH, './app-product-list-item')
+        # Gather search results: titles and artists
+        song_candidates: list[dict[str, Any]] = []
+        songs_parent = SeleniumHelper.find_element(driver, XPATHS['songs_parent'], timeout=10, log_func=logger.debug)
+        if songs_parent:
+            songs_children = songs_parent.find_elements("xpath", './app-product-list-item')
             for idx, child in enumerate(songs_children, 1):
-                # Extract title
                 song_title = ''
                 artist_name = ''
+                # Title
                 try:
-                    title_el = child.find_element(By.XPATH, XPATHS['song_title'])
+                    title_el = child.find_element("xpath", XPATHS['song_title'])
                     song_title = title_el.text.strip()
                 except Exception:
                     pass
-                # Extract possible artist/instrument fields
-                text2 = ''
+                # text3 (e.g. key list)
                 text3 = ''
                 try:
-                    text3_el = child.find_element(By.XPATH, XPATHS['song_text3'])
+                    text3_el = child.find_element("xpath", XPATHS['song_text3'])
                     text3 = text3_el.text.strip()
                 except Exception:
                     text3 = ''
+                # text2 (artist) only if text3 exists
+                text2 = ''
                 if text3:
                     try:
-                        text2_el = child.find_element(By.XPATH, XPATHS['song_text2'])
+                        text2_el = child.find_element("xpath", XPATHS['song_text2'])
+                        # Only take the first line of text2
                         text2 = text2_el.text.split("\n")[0].strip()
                     except Exception:
                         text2 = ''
-                # Determine artist: in the original GUI, if text3 exists, text2 is the artist name
+                # Determine artist: in the GUI, if text3 exists, text2 is the artist name
                 if text3 and text2 and text3 != text2:
                     artist_name = text2
-                # Append candidate if title exists
                 if song_title:
                     song_candidates.append({
                         'index': idx,
@@ -497,9 +540,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
                         'artist': artist_name,
                         'text3': text3,
                     })
-        except Exception:
-            pass
-        # If we found candidates, log them for debugging
+        # Log candidate titles for debugging
         if song_candidates:
             try:
                 choices_str = ', '.join([
@@ -509,67 +550,47 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
                 logger.info("SCRAPER: search results: %s", choices_str)
             except Exception:
                 pass
-        # Select the first candidate by default
+        # Pick the first candidate or default to index 1
         if song_candidates:
             selected = song_candidates[0]
             artist_name = selected.get('artist', '')
             song_index = selected['index']
         else:
-            # If no candidates, attempt to click the first result anyway
             artist_name = ''
             song_index = 1
-        # Click the selected song
-        click_xpath = XPATHS['click_song'].format(index=song_index)
-        try:
-            song_element = wait.until(EC.element_to_be_clickable((By.XPATH, click_xpath)))
-            song_element.click()
-        except Exception:
-            # If clicking fails, abort scraping
+        # Click the selected song via helper
+        if not SeleniumHelper.click_dynamic_element(driver, XPATHS['click_song'], song_index, timeout=5, log_func=logger.debug):
             logger.error("SCRAPER: failed to click song result at index %d", song_index)
             return None
-        # Optionally click the "Chords & Lyrics" button to ensure the sheet selector panel is visible
-        try:
-            chords_btn = wait.until(EC.element_to_be_clickable((By.XPATH, XPATHS['chords_button'])))
-            chords_btn.click()
-        except Exception:
-            # Some pages may not have this button or may already be open; ignore errors
-            pass
-        # Attempt to open the orchestration menu (keys and parts)
-        try:
-            orch_header = wait.until(EC.element_to_be_clickable((By.XPATH, XPATHS['orchestration_header'])))
-            orch_header.click()
-        except Exception:
-            pass
+        # Click the chords button if present
+        SeleniumHelper.click_element(driver, XPATHS['chords_button'], timeout=5, log_func=logger.debug)
+        # Click the orchestration header to reveal keys/parts
+        SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
         # Gather available keys
-        available_keys = []
-        selected_key = None
-        try:
-            key_btn = wait.until(EC.element_to_be_clickable((By.XPATH, XPATHS['key_button'])))
-            key_btn.click()
-            # Wait for the key list to load
-            key_parent = wait.until(EC.presence_of_element_located((By.XPATH, XPATHS['key_parent'])))
-            key_buttons = key_parent.find_elements(By.TAG_NAME, 'button')
-            for btn in key_buttons:
-                text = btn.text.strip()
-                if text:
-                    available_keys.append(text)
-            # Determine which key to select: try exact match, else first
-            norm_req = normalize_key(key)
-            for btn in key_buttons:
-                if btn.text.strip().lower() == norm_req.lower():
-                    selected_key = btn.text.strip()
-                    btn.click()
-                    break
-            if not selected_key and key_buttons:
-                selected_key = key_buttons[0].text.strip()
-                key_buttons[0].click()
+        available_keys: list[str] = []
+        selected_key: str | None = None
+        # Open key menu
+        if SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug):
+            # Fetch list items
+            key_parent_el = SeleniumHelper.find_element(driver, XPATHS['key_parent'], timeout=5, log_func=logger.debug)
+            if key_parent_el:
+                key_buttons = key_parent_el.find_elements(By.TAG_NAME, 'button')
+                for btn in key_buttons:
+                    text = btn.text.strip()
+                    if text:
+                        available_keys.append(text)
+                # Choose requested key if available
+                requested_norm = normalize_key(key)
+                for btn in key_buttons:
+                    if btn.text.strip().lower() == requested_norm.lower():
+                        selected_key = btn.text.strip()
+                        btn.click()
+                        break
+                if not selected_key and key_buttons:
+                    selected_key = key_buttons[0].text.strip()
+                    key_buttons[0].click()
             # Close key menu (click again)
-            try:
-                key_btn.click()
-            except Exception:
-                pass
-        except Exception:
-            pass
+            SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
         if available_keys:
             logger.info(
                 "SCRAPER: available keys for '%s': %s; selected key: %s",
@@ -578,53 +599,151 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
                 selected_key or 'none',
             )
         # Gather available instruments
-        available_instruments = []
-        selected_instrument = None
-        try:
-            parts_btn = wait.until(EC.element_to_be_clickable((By.XPATH, XPATHS['parts_button'])))
-            parts_btn.click()
-            parts_parent = wait.until(EC.presence_of_element_located((By.XPATH, XPATHS['parts_parent'])))
-            parts_buttons = parts_parent.find_elements(By.TAG_NAME, 'button')
+        available_instruments: list[str] = []
+        selected_instrument: str | None = None
+        if SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug):
+            # Locate the parent element for the parts menu.  Gathering buttons via
+            # this element helps ensure all instruments are captured.  We also
+            # attempt to scroll the list to load additional instruments if
+            # necessary.
+            parts_parent_el = SeleniumHelper.find_element(
+                driver, XPATHS['parts_parent'], timeout=5, log_func=logger.debug
+            )
+            parts_buttons = []
+            try:
+                # Import By lazily to avoid ImportError when Selenium is unavailable at import time
+                from selenium.webdriver.common.by import By  # type: ignore
+            except Exception:
+                By = None  # type: ignore
+            if parts_parent_el is not None and By is not None:
+                try:
+                    # Collect instrument buttons and attempt to scroll multiple
+                    # times to ensure all options are loaded.  Some UIs lazy‑load
+                    # entries when the list is scrolled.
+                    parts_buttons = []
+                    seen_count = 0
+                    for _ in range(5):
+                        current_buttons = parts_parent_el.find_elements(By.TAG_NAME, 'button')
+                        # Add new buttons to list
+                        if current_buttons:
+                            for b in current_buttons:
+                                if b not in parts_buttons:
+                                    parts_buttons.append(b)
+                        # Break early if we have already collected new items in the last
+                        # iteration and the requested instrument appears in the list
+                        if any(
+                            (instrument.lower() in (btn.text or '').lower())
+                            or ('horn' in instrument.lower() and 'horn' in (btn.text or '').lower())
+                            for btn in parts_buttons
+                        ):
+                            break
+                        # Scroll down within the parts list to load more buttons
+                        try:
+                            driver.execute_script(
+                                "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].offsetHeight",
+                                parts_parent_el,
+                            )
+                            time.sleep(0.5)
+                        except Exception:
+                            break
+                    # Final refresh of buttons after scrolling
+                    try:
+                        current_buttons = parts_parent_el.find_elements(By.TAG_NAME, 'button')
+                        for b in current_buttons:
+                            if b not in parts_buttons:
+                                parts_buttons.append(b)
+                    except Exception:
+                        pass
+                except Exception:
+                    parts_buttons = []
+            # Fallback: use the parts_list XPath to gather buttons if parent not found
+            if not parts_buttons:
+                parts_buttons = SeleniumHelper.find_elements(
+                    driver, XPATHS['parts_list'], timeout=5, log_func=logger.debug
+                )
             for btn in parts_buttons:
-                part_text = btn.text.strip()
+                try:
+                    part_text = btn.text.strip()
+                except Exception:
+                    part_text = ''
                 if not part_text:
                     continue
-                # Exclude cover and lead sheet entries as per original logic
-                if 'cover' in part_text.lower() or 'lead sheet' in part_text.lower():
+                # Exclude 'cover' and 'lead sheet' entries
+                lower = part_text.lower()
+                if 'cover' in lower or 'lead sheet' in lower:
                     continue
-                available_instruments.append(part_text)
-            # Determine which instrument to select: exact match ignoring case
+                if part_text not in available_instruments:
+                    available_instruments.append(part_text)
+            # Determine the most appropriate instrument selection.  Attempt exact
+            # match (case‑insensitive), then fall back to partial matches
+            requested = instrument.lower()
+            # First pass: exact case‑insensitive match
             for btn in parts_buttons:
-                part_text = btn.text.strip()
+                try:
+                    part_text = btn.text.strip()
+                except Exception:
+                    continue
                 if not part_text:
                     continue
-                if 'cover' in part_text.lower() or 'lead sheet' in part_text.lower():
+                lower = part_text.lower()
+                if 'cover' in lower or 'lead sheet' in lower:
                     continue
-                if part_text.lower() == instrument.lower():
+                if lower == requested:
                     selected_instrument = part_text
-                    btn.click()
+                    try:
+                        btn.click()
+                    except Exception:
+                        pass
                     break
+            # Second pass: substring match (e.g. requested contains 'french horn' and part contains 'horn')
+            if not selected_instrument:
+                for btn in parts_buttons:
+                    try:
+                        part_text = btn.text.strip()
+                    except Exception:
+                        continue
+                    if not part_text:
+                        continue
+                    lower = part_text.lower()
+                    if 'cover' in lower or 'lead sheet' in lower:
+                        continue
+                    cand = lower
+                    if (
+                        requested == cand
+                        or requested in cand
+                        or cand in requested
+                        or ('horn' in requested and 'horn' in cand)
+                    ):
+                        selected_instrument = part_text
+                        try:
+                            btn.click()
+                        except Exception:
+                            pass
+                        break
+            # Default: choose the first available instrument
             if not selected_instrument and available_instruments:
                 selected_instrument = available_instruments[0]
-                # Click the first valid instrument button
                 for btn in parts_buttons:
-                    if btn.text.strip() == selected_instrument:
-                        btn.click()
-                        break
+                    try:
+                        if btn.text.strip() == selected_instrument:
+                            btn.click()
+                            break
+                    except Exception:
+                        continue
             # Close parts menu
+            SeleniumHelper.click_element(
+                driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug
+            )
+        if available_instruments:
             try:
-                parts_btn.click()
+                logger.info(
+                    "SCRAPER: available instruments for '%s': %s; selected instrument: %s",
+                    title,
+                    ', '.join(available_instruments),
+                    selected_instrument or 'none',
+                )
             except Exception:
                 pass
-        except Exception:
-            pass
-        if available_instruments:
-            logger.info(
-                "SCRAPER: available instruments for '%s': %s; selected instrument: %s",
-                title,
-                ', '.join(available_instruments),
-                selected_instrument or 'none',
-            )
         # Now on the product page with the chosen key and instrument.  Locate the image element and next button
         image_xpath = XPATHS['image_element']
         next_button_xpath = XPATHS['next_button']
@@ -677,6 +796,21 @@ def _scrape_with_selenium(title: str, instrument: str, key: str) -> Optional[str
         if downloaded_urls:
             if artist_name:
                 logger.info("SCRAPER: selected artist: %s", artist_name)
+            # Record metadata for use in later pipeline stages.  This metadata
+            # includes the sanitised title, selected artist, instrument and key.
+            try:
+                SCRAPE_METADATA['title'] = safe_title
+                SCRAPE_METADATA['artist'] = artist_name or ''
+                SCRAPE_METADATA['instrument'] = selected_instrument or ''
+                SCRAPE_METADATA['key'] = (selected_key or norm_key) or ''
+            except Exception:
+                pass
+            # Track the downloaded directory for cleanup after the PDF is assembled
+            try:
+                if out_dir not in TEMP_DIRS:
+                    TEMP_DIRS.append(out_dir)
+            except Exception:
+                pass
             return out_dir
         # Otherwise, scraping failed
         logger.warning("SCRAPER: no images downloaded for title '%s'", title)
@@ -756,6 +890,12 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
         img.save(out_path)
         logger.info("WMR: processed %s -> %s", inp_path, out_path)
     logger.info("WMR completed in %.3fs", time.perf_counter() - start)
+    # Track the processed directory for cleanup after PDF assembly
+    try:
+        if processed_dir not in TEMP_DIRS:
+            TEMP_DIRS.append(processed_dir)
+    except Exception:
+        pass
     return processed_dir
 
 
@@ -874,6 +1014,12 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
             img.save(out_path)
             logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
     logger.info("UPSCALE completed in %.3fs", time.perf_counter() - start)
+    # Track the upscaled directory for cleanup after PDF assembly
+    try:
+        if output_dir not in TEMP_DIRS:
+            TEMP_DIRS.append(output_dir)
+    except Exception:
+        pass
     return output_dir
 
 
@@ -918,16 +1064,66 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
     ]
     if not images:
         raise RuntimeError(f"PDF: no images found in {image_dir}")
-    # Ensure that the directory for the PDF exists
-    pdf_dir = os.path.dirname(output_pdf) or "."
-    os.makedirs(pdf_dir, exist_ok=True)
-    c = canvas.Canvas(output_pdf, pagesize=letter)
+    # Compute a structured output path based on the metadata recorded during
+    # scraping.  If metadata is not available (for example, if this
+    # function is called outside of the agent pipeline), fall back to the
+    # provided ``output_pdf`` path.  The final PDF will be written
+    # under ``output/<title>/<artist>/<key>/`` with a filename that
+    # includes the instrument and key.  The ``title`` and ``artist``
+    # components are sanitised to remove characters that may not be
+    # allowed in file paths.
+    final_pdf_path: str
+    try:
+        meta = SCRAPE_METADATA.copy()  # make a copy to avoid accidental mutation
+        title_meta = meta.get('title', '')
+        artist_meta = meta.get('artist', '')
+        key_meta = meta.get('key', '')
+        instrument_meta = meta.get('instrument', '')
+        if title_meta and artist_meta and key_meta and instrument_meta:
+            # Helper to sanitise file system components
+            def _sanitize(value: str) -> str:
+                import re
+                # Replace sequences of non‑alphanumeric characters with underscores
+                return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+            title_dir = _sanitize(title_meta)
+            artist_dir = _sanitize(artist_meta)
+            key_dir = _sanitize(key_meta)
+            instrument_part = _sanitize(instrument_meta)
+            # Build the directory structure under ``output``
+            pdf_root = os.path.join(os.getcwd(), "output")
+            final_dir = os.path.join(pdf_root, title_dir, artist_dir, key_dir)
+            os.makedirs(final_dir, exist_ok=True)
+            # Use lower‑case title for file name to mirror examples
+            file_title = _sanitize(title_meta.lower())
+            # Compose final filename
+            file_name = f"{file_title}_{instrument_part}_{key_dir}.pdf"
+            final_pdf_path = os.path.join(final_dir, file_name)
+        else:
+            # Fallback: use the provided output_pdf parameter
+            final_pdf_path = output_pdf
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)
+    except Exception:
+        final_pdf_path = output_pdf
+        os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)
+    # Prepare the canvas for the PDF
+    c = canvas.Canvas(final_pdf_path, pagesize=letter)
     width, height = letter
     for fname in images:
         path = os.path.join(image_dir, fname)
         c.drawImage(path, 0, 0, width=width, height=height, preserveAspectRatio=True)
         c.showPage()
     c.save()
-    logger.info("ASSEMBLER: wrote %d pages to %s", len(images), output_pdf)
+    logger.info("ASSEMBLER: wrote %d pages to %s", len(images), final_pdf_path)
     logger.info("ASSEMBLER completed in %.3fs", time.perf_counter() - start)
-    return output_pdf
+    # Clean up any temporary directories created during this pipeline run.
+    try:
+        for d in TEMP_DIRS:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+        TEMP_DIRS.clear()
+    except Exception:
+        pass
+    return final_pdf_path

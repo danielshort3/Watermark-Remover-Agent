@@ -98,7 +98,15 @@ def run_instruction(instruction: str) -> str:
     except Exception as exc:
         return f"Failed to create Ollama agent: {exc}"
     try:
-        response = agent.invoke({"input": prompt})
+        # Use the agent's run method to execute the task end‑to‑end.  This
+        # avoids returning intermediate JSON and ensures the agent calls
+        # tools automatically.  Pass the raw prompt as input; run() will
+        # interpret it as the user message.
+        try:
+            response = agent.run(prompt)  # type: ignore[no-untyped-call]
+        except Exception:
+            # Fall back to invoke with the structured input if run is not available
+            response = agent.invoke({"input": prompt})
     except Exception as exc:
         return f"Error executing instruction: {exc}"
     # Extract the answer from the agent response.  The LLM may return
