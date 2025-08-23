@@ -54,19 +54,15 @@ def run_instruction(prompt: str, model: str = "qwen3:30b", base_url: str | None 
         agent = get_ollama_agent(model_name=model, base_url=base_url, verbose=True)
     except Exception as exc:
         return f"Failed to create Ollama agent: {exc}"
-    # Run the agent with intermediate step capture
+    # Execute the instruction end-to-end using agent.run().  This will
+    # invoke tools automatically rather than just returning a plan.
     try:
-        result = agent.invoke({"input": prompt}, return_intermediate_steps=True)
+        result = agent.run(prompt)
     except Exception as exc:
         return f"Error executing instruction: {exc}"
-    # Extract answer and reasoning
-    answer = ""
-    steps = []
-    if isinstance(result, dict):
-        answer = result.get("output") or result.get("result") or ""
-        steps = result.get("intermediate_steps") or []
-    else:
-        answer = str(result)
+    # Extract answer; intermediate steps are printed to stdout when verbose=True.
+    answer = str(result)
+    steps = []  # We no longer capture intermediate steps directly
     # Log reasoning and final answer
     try:
         log_path = os.path.join(log_dir, "thoughts_and_steps.log")
