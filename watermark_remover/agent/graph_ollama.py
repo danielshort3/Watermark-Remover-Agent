@@ -169,7 +169,7 @@ def run_instruction(instruction: str) -> str:
     try:
         # Persist the thought process to a log file under the run‑specific
         # logs directory.  Use the WMRA_LOG_DIR environment variable if set.
-        log_root = os.environ.get("WMRA_LOG_DIR") or os.path.join(os.getcwd(), "logs")
+        log_root = os.environ.get("WMRA_LOG_DIR") or os.path.join(os.getcwd(), "output", "logs")
         os.makedirs(log_root, exist_ok=True)
         log_path = os.path.join(log_root, "thoughts_and_steps.log")
         with open(log_path, "a", encoding="utf-8") as f:

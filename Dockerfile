@@ -21,8 +21,6 @@ COPY . /app
 RUN apt-get update && \
     # Install basic libraries required by PIL, OpenCV and reportlab
     apt-get install -y --no-install-recommends \
-        libgl1-mesa-glx \
-        libglib2.0-0 \
         wget \
         ca-certificates \
         fonts-liberation && \

@@ -187,7 +187,13 @@ class SeleniumHelper:
                             # Determine the base directory for logs/screenshots.  Use the
                             # WMRA_LOG_DIR environment variable if set by tools.py; fall
                             # back to a local ``output`` directory otherwise.
-                            base_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "output"))
+                            # Use the WMRA_LOG_DIR from tools.py if available, otherwise
+                            # fall back to ``output/logs``.  This ensures
+                            # screenshots live alongside other run artefacts.
+                            base_dir = os.environ.get(
+                                "WMRA_LOG_DIR",
+                                os.path.join(os.getcwd(), "output", "logs"),
+                            )
                             out_dir = os.path.join(base_dir, "screenshots")
                             os.makedirs(out_dir, exist_ok=True)
                             # Build a filename using the label and timestamp
