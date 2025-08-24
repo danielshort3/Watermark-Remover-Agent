@@ -126,8 +126,23 @@ try:
     # subdirectory.  The WMRA_LOG_DIR environment variable is set to
     # propagate this location to helper modules (e.g. Selenium) so
     # screenshots and other artefacts are saved alongside the logs.
+    #
+    # Determine a timestamped directory for this run.  Rather than
+    # writing logs into a top‑level ``logs`` folder, store them under
+    # ``output/logs`` so that all artefacts live inside the output
+    # hierarchy.  Each run gets its own unique timestamped subfolder.
     _run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(os.getcwd(), "logs", _run_ts)
+    # Persist the run timestamp so subsequent tools (e.g. scrape_music)
+    # can reuse it when organising their own output.  If another value is
+    # already present in the environment then leave it unchanged – this
+    # allows callers to override the timestamp (e.g. for testing).  The
+    # environment variable is read by scrape_music to locate the run
+    # directory for image backups.
+    os.environ.setdefault("RUN_TS", _run_ts)
+    # Build the log directory under ``output/logs``.  Using ``os.getcwd()``
+    # ensures the path is relative to the project root regardless of
+    # where the container mounts the code.  Create the directory up front.
+    output_dir = os.path.join(os.getcwd(), "output", "logs", os.environ["RUN_TS"])
     os.makedirs(output_dir, exist_ok=True)
     os.environ["WMRA_LOG_DIR"] = output_dir
     # Configure a plain‑text file handler for the pipeline log
@@ -251,11 +266,51 @@ def scrape_music(
     start = time.perf_counter()
     # Normalise key for matching and suggestions
     norm_key = normalize_key(key)
-    # Fast path: if a custom directory (different from the default library root)
-    # is provided and exists, return it directly.  This allows callers to
-    # override the search logic by specifying a specific path.  We do not
-    # treat the default library root as an explicit directory; instead, we
-    # perform a search within it to locate the requested title/key.
+    # Determine a run timestamp and prepare the log hierarchy for this
+    # piece.  The run timestamp is read from RUN_TS so all tools use the
+    # same folder per request.  If RUN_TS is missing, compute a fresh
+    # timestamp.  Sanitize the title to remove symbols and replace
+    # whitespace with underscores, mirroring the sanitisation logic used
+    # elsewhere in the project.  Backups of the different processing
+    # stages will be stored under ``output/logs/<timestamp>/<safe_title>``.
+    run_ts = os.environ.get("RUN_TS") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.environ.setdefault("RUN_TS", run_ts)
+    # Sanitise the title for use in directory names.  Replace any
+    # characters other than alphanumerics, spaces or hyphens with
+    # underscores, then collapse spaces into underscores.
+    safe_title = ''.join(
+        c if c.isalnum() or c in (' ', '-') else '_' for c in title
+    ).strip().replace(' ', '_')
+    # Compute the root of the logs for this run.  Individual subfolders
+    # (song/artist/key/instrument) will be created later once we know
+    # the artist.  Do not create the per-song directory yet; it will be
+    # determined after scraping when the artist is known (if any).
+    log_root = os.path.join(os.getcwd(), "output", "logs", run_ts)
+    # Sanitize the instrument and key ahead of time.  The key may
+    # contain sharps or flats; sanitising it normalises these
+    # characters for use in file paths.
+    import re
+    def _sanitize(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+    safe_instrument = _sanitize(instrument) if instrument else 'unknown'
+    safe_key = _sanitize(key) if key else 'unknown'
+    # Record preliminary metadata for later use when assembling the PDF.  We
+    # capture the sanitised title, instrument and key along with the run
+    # timestamp.  The artist will be filled in after scraping.
+    try:
+        SCRAPE_METADATA.clear()
+        SCRAPE_METADATA.update({
+            'title': safe_title,
+            'instrument': instrument,
+            'key': key,
+            'run_ts': run_ts,
+        })
+    except Exception:
+        pass
+    # Fast path: if a custom directory (different from the default
+    # library root) is provided and exists, copy its images into
+    # ``1_original`` and return that path.  This allows callers to
+    # override the scraping logic by specifying a specific path.
     root_dir = "data/samples"
     if input_dir and input_dir != root_dir and os.path.isdir(input_dir):
         imgs = [
@@ -264,6 +319,37 @@ def scrape_music(
             if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
         ]
         if imgs:
+            # Determine the artist for logging structure.  When using an
+            # explicit directory, no artist information is available,
+            # so we default to 'unknown'.
+            safe_artist = 'unknown'
+            # Build the full instrument directory under the log root:
+            # logs/<run_ts>/<song>/<artist>/<key>/<instrument>/
+            instrument_dir = os.path.join(
+                log_root,
+                safe_title,
+                safe_artist,
+                safe_key,
+                safe_instrument,
+            )
+            original_dir_final = os.path.join(instrument_dir, "1_original")
+            os.makedirs(original_dir_final, exist_ok=True)
+            # Copy images into the 1_original directory
+            for src in imgs:
+                try:
+                    dst = os.path.join(original_dir_final, os.path.basename(src))
+                    shutil.copyfile(src, dst)
+                    logger.info("SCRAPER: copied %s -> %s", src, dst)
+                except Exception as copy_err:
+                    logger.error("SCRAPER: failed to copy %s: %s", src, copy_err)
+            # Update metadata with the default artist
+            try:
+                SCRAPE_METADATA['artist'] = safe_artist
+                SCRAPE_METADATA['title'] = safe_title
+                SCRAPE_METADATA['instrument'] = instrument
+                SCRAPE_METADATA['key'] = key
+            except Exception:
+                pass
             logger.info(
                 "SCRAPER: using explicit directory '%s' (%d image file(s)) for title='%s', instrument='%s', key='%s'",
                 input_dir,
@@ -274,10 +360,10 @@ def scrape_music(
             )
             logger.debug("SCRAPER: sample files: %s", imgs[:5])
             logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
-            return input_dir
-        # If the directory exists but has no images, fall back to library search
+            return original_dir_final
+        # If the directory exists but has no images, fall back to scraping
         logger.debug(
-            "SCRAPER: explicit directory '%s' exists but contains no images; falling back to library search",
+            "SCRAPER: explicit directory '%s' exists but contains no images; falling back to scraping",
             input_dir,
         )
     # After checking an explicit directory, perform online scraping.
@@ -292,15 +378,58 @@ def scrape_music(
         scraped_dir = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
     if scraped_dir:
+        # Determine the artist from metadata (set by _scrape_with_selenium)
+        artist_meta = SCRAPE_METADATA.get('artist', '') or 'unknown'
+        import re
+        def _sanitize(value: str) -> str:
+            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+        safe_artist = _sanitize(artist_meta)
+        # Build the instrument directory under the log root
+        instrument_dir = os.path.join(
+            log_root,
+            safe_title,
+            safe_artist,
+            safe_key,
+            safe_instrument,
+        )
+        original_dir_final = os.path.join(instrument_dir, "1_original")
+        os.makedirs(original_dir_final, exist_ok=True)
+        # Copy scraped images into the 1_original directory.
+        try:
+            imgs = [
+                p for p in glob.glob(os.path.join(scraped_dir, "*"))
+                if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+            ]
+            for src in imgs:
+                dst = os.path.join(original_dir_final, os.path.basename(src))
+                shutil.copyfile(src, dst)
+                logger.info("SCRAPER: copied %s -> %s", src, dst)
+        except Exception as copy_err:
+            logger.error("SCRAPER: failed to copy scraped files: %s", copy_err)
+        # Update metadata with the sanitised artist and title
+        try:
+            SCRAPE_METADATA['artist'] = artist_meta
+            SCRAPE_METADATA['title'] = safe_title
+            SCRAPE_METADATA['instrument'] = instrument
+            SCRAPE_METADATA['key'] = key
+        except Exception:
+            pass
+        # Remove the temporary scraped directory and its parent as before
+        try:
+            shutil.rmtree(scraped_dir, ignore_errors=True)
+            scrape_parent = os.path.dirname(scraped_dir.rstrip(os.sep))
+            if os.path.basename(scrape_parent).startswith(f"{safe_title}_"):
+                shutil.rmtree(scrape_parent, ignore_errors=True)
+        except Exception:
+            pass
         logger.info(
-            "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s' to '%s'",
+            "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s'",
             title,
             instrument,
             key,
-            scraped_dir,
         )
         logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
-        return scraped_dir
+        return original_dir_final
     # If scraping failed, compute transposition suggestions for the agent to
     # potentially present to the user.  We always raise an error here
     # because there is no local library fallback.
@@ -1224,6 +1353,14 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
+    # Determine the output directory.  If the caller provides a value
+    # other than the default, honour it.  Otherwise, derive a
+    # ``2_watermark_removed`` sibling inside the same run directory as
+    # the input.  This ensures that all intermediate artefacts live
+    # alongside the original images for this run.
+    if output_dir == "processed" or not output_dir:
+        parent_dir = os.path.dirname(input_dir.rstrip(os.sep))
+        output_dir = os.path.join(parent_dir, "2_watermark_removed")
     os.makedirs(output_dir, exist_ok=True)
     # List images to process
     images = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
@@ -1270,12 +1407,9 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
         img.save(out_path)
         logger.info("WMR: processed %s -> %s", inp_path, out_path)
     logger.info("WMR completed in %.3fs", time.perf_counter() - start)
-    # Track the processed directory for cleanup after PDF assembly
-    try:
-        if processed_dir not in TEMP_DIRS:
-            TEMP_DIRS.append(processed_dir)
-    except Exception:
-        pass
+    # Do not track the processed directory for cleanup.  We intentionally
+    # preserve each intermediate stage under its timestamped run
+    # directory for debugging and reproducibility.
     return processed_dir
 
 
@@ -1323,6 +1457,12 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
+    # Determine the output directory.  If the caller provides a value
+    # other than the default, honour it.  Otherwise, derive a
+    # ``3_upscaled`` sibling inside the same run directory as the input.
+    if output_dir == "upscaled" or not output_dir:
+        parent_dir = os.path.dirname(input_dir.rstrip(os.sep))
+        output_dir = os.path.join(parent_dir, "3_upscaled")
     os.makedirs(output_dir, exist_ok=True)
     images = [
         f
@@ -1394,12 +1534,8 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
             img.save(out_path)
             logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
     logger.info("UPSCALE completed in %.3fs", time.perf_counter() - start)
-    # Track the upscaled directory for cleanup after PDF assembly
-    try:
-        if output_dir not in TEMP_DIRS:
-            TEMP_DIRS.append(output_dir)
-    except Exception:
-        pass
+    # Do not track the upscaled directory for cleanup.  We preserve
+    # intermediate stages for debugging and reproducibility.
     return output_dir
 
 
@@ -1444,49 +1580,70 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
     ]
     if not images:
         raise RuntimeError(f"PDF: no images found in {image_dir}")
-    # Compute a structured output path based on the metadata recorded during
-    # scraping.  If metadata is not available (for example, if this
-    # function is called outside of the agent pipeline), fall back to the
-    # provided ``output_pdf`` path.  The final PDF will be written
-    # under ``output/<title>/<artist>/<key>/`` with a filename that
-    # includes the instrument and key.  The ``title`` and ``artist``
-    # components are sanitised to remove characters that may not be
-    # allowed in file paths.
+    # Determine the output paths for the final PDF.  We produce two
+    # copies: one stored under ``output/music/<title>/<artist>/<key>/``
+    # organised by song, artist and key, and another under the log
+    # directory ``output/logs/<run_ts>/<title>/4_final_pdf`` for
+    # debugging.  Use metadata recorded during scraping to build a
+    # meaningful directory structure.  When metadata is missing, fall
+    # back to the provided ``output_pdf`` parameter.
     final_pdf_path: str
+    debug_pdf_path: str
     try:
-        meta = SCRAPE_METADATA.copy()  # make a copy to avoid accidental mutation
-        title_meta = meta.get('title', '')
-        artist_meta = meta.get('artist', '')
-        key_meta = meta.get('key', '')
-        instrument_meta = meta.get('instrument', '')
-        if title_meta and artist_meta and key_meta and instrument_meta:
-            # Helper to sanitise file system components
-            def _sanitize(value: str) -> str:
-                import re
-                # Replace sequences of non‑alphanumeric characters with underscores
-                return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
-            title_dir = _sanitize(title_meta)
-            artist_dir = _sanitize(artist_meta)
-            key_dir = _sanitize(key_meta)
-            instrument_part = _sanitize(instrument_meta)
-            # Build the directory structure under ``output``
-            pdf_root = os.path.join(os.getcwd(), "output")
-            final_dir = os.path.join(pdf_root, title_dir, artist_dir, key_dir)
-            os.makedirs(final_dir, exist_ok=True)
-            # Use lower‑case title for file name to mirror examples
-            file_title = _sanitize(title_meta.lower())
-            # Compose final filename
-            file_name = f"{file_title}_{instrument_part}_{key_dir}.pdf"
-            final_pdf_path = os.path.join(final_dir, file_name)
+        meta = SCRAPE_METADATA.copy()
+        # Retrieve run timestamp for logs
+        run_ts = meta.get('run_ts') or os.environ.get('RUN_TS') or ''
+        # Use sanitised components for file and directory names.  The
+        # title stored in metadata is already sanitised.  If any
+        # component is missing, substitute a sensible default.
+        import re
+        def _sanitize(value: str) -> str:
+            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+        title_meta = meta.get('title', '') or 'unknown'
+        artist_meta = meta.get('artist', '') or 'unknown'
+        key_meta = meta.get('key', '') or 'unknown'
+        instrument_meta = meta.get('instrument', '') or 'unknown'
+        title_dir = _sanitize(title_meta)
+        artist_dir = _sanitize(artist_meta)
+        key_dir = _sanitize(key_meta)
+        instrument_part = _sanitize(instrument_meta)
+        # Build final directory under output/music
+        pdf_root = os.path.join(os.getcwd(), "output", "music")
+        final_dir = os.path.join(pdf_root, title_dir, artist_dir, key_dir)
+        os.makedirs(final_dir, exist_ok=True)
+        # Compose file name
+        file_title = _sanitize(title_meta.lower()) if title_meta else 'output'
+        file_name = f"{file_title}_{instrument_part}_{key_dir}.pdf"
+        final_pdf_path = os.path.join(final_dir, file_name)
+        # Build debug directory under logs mirroring the song/artist/key/instrument
+        # structure.  If a run timestamp is available, construct the full
+        # hierarchy; otherwise fall back to a directory adjacent to the
+        # input images.  The instrument component comes from instrument_part.
+        if run_ts:
+            debug_dir = os.path.join(
+                os.getcwd(),
+                "output",
+                "logs",
+                run_ts,
+                title_dir,
+                artist_dir,
+                key_dir,
+                instrument_part,
+                "4_final_pdf",
+            )
         else:
-            # Fallback: use the provided output_pdf parameter
-            final_pdf_path = output_pdf
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)
+            # Fallback: use the parent of the input image directory
+            debug_dir = os.path.join(os.path.dirname(image_dir.rstrip(os.sep)), "4_final_pdf")
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_pdf_path = os.path.join(debug_dir, file_name)
     except Exception:
+        # Fallback: use provided output_pdf and create directories if necessary
         final_pdf_path = output_pdf
+        debug_pdf_path = output_pdf
         os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)
-    # Prepare the canvas for the PDF
+    # Prepare the canvas for the PDF.  Render pages to the final
+    # destination first, then copy the resulting file into the debug
+    # directory.  This avoids rendering twice.
     c = canvas.Canvas(final_pdf_path, pagesize=letter)
     width, height = letter
     for fname in images:
@@ -1494,16 +1651,15 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
         c.drawImage(path, 0, 0, width=width, height=height, preserveAspectRatio=True)
         c.showPage()
     c.save()
+    # Copy the final PDF into the debug directory for debugging purposes
+    try:
+        if final_pdf_path != debug_pdf_path:
+            shutil.copyfile(final_pdf_path, debug_pdf_path)
+    except Exception as cp_err:
+        logger.error("ASSEMBLER: failed to copy PDF to debug directory: %s", cp_err)
     logger.info("ASSEMBLER: wrote %d pages to %s", len(images), final_pdf_path)
     logger.info("ASSEMBLER completed in %.3fs", time.perf_counter() - start)
-    # Clean up any temporary directories created during this pipeline run.
-    try:
-        for d in TEMP_DIRS:
-            try:
-                shutil.rmtree(d, ignore_errors=True)
-            except Exception:
-                pass
-        TEMP_DIRS.clear()
-    except Exception:
-        pass
+    # Do not clean up intermediate directories.  All stages are
+    # preserved under the run directory for future debugging and
+    # reproducibility.  Return the path to the assembled PDF.
     return final_pdf_path
