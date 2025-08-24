@@ -119,16 +119,15 @@ TEMP_DIRS: list[str] = []
 # first import.  Ignore any errors configuring the file handler (for
 # example when running in a read‑only environment).
 try:
-# Compute a timestamped log directory under the ``output/logs`` folder.  The
-# base ``output/logs`` directory lives at the root of the project (``/app/output/logs``)
-# and may be bind‑mounted by the user via ``-v $(pwd)/output:/app/output``.
-# Each run writes its logs and screenshots into a unique timestamped
-# subdirectory.  The WMRA_LOG_DIR environment variable is set to
-# propagate this location to helper modules (e.g. Selenium) so
-# screenshots and other artefacts are saved alongside the logs.
+    # Compute a timestamped log directory under the ``logs`` folder.  The
+    # base ``logs`` directory lives at the root of the project (``/app/logs``)
+    # and may be bind‑mounted by the user via ``-v $(pwd)/output:/app/logs``.
+    # Each run writes its logs and screenshots into a unique timestamped
+    # subdirectory.  The WMRA_LOG_DIR environment variable is set to
+    # propagate this location to helper modules (e.g. Selenium) so
+    # screenshots and other artefacts are saved alongside the logs.
     _run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Place logs under output/logs/<timestamp> instead of logs/<timestamp>
-    output_dir = os.path.join(os.getcwd(), "output", "logs", _run_ts)
+    output_dir = os.path.join(os.getcwd(), "logs", _run_ts)
     os.makedirs(output_dir, exist_ok=True)
     os.environ["WMRA_LOG_DIR"] = output_dir
     # Configure a plain‑text file handler for the pipeline log
@@ -1225,19 +1224,7 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
-    # Determine where to write the watermark‑free images.  If the caller
-    # specified a custom output_dir different from the default, respect
-    # it.  Otherwise, place the processed images in a subdirectory of
-    # the run‑specific log directory (WMRA_LOG_DIR) so that they are
-    # preserved for debugging.  Fall back to the provided output_dir if
-    # WMRA_LOG_DIR is not set.
-    processed_dir: str = output_dir
-    try:
-        if output_dir == "processed" and os.environ.get("WMRA_LOG_DIR"):
-            processed_dir = os.path.join(os.environ["WMRA_LOG_DIR"], "processed")
-    except Exception:
-        processed_dir = output_dir
-    os.makedirs(processed_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     # List images to process
     images = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
     if not images:
@@ -1251,7 +1238,7 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
     except Exception:
         logger.warning("WMR: failed to load checkpoints from %s; using random weights", model_dir)
     model.eval()
-    # Use processed_dir (which may differ from the provided output_dir) for saving files
+    processed_dir = output_dir
     for fname in images:
         inp_path = os.path.join(input_dir, fname)
         out_path = os.path.join(processed_dir, fname)
@@ -1283,9 +1270,7 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
         img.save(out_path)
         logger.info("WMR: processed %s -> %s", inp_path, out_path)
     logger.info("WMR completed in %.3fs", time.perf_counter() - start)
-    # Track the processed directory for potential cleanup after PDF assembly.
-    # The cleanup step no longer deletes these directories, but we retain
-    # TEMP_DIRS for compatibility.
+    # Track the processed directory for cleanup after PDF assembly
     try:
         if processed_dir not in TEMP_DIRS:
             TEMP_DIRS.append(processed_dir)
@@ -1338,19 +1323,7 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
         raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
     if not os.path.isdir(model_dir):
         raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
-    # Determine where to write the upscaled images.  If the caller
-    # specified a custom output_dir different from the default, respect
-    # it.  Otherwise, place the upscaled images in a subdirectory of
-    # the run‑specific log directory (WMRA_LOG_DIR) so that they are
-    # preserved for debugging.  Fall back to the provided output_dir if
-    # WMRA_LOG_DIR is not set.
-    us_output_dir: str = output_dir
-    try:
-        if output_dir == "upscaled" and os.environ.get("WMRA_LOG_DIR"):
-            us_output_dir = os.path.join(os.environ["WMRA_LOG_DIR"], "upscaled")
-    except Exception:
-        us_output_dir = output_dir
-    os.makedirs(us_output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     images = [
         f
         for f in os.listdir(input_dir)
@@ -1376,7 +1349,7 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
     # Process each image
     for fname in images:
         inp_path = os.path.join(input_dir, fname)
-        out_path = os.path.join(us_output_dir, fname)
+        out_path = os.path.join(output_dir, fname)
         # Convert image to tensor and move to device
         with torch.no_grad():
             tensor = PIL_to_tensor(inp_path)
@@ -1417,26 +1390,21 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
                     ] = us_patch
             # Convert the output tensor back to a PIL image and save
             img = tensor_to_PIL(us_output.squeeze(0).cpu())
-        os.makedirs(us_output_dir, exist_ok=True)
-        img.save(out_path)
-        # Log the per‑image completion inside the loop to record each
-        # input/output mapping.  Note that inp_path and out_path refer
-        # to the current iteration's file names.
-        logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
+            os.makedirs(output_dir, exist_ok=True)
+            img.save(out_path)
+            logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
     logger.info("UPSCALE completed in %.3fs", time.perf_counter() - start)
-    # Track the upscaled directory for potential cleanup after PDF assembly.
-    # The cleanup step no longer deletes these directories, but we retain
-    # TEMP_DIRS for compatibility.  Append the resolved us_output_dir.
+    # Track the upscaled directory for cleanup after PDF assembly
     try:
-        if us_output_dir not in TEMP_DIRS:
-            TEMP_DIRS.append(us_output_dir)
+        if output_dir not in TEMP_DIRS:
+            TEMP_DIRS.append(output_dir)
     except Exception:
         pass
-    return us_output_dir
+    return output_dir
 
 
 @tool
-def assemble_pdf(image_dir: str, output_pdf: str = "output/music/output.pdf") -> str:
+def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
     """Assemble images from a directory into a single PDF file.
 
     Parameters
@@ -1501,11 +1469,8 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/music/output.pdf") ->
             artist_dir = _sanitize(artist_meta)
             key_dir = _sanitize(key_meta)
             instrument_part = _sanitize(instrument_meta)
-            # Build the directory structure under ``output/music``.
-            # This ensures all songs and assembled PDFs are stored under
-            # the ``output/music`` root rather than ``output`` to
-            # satisfy the updated project requirements.
-            pdf_root = os.path.join(os.getcwd(), "output", "music")
+            # Build the directory structure under ``output``
+            pdf_root = os.path.join(os.getcwd(), "output")
             final_dir = os.path.join(pdf_root, title_dir, artist_dir, key_dir)
             os.makedirs(final_dir, exist_ok=True)
             # Use lower‑case title for file name to mirror examples
@@ -1516,16 +1481,8 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/music/output.pdf") ->
         else:
             # Fallback: use the provided output_pdf parameter
             final_pdf_path = output_pdf
-            # Ensure the directory exists.  When the caller specifies a
-            # simple filename (no directory component), place it under
-            # ``output/music`` by default.  If a directory component
-            # exists, preserve it as provided.
-            base_dir, fname_only = os.path.split(final_pdf_path)
-            # If no base directory is given, default to output/music
-            if not base_dir:
-                base_dir = os.path.join(os.getcwd(), "output", "music")
-                final_pdf_path = os.path.join(base_dir, fname_only)
-            os.makedirs(base_dir or '.', exist_ok=True)
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)
     except Exception:
         final_pdf_path = output_pdf
         os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)
@@ -1539,13 +1496,13 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/music/output.pdf") ->
     c.save()
     logger.info("ASSEMBLER: wrote %d pages to %s", len(images), final_pdf_path)
     logger.info("ASSEMBLER completed in %.3fs", time.perf_counter() - start)
-    # Do **not** clean up the temporary directories.  Intermediate
-    # directories (e.g. processed and upscaled images) are now created
-    # under the run‑specific log directory and should persist for
-    # debugging.  Remove the deletion of these directories to preserve
-    # them after PDF assembly.  Still clear the TEMP_DIRS list so it
-    # doesn’t hold stale paths.
+    # Clean up any temporary directories created during this pipeline run.
     try:
+        for d in TEMP_DIRS:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
         TEMP_DIRS.clear()
     except Exception:
         pass
