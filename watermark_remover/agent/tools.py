@@ -41,7 +41,6 @@ from typing import Optional, Any
 import random
 
 import requests  # used for downloading images during online scraping
-import re  # regular expressions used for sanitising titles
 
 # Import the tool decorator from the core tools package.  The decorator used to
 # live under ``langchain.agents``, but in recent versions it has moved to
@@ -98,29 +97,10 @@ try:
         level=getattr(logging, _log_level, logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-except Exception as e:
-    # basicConfig may have been called elsewhere; don't fail silently
-    print(f"LOGGING: basicConfig setup failed: {e}")
+except Exception:
+    # basicConfig may have been called elsewhere; ignore errors
+    pass
 logger = logging.getLogger("wmra.tools")
-
-def _silence_pdfminer() -> None:
-    """
-    Reduce pdfminer logging to ERROR and stop propagation to the root logger.
-    Call this after configuring the base logging so pdfminer debug output
-    does not pollute your logs.
-    """
-    for name in (
-        "pdfminer", "pdfminer.psparser", "pdfminer.pdfinterp",
-        "pdfminer.cmapdb", "pdfminer.pdfdocument", "pdfminer.pdfpage",
-    ):
-        lg = logging.getLogger(name)
-        lg.setLevel(logging.ERROR)
-        lg.propagate = False
-        # Ensure there is at least a null handler so no "No handlers" warning appears
-        if not lg.handlers:
-            lg.addHandler(logging.NullHandler())
-
-_silence_pdfminer()
 
 # Global state used by the music scraping and assembly pipeline.  When
 # ``scrape_music`` runs, it records metadata about the selected song, artist,
@@ -218,10 +198,9 @@ try:
         logger.addHandler(file_handler)
     if not any(f.endswith("pipeline.csv") for f in existing_files):
         logger.addHandler(csv_handler)
-except Exception as e:
-    # Best‑effort: if we cannot set up file logging, don't fail silently
-    import sys
-    print(f"LOGGING: failed to set up file logging: {e}", file=sys.stderr)
+except Exception:
+    # Best‑effort: if we cannot set up file logging, continue silently
+    pass
 
 
 @tool
@@ -296,15 +275,12 @@ def scrape_music(
     # stages will be stored under ``output/logs/<timestamp>/<safe_title>``.
     run_ts = os.environ.get("RUN_TS") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ.setdefault("RUN_TS", run_ts)
-    # Sanitise the title for use in directory names.  Preserve
-    # parentheses but replace any sequence of characters that are not
-    # alphanumeric or parentheses with a single underscore.  Strip
-    # leading/trailing underscores to avoid empty segments.  This
-    # normalisation ensures consistent folder names across the
-    # pipeline.
-    safe_title = re.sub(r'[^A-Za-z0-9()\-\s]+', '_', title.strip())   # allow hyphens
-    safe_title = re.sub(r'[_\s]+', '_', safe_title)                  # collapse spaces/underscores
-    safe_title = safe_title.strip('_')                               # strip leading/trailing underscores
+    # Sanitise the title for use in directory names.  Replace any
+    # characters other than alphanumerics, spaces or hyphens with
+    # underscores, then collapse spaces into underscores.
+    safe_title = ''.join(
+        c if c.isalnum() or c in (' ', '-') else '_' for c in title
+    ).strip().replace(' ', '_')
     # Compute the root of the logs for this run.  Individual subfolders
     # (song/artist/key/instrument) will be created later once we know
     # the artist.  Do not create the per-song directory yet; it will be
@@ -314,7 +290,6 @@ def scrape_music(
     # contain sharps or flats; sanitising it normalises these
     # characters for use in file paths.
     import re
-
     def _sanitize(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
     safe_instrument = _sanitize(instrument) if instrument else 'unknown'
@@ -331,7 +306,7 @@ def scrape_music(
             'run_ts': run_ts,
         })
     except Exception:
-        logger.exception("SCRAPER: failed to record initial metadata")
+        pass
     # Fast path: if a custom directory (different from the default
     # library root) is provided and exists, copy its images into
     # ``1_original`` and return that path.  This allows callers to
@@ -374,7 +349,7 @@ def scrape_music(
                 SCRAPE_METADATA['instrument'] = instrument
                 SCRAPE_METADATA['key'] = key
             except Exception:
-                logger.exception("SCRAPER: failed to update metadata for explicit directory")
+                pass
             logger.info(
                 "SCRAPER: using explicit directory '%s' (%d image file(s)) for title='%s', instrument='%s', key='%s'",
                 input_dir,
@@ -406,13 +381,8 @@ def scrape_music(
         # Determine the artist from metadata (set by _scrape_with_selenium)
         artist_meta = SCRAPE_METADATA.get('artist', '') or 'unknown'
         import re
-
         def _sanitize(value: str) -> str:
-            # Preserve parentheses in song titles but collapse any other
-            # non‑alphanumeric characters (including whitespace) into
-            # underscores.  Remove leading/trailing underscores for
-            # cleanliness.
-            return re.sub(r"[^A-Za-z0-9()]+", "_", value.strip()).strip("_")
+            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
         safe_artist = _sanitize(artist_meta)
         # Build the instrument directory under the log root
         instrument_dir = os.path.join(
@@ -443,7 +413,7 @@ def scrape_music(
             SCRAPE_METADATA['instrument'] = instrument
             SCRAPE_METADATA['key'] = key
         except Exception:
-            logger.exception("SCRAPER: failed to update metadata after scraping")
+            pass
         # Remove the temporary scraped directory and its parent as before
         try:
             shutil.rmtree(scraped_dir, ignore_errors=True)
@@ -451,7 +421,7 @@ def scrape_music(
             if os.path.basename(scrape_parent).startswith(f"{safe_title}_"):
                 shutil.rmtree(scrape_parent, ignore_errors=True)
         except Exception:
-            logger.warning("SCRAPER: cleanup of temporary scrape directory failed", exc_info=True)
+            pass
         logger.info(
             "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s'",
             title,
@@ -467,7 +437,6 @@ def scrape_music(
     try:
         suggestions = get_transposition_suggestions(instrument, norm_key)
     except Exception:
-        logger.exception("SCRAPER: failed computing transposition suggestions")
         suggestions = []
     sugg_str = ", ".join([
         f"{inst}/{k}" for inst, k in suggestions
@@ -654,18 +623,14 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
     log_root = os.environ.get("WMRA_LOG_DIR", os.getcwd())
     try:
         root_dir = tempfile.mkdtemp(prefix=f"{safe_title}_", dir=log_root)
-    except Exception as e:
-        # Fall back to creating under the current working directory (log it)
-        logger.warning(
-            "SCRAPER: failed to create temp dir in log root '%s': %s; using system temp",
-            log_root, e
-        )
+    except Exception:
+        # Fall back to creating under the current working directory
         root_dir = tempfile.mkdtemp(prefix=f"{safe_title}_")
     # Record the temporary directory so it can be removed after the pipeline
     try:
         TEMP_DIRS.append(root_dir)
     except Exception:
-        logger.debug("SCRAPER: failed to record temp dir for cleanup", exc_info=True)
+        pass
     out_dir = os.path.join(root_dir, norm_key)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -701,8 +666,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     service = Service(candidate_path)
                     driver = webdriver.Chrome(service=service, options=options)
                     break
-                except Exception as e:
-                    logger.warning("SCRAPER: chromedriver at %s did not start: %s", candidate_path, e)
+                except Exception:
                     continue
         if driver is None:
             # Fall back to webdriver_manager: this will download a driver if necessary
@@ -757,23 +721,33 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 songs_tab_xpath = "//button[contains(., 'Songs')]"
                 SeleniumHelper.click_element(driver, songs_tab_xpath, timeout=5, log_func=logger.debug)
                 # After clicking the Songs tab, wait for the loading spinner
+                # to appear and then disappear.  PraiseCharts renders a
+                # <app-loading-spinner> element inside the search bar
+                # when filtering; we first wait up to 5 seconds for it to
+                # appear, then wait up to an additional 10 seconds for it
+                # to vanish.  This prevents premature access to the DOM.
                 spinner_xpath = "//app-loading-spinner"
                 # Wait for the spinner to appear (if it ever does)
+                # Wait up to a few seconds for the spinner to appear.  In some
+                # cases the spinner appears after a brief delay.  If it
+                # never appears, we will proceed to the disappear wait.
                 appear_deadline = time.time() + 7
                 while time.time() < appear_deadline:
                     try:
                         if driver.find_elements(By.XPATH, spinner_xpath):
                             break
                     except Exception:
-                        logger.debug("SCRAPER: transient error while checking spinner appearance", exc_info=True)
+                        pass
                     time.sleep(0.2)
-                # Wait for the spinner to disappear.
+                # Wait for the spinner to disappear.  Some searches can take up to
+                # 15 seconds to refresh the results, so allow a generous
+                # timeout here.  Poll every 0.3 seconds until no spinner
+                # elements are present or until the deadline is reached.
                 disappear_deadline = time.time() + 15
                 while time.time() < disappear_deadline:
                     try:
                         spinners = driver.find_elements(By.XPATH, spinner_xpath)
                     except Exception:
-                        logger.debug("SCRAPER: transient error while checking spinner disappearance", exc_info=True)
                         spinners = []
                     if not spinners:
                         break
@@ -781,8 +755,8 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 # Brief additional pause to allow DOM to stabilise
                 time.sleep(random.uniform(0.5, 1.0))
             except Exception:
-                # If clicking the songs tab or waiting for the spinner fails, log at debug
-                logger.debug("SCRAPER: could not click Songs tab or wait for spinner", exc_info=True)
+                # If clicking the songs tab or waiting for the spinner fails, just continue
+                pass
             # Locate the songs container
             songs_parent_el = SeleniumHelper.find_element(driver, XPATHS['songs_parent'], timeout=10, log_func=logger.debug)
             if not songs_parent_el:
@@ -799,13 +773,12 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     title_el = child.find_element("xpath", XPATHS['song_title'])
                     song_title = title_el.text.strip()
                 except Exception:
-                    logger.debug("SCRAPER: failed to extract song title", exc_info=True)
+                    pass
                 # Extract text3 (keys or 'Album')
                 try:
                     text3_el = child.find_element("xpath", XPATHS['song_text3'])
                     text3 = text3_el.text.strip()
                 except Exception:
-                    logger.debug("SCRAPER: failed to extract song text3", exc_info=True)
                     text3 = ''
                 # Skip entries without text3 or containing 'album'
                 if not text3:
@@ -818,7 +791,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     text2_el = child.find_element("xpath", XPATHS['song_text2'])
                     text2 = text2_el.text.split("\n")[0].strip()
                 except Exception:
-                    logger.debug("SCRAPER: failed to extract song text2 (artist)", exc_info=True)
                     text2 = ''
                 if text2 and text3 and text3 != text2:
                     artist_name = text2
@@ -838,7 +810,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     ])
                     logger.info("SCRAPER: search results: %s", choices_str)
                 except Exception:
-                    logger.debug("SCRAPER: failed to log search results", exc_info=True)
+                    pass
             return candidates
 
         # Build the initial list of song candidates
@@ -868,7 +840,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         f" by {cand.get('artist')}" if cand.get('artist') else '',
                     )
                 except Exception:
-                    logger.debug("SCRAPER: failed to log candidate evaluation", exc_info=True)
+                    pass
                 # Instead of clicking the candidate in the same tab, open it in a new tab.
                 # Retrieve the anchor element for this candidate to extract its href.
                 try:
@@ -907,16 +879,15 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 try:
                     driver.switch_to.window(driver.window_handles[-1])
                 except Exception:
-                    logger.warning("SCRAPER: failed to switch to new tab", exc_info=True)
                     # If switching fails, close the tab and skip this candidate
                     try:
                         driver.close()
                     except Exception:
-                        logger.debug("SCRAPER: failed to close failed tab", exc_info=True)
+                        pass
                     try:
                         driver.switch_to.window(original_window)
                     except Exception:
-                        logger.debug("SCRAPER: failed to switch back to original tab", exc_info=True)
+                        pass
                     continue
                 # Allow the page to load
                 time.sleep(random.uniform(1.0, 2.0))
@@ -933,17 +904,16 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     time.sleep(random.uniform(0.5, 1.0))
                 except Exception:
                     orch_ok = False
-                    logger.debug("SCRAPER: failed to click chords/orchestration", exc_info=True)
                 if not orch_ok:
                     # Close the tab and switch back to the original search results tab.
                     try:
                         driver.close()
                     except Exception:
-                        logger.debug("SCRAPER: failed to close candidate tab without orchestration", exc_info=True)
+                        pass
                     try:
                         driver.switch_to.window(original_window)
                     except Exception:
-                        logger.debug("SCRAPER: failed switching back to results after candidate skip", exc_info=True)
+                        pass
                     logger.info(
                         "SCRAPER: candidate '%s' has no orchestration; skipping",
                         cand.get('title', 'unknown'),
@@ -969,7 +939,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     try:
                         driver.quit()
                     except Exception:
-                        logger.debug("SCRAPER: driver.quit() failed during retry", exc_info=True)
+                        pass
                     return _scrape_with_selenium(title, instrument, key, _retry=True)
                 return None
         # End of candidate selection loop
@@ -994,7 +964,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 driver.back()
                 time.sleep(1)
             except Exception:
-                logger.debug("SCRAPER: driver.back() failed after key menu issue", exc_info=True)
+                pass
             return None
         # Fetch list items
         key_parent_el = SeleniumHelper.find_element(
@@ -1013,21 +983,19 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 from watermark_remover.utils.transposition_utils import KEY_TO_SEMITONE
                 target_semitone = KEY_TO_SEMITONE.get(normalize_key(requested_norm), None)
             except Exception:
-                logger.debug("SCRAPER: failed to import KEY_TO_SEMITONE", exc_info=True)
                 target_semitone = None
             # Attempt to select the requested key exactly
             for btn in key_buttons:
                 try:
                     btn_text = btn.text.strip()
                 except Exception:
-                    logger.debug("SCRAPER: failed reading key button text", exc_info=True)
                     continue
                 if btn_text and btn_text.lower() == requested_norm.lower():
                     selected_key = btn_text
                     try:
                         btn.click()
                     except Exception:
-                        logger.debug("SCRAPER: failed clicking exact key button", exc_info=True)
+                        pass
                     break
             # If not selected and we know the target semitone, choose the closest key (prefer downward)
             if not selected_key and target_semitone is not None and key_buttons:
@@ -1036,7 +1004,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     try:
                         btn_text = btn.text.strip()
                     except Exception:
-                        logger.debug("SCRAPER: failed reading key button text (closest)", exc_info=True)
                         continue
                     if not btn_text:
                         continue
@@ -1061,14 +1028,14 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     try:
                         sel_btn.click()
                     except Exception:
-                        logger.debug("SCRAPER: failed clicking closest/fallback key", exc_info=True)
+                        pass
             # Fallback: pick first available if no other key selected
             if not selected_key and key_buttons:
                 selected_key = key_buttons[0].text.strip()
                 try:
                     key_buttons[0].click()
                 except Exception:
-                    logger.debug("SCRAPER: failed clicking first available key", exc_info=True)
+                    pass
         # Close key menu (click again)
         SeleniumHelper.click_element(
             driver, XPATHS['key_button'], timeout=5, log_func=logger.debug
@@ -1094,7 +1061,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         selected_key,
                     )
             except Exception:
-                logger.debug("SCRAPER: failed to log key fallback reason", exc_info=True)
+                pass
         # Gather available instruments
         available_instruments: list[str] = []
         selected_instrument: str | None = None
@@ -1113,7 +1080,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 driver.back()
                 time.sleep(1)
             except Exception:
-                logger.debug("SCRAPER: driver.back() failed after parts menu issue", exc_info=True)
+                pass
             return None
         # Locate the parent element for the parts menu and collect buttons
         parts_parent_el = SeleniumHelper.find_element(
@@ -1124,7 +1091,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
             from selenium.webdriver.common.by import By  # type: ignore
         except Exception:
             By = None  # type: ignore
-            logger.debug("SCRAPER: failed importing selenium.webdriver.common.by.By", exc_info=True)
         if parts_parent_el is not None and By is not None:
             try:
                 parts_buttons = []
@@ -1152,7 +1118,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         )
                         time.sleep(0.5)
                     except Exception:
-                        logger.debug("SCRAPER: error while scrolling parts list", exc_info=True)
                         break
                 # Final refresh
                 try:
@@ -1161,7 +1126,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         if b not in parts_buttons:
                             parts_buttons.append(b)
                 except Exception:
-                    logger.debug("SCRAPER: failed refreshing parts buttons", exc_info=True)
+                    pass
             except Exception:
                 parts_buttons = []
         # Fallback: gather via parts_list if parent not found
@@ -1174,7 +1139,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
             try:
                 part_text = btn.text.strip()
             except Exception:
-                logger.debug("SCRAPER: failed reading part button text", exc_info=True)
                 part_text = ''
             if not part_text:
                 continue
@@ -1190,7 +1154,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
             try:
                 part_text = btn.text.strip()
             except Exception:
-                logger.debug("SCRAPER: failed reading exact-match instrument text", exc_info=True)
                 continue
             if not part_text:
                 continue
@@ -1202,7 +1165,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 try:
                     btn.click()
                 except Exception:
-                    logger.debug("SCRAPER: failed clicking exact-match instrument", exc_info=True)
+                    pass
                 break
         # Substring/horn match
         if not selected_instrument:
@@ -1210,7 +1173,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 try:
                     part_text = btn.text.strip()
                 except Exception:
-                    logger.debug("SCRAPER: failed reading instrument text (substring)", exc_info=True)
                     continue
                 if not part_text:
                     continue
@@ -1229,7 +1191,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                     try:
                         btn.click()
                     except Exception:
-                        logger.debug("SCRAPER: failed clicking matched instrument", exc_info=True)
+                        pass
                     break
         # Default: first available
         if not selected_instrument and available_instruments:
@@ -1240,7 +1202,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                         btn.click()
                         break
                 except Exception:
-                    logger.debug("SCRAPER: failed clicking default instrument", exc_info=True)
                     continue
         # Close parts menu
         SeleniumHelper.click_element(
@@ -1270,9 +1231,9 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                                 selected_instrument,
                             )
                 except Exception:
-                    logger.debug("SCRAPER: failed to log instrument fallback reason", exc_info=True)
+                    pass
             except Exception:
-                logger.debug("SCRAPER: failed logging available instruments", exc_info=True)
+                pass
         # Now on the product page with the chosen key and instrument.  Locate the image element and next button
         image_xpath = XPATHS['image_element']
         next_button_xpath = XPATHS['next_button']
@@ -1319,7 +1280,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 next_btn.click()
                 time.sleep(1)
             except Exception:
-                logger.debug("SCRAPER: next button not clickable or end reached", exc_info=True)
                 break
             prev_page_num = page_num
         # If we downloaded any images, log artist information if available
@@ -1334,13 +1294,13 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 SCRAPE_METADATA['instrument'] = selected_instrument or ''
                 SCRAPE_METADATA['key'] = (selected_key or norm_key) or ''
             except Exception:
-                logger.debug("SCRAPER: failed to update SCRAPE_METADATA after download", exc_info=True)
+                pass
             # Track the downloaded directory for cleanup after the PDF is assembled
             try:
                 if out_dir not in TEMP_DIRS:
                     TEMP_DIRS.append(out_dir)
             except Exception:
-                logger.debug("SCRAPER: failed to record out_dir in TEMP_DIRS", exc_info=True)
+                pass
             return out_dir
         # Otherwise, scraping failed
         logger.warning("SCRAPER: no images downloaded for title '%s'", title)
@@ -1352,7 +1312,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
         try:
             driver.quit()
         except Exception:
-            logger.debug("SCRAPER: failed to quit WebDriver", exc_info=True)
+            pass
 
 
 @tool
@@ -1413,7 +1373,7 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
     try:
         load_best_model(model, model_dir)  # type: ignore[misc]
     except Exception:
-        logger.warning("WMR: failed to load checkpoints from %s; using random weights", model_dir, exc_info=True)
+        logger.warning("WMR: failed to load checkpoints from %s; using random weights", model_dir)
     model.eval()
     processed_dir = output_dir
     for fname in images:
@@ -1437,9 +1397,8 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
                     im.save(tmp_path)
                     tensor = PIL_to_tensor(tmp_path)
                     os.remove(tmp_path)
-                except Exception as e:
-                    # fallback: average channels (log the issue)
-                    logger.warning("WMR: grayscale conversion failed (%s); falling back to channel average", e)
+                except Exception:
+                    # fallback: average channels
                     tensor = tensor.mean(dim=0, keepdim=True)
             tensor = tensor.unsqueeze(0).to(device)
             output = model(tensor)
@@ -1518,7 +1477,7 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
     try:
         load_best_model(us_model, model_dir)  # type: ignore[misc]
     except Exception:
-        logger.warning("VDSR: failed to load checkpoints from %s; using random weights", model_dir, exc_info=True)
+        logger.warning("VDSR: failed to load checkpoints from %s; using random weights", model_dir)
     us_model.eval()
     # Define upsample operation to enlarge each image to the canonical size.
     image_base_width, image_base_height = 1700, 2200
@@ -1638,7 +1597,6 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
         # title stored in metadata is already sanitised.  If any
         # component is missing, substitute a sensible default.
         import re
-
         def _sanitize(value: str) -> str:
             return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
         title_meta = meta.get('title', '') or 'unknown'
@@ -1680,7 +1638,6 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
         debug_pdf_path = os.path.join(debug_dir, file_name)
     except Exception:
         # Fallback: use provided output_pdf and create directories if necessary
-        logger.warning("ASSEMBLER: failed to build metadata-based output paths; using fallback", exc_info=True)
         final_pdf_path = output_pdf
         debug_pdf_path = output_pdf
         os.makedirs(os.path.dirname(final_pdf_path) or '.', exist_ok=True)

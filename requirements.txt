@@ -22,6 +22,3 @@ numpy
 # development server.
 langgraph>=0.2.0
 langgraph-cli[inmem]>=0.2.0
-
-# PDF parsing library for order of worship processing
-pdfplumber>=0.10.0
