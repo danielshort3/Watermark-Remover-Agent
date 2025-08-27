@@ -32,7 +32,6 @@ import uuid
 import traceback
 import logging
 from typing import Any, Dict, List, Tuple
-import datetime
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
@@ -114,21 +113,12 @@ def _get_order_folder(state: Dict[str, Any]) -> str:
             except Exception:
                 pass
 
-        # Last resort: never use 'unknown'—fallback to today's date in MM_DD_YYYY
+    # Last resort
+    of = of or "unknown"
     try:
-        if not of or of.lower() == "unknown":
-            today = datetime.datetime.now().strftime("%m_%d_%Y")
-            # Persist on state for downstream consumers
-            state["order_folder"] = today
-            return sanitize_title(today)
         return sanitize_title(of)
     except Exception:
-        # Fallback: best-effort raw value or today's date
-        try:
-            return of if (of and of.lower() != "unknown") else datetime.datetime.now().strftime("%m_%d_%Y")
-        except Exception:
-            return "unknown_date"
-
+        return of
 
 def _debug_dir_for(state: Dict[str, Any]) -> Path:
     run_id = _get_run_id(state)
@@ -837,6 +827,7 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "instrument": song.get("instrument", ""),
                 "key": song.get("key", ""),
                 "input_dir": input_dir_override,
+                "artist": song.get("artist", ""),
             }
             if _debug_enabled(new_state):
                 base = _debug_dir_for(new_state)
@@ -903,12 +894,13 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            safe_title = sanitize_title(SCRAPE_METADATA.get("title") or song.get("title", "Unknown Title"))
             safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
             safe_key = sanitize_title(actual_key or "Unknown Key")
 
+            actual_title_for_name = SCRAPE_METADATA.get("title") or song.get("title", "Unknown Title")
+            safe_title_for_name = sanitize_title(actual_title_for_name)
             idx_str = str(idx + 1).zfill(2)
-            filename = f"{idx_str}_{safe_title}_{safe_instrument}_{safe_key}.pdf"
+            filename = f"{idx_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
 
             # 4) ASSEMBLE PDF
             try:

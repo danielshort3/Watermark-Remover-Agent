@@ -65,6 +65,101 @@ from watermark_remover.utils.transposition_utils import (
 from watermark_remover.utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 from PIL import Image
 
+# Optional LLM ranking support (uses local Ollama-backed agent if available)
+try:
+    from watermark_remover.agent.graph_ollama import run_instruction as _llm_run_instruction  # type: ignore
+except Exception:
+    _llm_run_instruction = None  # type: ignore
+
+def _is_default_arrangement(artist: Optional[str]) -> bool:
+    if not artist:
+        return False
+    a = artist.strip().lower()
+    return "default" in a and "arrangement" in a
+
+def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], candidates: list[dict]) -> int | None:
+    if _llm_run_instruction is None:
+        return None
+    try:
+        # Build a compact list of candidates
+        items = []
+        for i, c in enumerate(candidates):
+            t = str(c.get("title", "")).strip()
+            a = str(c.get("artist", "") or "").strip()
+            items.append(f"{i}: TITLE='{t}' | ARTIST='{a}'")
+        req_artist = "" if _is_default_arrangement(artist) else (artist or "")
+        instr = (
+            "You are matching a hymn/worship song search result to a requested song. "
+            "Pick the SINGLE best index (0-based) from the list. "
+            "Rules: "
+            "1) Exact title match beats partials. "
+            "2) If an artist is provided, prefer that artist (ignore 'default arrangement'). "
+            "3) Prefer common worship arrangements over covers. "
+            "4) If unsure, choose the most likely canonical version. "
+            "Return ONLY JSON like {\"index\": <int>, \"confidence\": <float>}."
+        )
+        prompt = (
+            f"""{instr}
+Requested Title: {title}
+Requested Artist: {req_artist or 'N/A'}
+
+CANDIDATES:
+{chr(10).join(items)}
+"""
+        )
+        raw = _llm_run_instruction(prompt)  # type: ignore
+        s = str(raw).strip()
+        # Try to extract JSON block
+        import json as _json, re as _re
+        obj = None
+        # Find first {...}
+        m = _re.search(r"\{.*?\}", s, flags=_re.S)
+        if m:
+            try:
+                obj = _json.loads(m.group(0))
+            except Exception:
+                obj = None
+        if isinstance(obj, dict) and "index" in obj:
+            idx = int(obj.get("index"))
+            if 0 <= idx < len(candidates):
+                return idx
+        # Fallback: find first integer in text
+        m2 = _re.search(r"(\d+)", s)
+        if m2:
+            idx = int(m2.group(1))
+            if 0 <= idx < len(candidates):
+                return idx
+    except Exception:
+        return None
+    return None
+
+def _reorder_candidates(title: str, artist: Optional[str], candidates: list[dict]) -> list[dict]:
+    """Reorder the list using LLM if available; otherwise, fuzzy title/artist similarity."""
+    # LLM pick first
+    best = _choose_best_candidate_index_with_llm(title, artist, candidates)
+    remaining = list(range(len(candidates)))
+    if best is not None and 0 <= best < len(candidates):
+        remaining.remove(best)
+        ordered = [candidates[best]]
+    else:
+        ordered = []
+
+    # Fuzzy rank the rest by title/artist similarity
+    from difflib import SequenceMatcher
+    def score(c: dict) -> float:
+        t = str(c.get("title", "")).lower()
+        a = str(c.get("artist", "") or "").lower()
+        s1 = SequenceMatcher(None, t, title.lower()).ratio()
+        if artist and not _is_default_arrangement(artist):
+            s2 = SequenceMatcher(None, a, artist.lower()).ratio()
+        else:
+            s2 = 0.0
+        return (s1 * 0.8) + (s2 * 0.2)
+    rest = [candidates[i] for i in remaining]
+    rest.sort(key=score, reverse=True)
+    return ordered + rest if ordered else rest
+
+
 # ---------------------------------------------------------------------------
 # Sanitisation helper
 #
@@ -250,6 +345,7 @@ def scrape_music(
     instrument: str,
     key: str,
     input_dir: Optional[str] = None,
+    artist: Optional[str] = None,
 ) -> str:
     """Return a directory of sheet music images for the requested title/key.
 
@@ -363,15 +459,6 @@ def scrape_music(
             # explicit directory, no artist information is available,
             # so we default to 'unknown'.
             safe_artist = 'unknown'
-
-            # Canonicalize instrument/key for directory naming using post-scrape metadata if available
-            try:
-                _inst_meta = SCRAPE_METADATA.get('instrument') or instrument or ''
-                _key_meta = SCRAPE_METADATA.get('key') or key or ''
-                safe_instrument = sanitize_title(_inst_meta) if _inst_meta else 'unknown'
-                safe_key = sanitize_title(_key_meta) if _key_meta else 'unknown'
-            except Exception:
-                pass
             # Build the full instrument directory under the log root:
             # logs/<run_ts>/<song>/<artist>/<key>/<instrument>/
             instrument_dir = os.path.join(
@@ -394,7 +481,8 @@ def scrape_music(
             # Update metadata with the default artist
             try:
                 SCRAPE_METADATA['artist'] = safe_artist
-                SCRAPE_METADATA['title'] = safe_title
+                # Title should reflect the ACTUAL selected candidate, not the requested title
+                SCRAPE_METADATA['title'] = cand.get('title', title)
                 SCRAPE_METADATA['instrument'] = instrument
                 SCRAPE_METADATA['key'] = key
             except Exception:
@@ -422,27 +510,20 @@ def scrape_music(
     # ensures that the legacy library search code below is never
     # executed.
     try:
-        scraped_dir = _scrape_with_selenium(title, instrument, key)
+        scraped_dir = _scrape_with_selenium(title, instrument, key, artist=artist)
     except Exception as scrape_err:
         scraped_dir = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
     if scraped_dir:
         # Determine the artist from metadata (set by _scrape_with_selenium)
+        title_meta = (SCRAPE_METADATA.get('title', '') or title)
         artist_meta = SCRAPE_METADATA.get('artist', '') or 'unknown'
         import re
         def _sanitize(value: str) -> str:
             return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+        safe_title = _sanitize(title_meta)
         safe_artist = _sanitize(artist_meta)
-
-        # Canonicalize instrument/key for directory naming using selected values from scraping
-        try:
-            _inst_meta = SCRAPE_METADATA.get('instrument') or instrument or ''
-            _key_meta = SCRAPE_METADATA.get('key') or key or ''
-            safe_instrument = sanitize_title(_inst_meta) if _inst_meta else 'unknown'
-            safe_key = sanitize_title(_key_meta) if _key_meta else 'unknown'
-        except Exception:
-            pass
-        # Build the instrument directory under the log root
+        # Build the instrument directory under the log root using ACTUAL selected metadata
         instrument_dir = os.path.join(
             log_root,
             safe_title,
@@ -530,7 +611,7 @@ def scrape_music(
     if candidate_dir is None:
         # Before giving up, attempt to scrape the sheet music online using Selenium.
         try:
-            scraped_dir = _scrape_with_selenium(title, instrument, key)
+            scraped_dir = _scrape_with_selenium(title, instrument, key, artist=artist)
         except Exception as scrape_err:
             # Log any exception that occurs during scraping and fall back
             scraped_dir = None
@@ -604,7 +685,7 @@ def scrape_music(
     logger.warning("SCRAPER: %s", message)
     # Attempt online scraping before raising the error
     try:
-        scraped_dir = _scrape_with_selenium(title, instrument, key)
+        scraped_dir = _scrape_with_selenium(title, instrument, key, artist=artist)
     except Exception as scrape_err:
         scraped_dir = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
@@ -631,7 +712,7 @@ def scrape_music(
 # scraping fails for any reason, the function returns ``None`` so
 # ``scrape_music`` can fall back to other logic.
 
-def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool = False) -> Optional[str]:
+def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optional[str] = None, *, _retry: bool = False) -> Optional[str]:
     """Attempt to scrape sheet music from an online catalogue.
 
     This helper uses a headless Chrome browser (via Selenium WebDriver) to
@@ -744,7 +825,11 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
         driver.get(search_url)
         wait = WebDriverWait(driver, 10)
         # Use the helper to send keys to the search bar
-        if not SeleniumHelper.send_keys_to_element(driver, XPATHS['search_bar'], title, timeout=5, log_func=logger.debug):
+        # Build search query using title + artist when artist is not default arrangement
+        search_query = title
+        if artist and not _is_default_arrangement(artist):
+            search_query = f"{title} {artist}"
+        if not SeleniumHelper.send_keys_to_element(driver, XPATHS['search_bar'], search_query, timeout=5, log_func=logger.debug):
             logger.error("SCRAPER: failed to locate or send keys to search bar")
             return None
         # Allow suggestions/results to render
@@ -769,8 +854,11 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 driver.get(search_url)
             except Exception:
                 return []
-            # Enter the title in the search bar
-            if not SeleniumHelper.send_keys_to_element(driver, XPATHS['search_bar'], title, timeout=5, log_func=logger.debug):
+            # Enter the combined query (title + artist if supplied)
+            search_query = title
+            if artist and not _is_default_arrangement(artist):
+                search_query = f"{title} {artist}"
+            if not SeleniumHelper.send_keys_to_element(driver, XPATHS['search_bar'], search_query, timeout=5, log_func=logger.debug):
                 return []
             # Allow suggestions to render
             time.sleep(random.uniform(0.5, 1.5))
@@ -878,6 +966,11 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
 
         # Build the initial list of song candidates
         song_candidates = perform_search()
+        # Reorder candidates using LLM/fuzzy matching
+        try:
+            song_candidates = _reorder_candidates(title, artist, song_candidates) or song_candidates
+        except Exception:
+            pass
         # Set of attempted song identifiers to avoid infinite loops
         attempted: set[tuple[str, str]] = set()
         selected = None
@@ -1212,35 +1305,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 available_instruments.append(part_text)
         # Determine the most appropriate instrument selection
         requested_lower = instrument.lower()
-        
-        # Prefer '1 & 2' parts when available (e.g., 'French Horn 1 & 2') for combined parts naming
-        if not selected_instrument:
-            try:
-                import re as _re
-                req = requested_lower
-                base_req = _re.sub(r"\b[0-9]+\b", "", req).strip()
-                def _is_parted(s: str) -> bool:
-                    return bool(_re.search(r"\b1\s*([&+,]|and)\s*2\b", s))
-                for btn in parts_buttons:
-                    try:
-                        pt = (btn.text or "").strip()
-                    except Exception:
-                        continue
-                    if not pt:
-                        continue
-                    low = pt.lower()
-                    if 'cover' in low or 'lead sheet' in low:
-                        continue
-                    if _is_parted(low) and (base_req and base_req.split()[0] in low):
-                        selected_instrument = pt
-                        try:
-                            btn.click()
-                        except Exception:
-                            pass
-                        break
-            except Exception:
-                pass
-
         # Exact match
         for btn in parts_buttons:
             try:
@@ -1381,7 +1445,8 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
             # Record metadata for use in later pipeline stages.  This metadata
             # includes the sanitised title, selected artist, instrument and key.
             try:
-                SCRAPE_METADATA['title'] = safe_title
+                # Title should reflect the ACTUAL selected candidate, not the requested title
+                SCRAPE_METADATA['title'] = cand.get('title', title)
                 SCRAPE_METADATA['artist'] = artist_name or ''
                 SCRAPE_METADATA['instrument'] = selected_instrument or ''
                 SCRAPE_METADATA['key'] = (selected_key or norm_key) or ''
