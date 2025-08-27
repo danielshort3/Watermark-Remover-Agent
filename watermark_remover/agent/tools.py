@@ -363,6 +363,15 @@ def scrape_music(
             # explicit directory, no artist information is available,
             # so we default to 'unknown'.
             safe_artist = 'unknown'
+
+            # Canonicalize instrument/key for directory naming using post-scrape metadata if available
+            try:
+                _inst_meta = SCRAPE_METADATA.get('instrument') or instrument or ''
+                _key_meta = SCRAPE_METADATA.get('key') or key or ''
+                safe_instrument = sanitize_title(_inst_meta) if _inst_meta else 'unknown'
+                safe_key = sanitize_title(_key_meta) if _key_meta else 'unknown'
+            except Exception:
+                pass
             # Build the full instrument directory under the log root:
             # logs/<run_ts>/<song>/<artist>/<key>/<instrument>/
             instrument_dir = os.path.join(
@@ -424,6 +433,15 @@ def scrape_music(
         def _sanitize(value: str) -> str:
             return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
         safe_artist = _sanitize(artist_meta)
+
+        # Canonicalize instrument/key for directory naming using selected values from scraping
+        try:
+            _inst_meta = SCRAPE_METADATA.get('instrument') or instrument or ''
+            _key_meta = SCRAPE_METADATA.get('key') or key or ''
+            safe_instrument = sanitize_title(_inst_meta) if _inst_meta else 'unknown'
+            safe_key = sanitize_title(_key_meta) if _key_meta else 'unknown'
+        except Exception:
+            pass
         # Build the instrument directory under the log root
         instrument_dir = os.path.join(
             log_root,
@@ -1194,6 +1212,35 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
                 available_instruments.append(part_text)
         # Determine the most appropriate instrument selection
         requested_lower = instrument.lower()
+        
+        # Prefer '1 & 2' parts when available (e.g., 'French Horn 1 & 2') for combined parts naming
+        if not selected_instrument:
+            try:
+                import re as _re
+                req = requested_lower
+                base_req = _re.sub(r"\b[0-9]+\b", "", req).strip()
+                def _is_parted(s: str) -> bool:
+                    return bool(_re.search(r"\b1\s*([&+,]|and)\s*2\b", s))
+                for btn in parts_buttons:
+                    try:
+                        pt = (btn.text or "").strip()
+                    except Exception:
+                        continue
+                    if not pt:
+                        continue
+                    low = pt.lower()
+                    if 'cover' in low or 'lead sheet' in low:
+                        continue
+                    if _is_parted(low) and (base_req and base_req.split()[0] in low):
+                        selected_instrument = pt
+                        try:
+                            btn.click()
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
+
         # Exact match
         for btn in parts_buttons:
             try:

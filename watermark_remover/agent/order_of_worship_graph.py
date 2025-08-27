@@ -24,6 +24,7 @@ Toggle console+file debugging:
 
 from __future__ import annotations
 
+import re
 import os
 import json
 import time
@@ -31,6 +32,7 @@ import uuid
 import traceback
 import logging
 from typing import Any, Dict, List, Tuple
+import datetime
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
@@ -85,15 +87,48 @@ def _get_run_id(state: Dict[str, Any]) -> str:
     return rid
 
 def _get_order_folder(state: Dict[str, Any]) -> str:
-    # We rely ONLY on the LLM to set "order_folder". If absent, we keep "unknown_date".
-    of = state.get("order_folder")
-    if not of:
-        of = "unknown_date"
-    # Sanitize to be safe for filesystem
+    # Compute from PDF if possible; fallback to state-provided or 'unknown'
+    of = (state.get("order_folder") or "").strip()
+    if of and of.lower() != "unknown" and re.fullmatch(r"\d{2}_\d{2}_\d{4}", of):
+        # Already set/normalized
+        try:
+            return sanitize_title(of)
+        except Exception:
+            return of
+
+    # Try to compute from the actual PDF text
+    pdf_name = state.get("pdf_name")
+    pdf_path = None
+    if pdf_name:
+        # Resolve path similar to extractor
+        pdf_path = pdf_name
+        if not os.path.isabs(pdf_path):
+            root_dir = state.get("pdf_root") or state.get("input_dir") or "input"
+            candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
+            pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
+        if os.path.exists(pdf_path):
+            try:
+                computed = _determine_order_folder_from_pdf(state, pdf_path)
+                if computed and computed.lower() != "unknown":
+                    return sanitize_title(computed)
+            except Exception:
+                pass
+
+        # Last resort: never use 'unknown'—fallback to today's date in MM_DD_YYYY
     try:
+        if not of or of.lower() == "unknown":
+            today = datetime.datetime.now().strftime("%m_%d_%Y")
+            # Persist on state for downstream consumers
+            state["order_folder"] = today
+            return sanitize_title(today)
         return sanitize_title(of)
     except Exception:
-        return of
+        # Fallback: best-effort raw value or today's date
+        try:
+            return of if (of and of.lower() != "unknown") else datetime.datetime.now().strftime("%m_%d_%Y")
+        except Exception:
+            return "unknown_date"
+
 
 def _debug_dir_for(state: Dict[str, Any]) -> Path:
     run_id = _get_run_id(state)
@@ -317,6 +352,189 @@ def _read_pdf_text(pdf_path: str) -> str:
         "Could not read PDF text. Please install pdfplumber, PyPDF2, or pdfminer.six."
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Date of Service Extraction
+# ---------------------------------------------------------------------------
+
+_DATE_KEYWORDS = [
+    "date of service",
+    "service date",
+    "worship date",
+    "sunday",
+    "saturday",
+    "friday",
+    "worship on",
+    "worship for",
+    "order of worship for",
+    "date:"
+]
+
+_MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+# Common date regexes (US‑centric; we'll normalize to MM_DD_YYYY)
+_DATE_PATTERNS = [
+    # 01/05/2025 or 1/5/2025
+    r"(?P<m>\d{1,2})[/-](?P<d>\d{1,2})[/-](?P<y>\d{4})",
+    # 2025-01-05
+    r"(?P<y>\d{4})[.-](?P<m>\d{1,2})[.-](?P<d>\d{1,2})",
+    # January 5, 2025  or Jan 5, 2025
+    r"(?P<mon>(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?))\s+(?P<d>\d{1,2})(?:st|nd|rd|th)?(?:,)?\s+(?P<y>\d{4})",
+    # 5 January 2025 (UK style)
+    r"(?P<d>\d{1,2})(?:st|nd|rd|th)?\s+(?P<mon>(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?))\s+(?P<y>\d{4})",
+]
+
+def _normalize_date_mm_dd_yyyy(y: int, m: int, d: int) -> str:
+    return f"{m:02d}_{d:02d}_{y:04d}"
+
+def _parse_month_name(mon: str) -> int | None:
+    if not mon:
+        return None
+    return _MONTHS.get(mon.strip().lower())
+
+def _try_parse_date_fragment(s: str) -> list[tuple[int,int,int,int,int]]:
+    """Return list of (start, end, y, m, d) tuples for every date found in s."""
+    found: list[tuple[int,int,int,int,int]] = []
+    for pattern in _DATE_PATTERNS:
+        for m in re.finditer(pattern, s, flags=re.IGNORECASE):
+            gd = m.groupdict()
+            try:
+                if gd.get("mon"):
+                    mnum = _parse_month_name(gd["mon"])
+                    if not mnum:
+                        continue
+                    day = int(gd["d"])
+                    year = int(gd["y"])
+                    found.append((m.start(), m.end(), year, mnum, day))
+                else:
+                    year = int(gd["y"])
+                    month = int(gd["m"])
+                    day = int(gd["d"])
+                    # Very naive sanity check
+                    if not (1 <= month <= 12 and 1 <= day <= 31 and 1900 <= year <= 2100):
+                        continue
+                    found.append((m.start(), m.end(), year, month, day))
+            except Exception:
+                continue
+    return found
+
+def _score_date_candidate(text: str, pos_start: int, pos_end: int) -> int:
+    """Heuristic score: closer to keywords gets higher score; date in title block gets slight boost."""
+    window = 200  # characters to look around
+    start = max(0, pos_start - window)
+    end = min(len(text), pos_end + window)
+    around = text[start:end].lower()
+    score = 0
+    for kw in _DATE_KEYWORDS:
+        if kw in around:
+            score += 5
+    # Boost if line contains 'worship' or 'order of worship'
+    line_start = text.rfind('\n', 0, pos_start) + 1
+    line_end = text.find('\n', pos_end)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[line_start:line_end].lower()
+    if "worship" in line:
+        score += 2
+    # Slight boost if date is within first 1k chars (cover page)
+    if pos_start < 1000:
+        score += 1
+    return score
+
+def _extract_service_date_heuristic(pdf_text: str) -> str | None:
+    """Heuristically pick the most plausible service date and normalize to MM_DD_YYYY."""
+    candidates = _try_parse_date_fragment(pdf_text)
+    if not candidates:
+        return None
+    # Choose max score (ties broken by earliest in doc)
+    best = None
+    best_score = -10**9
+    for start, end, y, m, d in candidates:
+        score = _score_date_candidate(pdf_text, start, end)
+        if score > best_score or (score == best_score and (best is None or start < best[0])):
+            best = (start, end, y, m, d)
+            best_score = score
+    if best is None:
+        return None
+    _, _, y, m, d = best
+    return _normalize_date_mm_dd_yyyy(y, m, d)
+
+def _build_date_extractor_prompt(pdf_text: str) -> str:
+    system = (
+        "Extract the church 'Date of Service' from RAW text of an Order of Worship PDF. "
+        "Return STRICT JSON with exactly one key: date. "
+        "Format the value as MM_DD_YYYY (zero‑padded). "
+        "If no date is present, return {\"date\": \"\"}. "
+        "Prefer dates near phrases like 'Date of Service', 'Service Date', 'Order of Worship for', or weekday names."
+    )
+    return system + "\n\nRAW TEXT:\n" + pdf_text[:6000] + "\n\nReturn ONLY JSON."
+
+def _extract_service_date_with_llm(state: Dict[str, Any], pdf_text: str) -> str | None:
+    if run_instruction is None:
+        return None
+    try:
+        prompt = _build_date_extractor_prompt(pdf_text)
+        data = _run_llm_strict_json(state=state, label="date_extractor", prompt=prompt, expected="object")
+        if isinstance(data, dict):
+            val = (data.get("date") or "").strip()
+            # Normalize if LLM returned a recognizable date in other format
+            if re.fullmatch(r"\d{2}_\d{2}_\d{4}", val):
+                return val
+            # Try to re‑parse with our regex to make MM_DD_YYYY
+            ff = _try_parse_date_fragment(val)
+            if ff:
+                _, _, y, m, d = ff[0]
+                return _normalize_date_mm_dd_yyyy(y, m, d)
+    except Exception as e:
+        _record_error(state, "date_extractor.exception", e)
+    return None
+
+def _determine_order_folder_from_pdf(state: Dict[str, Any], pdf_path: str) -> str:
+    """Read PDF text, then use LLM (preferred) or heuristics to produce MM_DD_YYYY, else 'unknown'."""
+    try:
+        raw = _read_pdf_text(pdf_path)
+    except Exception as e:
+        _record_error(state, "date_extractor.read_pdf_exception", e)
+        raw = ""
+
+    if _debug_enabled(state):
+        base = _debug_dir_for(state)
+        _write_text(base, "pdf_text.txt", raw)
+
+    # First try LLM
+    date = _extract_service_date_with_llm(state, raw)
+    # Fallback to heuristics
+    if not date:
+        date = _extract_service_date_heuristic(raw)
+
+    if not date:
+        date = "unknown"
+
+    # Persist decision for debugging
+    if _debug_enabled(state):
+        base = _debug_dir_for(state)
+        _write_text(base, "date_of_service.txt", date)
+
+    # Sanitize folder name
+    try:
+        return sanitize_title(date)
+    except Exception:
+        return date or "unknown"
+
 # ---------------------------------------------------------------------------
 # LLM Prompts
 # ---------------------------------------------------------------------------
@@ -400,8 +618,36 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         pdf_name = (data.get("pdf_name") or "").strip()
         default_instrument = (data.get("default_instrument") or "").strip()
-        order_folder = (data.get("order_folder") or "").strip()
         overrides_raw = data.get("overrides") or {}
+        order_folder_llm = (data.get("order_folder") or "").strip()
+
+        # Compute order_folder (MM_DD_YYYY) from the PDF text (LLM preferred; fallback to heuristics)
+        try:
+            # Resolve a likely path to PDF
+            pdf_path = pdf_name
+            if not os.path.isabs(pdf_path):
+                root_dir = new_state.get("pdf_root") or new_state.get("input_dir") or "input"
+                candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
+                pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
+            order_folder_computed = _determine_order_folder_from_pdf(new_state, pdf_path) if os.path.exists(pdf_path) else "unknown"
+        except Exception as e:
+            _record_error(new_state, "parser_node.compute_order_folder_exception", e)
+            order_folder_computed = "unknown"
+        new_state["order_folder"] = order_folder_llm or order_folder_computed
+
+        # Compute order_folder (MM_DD_YYYY) from the PDF text (LLM preferred; fallback to heuristics)
+        try:
+            # Resolve a likely path to PDF
+            pdf_path = pdf_name
+            if not os.path.isabs(pdf_path):
+                root_dir = new_state.get("pdf_root") or new_state.get("input_dir") or "input"
+                candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
+                pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
+            order_folder_computed = _determine_order_folder_from_pdf(new_state, pdf_path) if os.path.exists(pdf_path) else "unknown"
+        except Exception as e:
+            _record_error(new_state, "parser_node.compute_order_folder_exception", e)
+            order_folder_computed = "unknown"
+        new_state["order_folder"] = order_folder_llm or order_folder_computed
 
         # Convert overrides keys to ints if provided as strings
         overrides: Dict[int, str] = {}
@@ -420,18 +666,20 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "pdf_name": pdf_name,
                 "default_instrument": default_instrument,
                 "overrides": overrides,
-                "order_folder": order_folder
+                "order_folder": new_state.get("order_folder")
             })
 
         if pdf_name and not new_state.get("pdf_name"):
             new_state["pdf_name"] = pdf_name
         if default_instrument and not new_state.get("default_instrument"):
             new_state["default_instrument"] = default_instrument
-        if order_folder:
+        # Normalize any LLM/heuristic-provided order_folder already stored in state
+        _of_val = new_state.get("order_folder")
+        if _of_val:
             try:
-                new_state["order_folder"] = sanitize_title(order_folder)
+                new_state["order_folder"] = sanitize_title(_of_val)
             except Exception:
-                new_state["order_folder"] = order_folder
+                new_state["order_folder"] = _of_val
 
         merged_overrides: Dict[int, str] = dict(new_state.get("overrides", {}))
         merged_overrides.update(overrides)
@@ -478,6 +726,13 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         root_dir = new_state.get("pdf_root") or new_state.get("input_dir") or "input"
         candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
         pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
+
+    # Ensure order_folder derived from PDF text (LLM preferred; fallback to heuristics)
+    try:
+        date_folder = _get_order_folder(new_state)
+        new_state["order_folder"] = date_folder
+    except Exception as e:
+        _record_error(new_state, "extract_songs_node.ensure_order_folder_exception", e)
 
     if run_instruction is None:
         err = RuntimeError("LLM 'run_instruction' is unavailable; cannot extract songs from PDF text.")
@@ -648,6 +903,7 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
+            safe_title = sanitize_title(SCRAPE_METADATA.get("title") or song.get("title", "Unknown Title"))
             safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
             safe_key = sanitize_title(actual_key or "Unknown Key")
 
