@@ -48,6 +48,9 @@ xpaths: dict[str, str] = {
     'song_image': './div/div[1]/div/app-product-audio-preview-image/div/img',
     'click_song': '//*[@id="page-wrapper"]/ion-router-outlet/app-page-search/ion-content/div/div/div/app-search/div/app-product-list-item[{index}]/div/a/div',
     'chords_button': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[1]/button',
+    # Avoid clicking orchestration sections labelled with "Finale".  We use
+    # translate() to perform a case‑insensitive check for 'orchestration'
+    # and exclude ancestors whose text contains 'finale'.
     'orchestration_header': "//h3[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'orchestration')]/ancestor::div[4][not(contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'finale'))]",
     'key_button': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[3]/app-product-selector-key/div/button',
     'key_parent': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[3]/app-product-selector-key/div/ul',
@@ -154,6 +157,29 @@ class SeleniumHelper:
                     mapped = xpath_labels.get(xpath)
                     if mapped:
                         label = mapped
+
+                # ------------------------------------------------------------------
+                # Special handling for the orchestration header: avoid clicking
+                # if the containing block includes the word "Finale".  PraiseCharts
+                # uses labels like "Finale: Orchestration" to denote Finale-only
+                # orchestrations, which do not contain the desired sheet music.  If
+                # such a label is detected, skip the click entirely.  Use
+                # translate() via Selenium attributes to perform a case-insensitive
+                # search.
+                if xpath == xpaths.get('orchestration_header'):
+                    try:
+                        # Attempt to extract inner text directly from the element.  If
+                        # this fails, use the label we already computed.
+                        block_text = (element.text or "").strip()
+                        if not block_text:
+                            block_text = (element.get_attribute("innerText") or "").strip()
+                    except Exception:
+                        block_text = label or ""
+                    # Check for 'finale' case-insensitively
+                    if block_text and 'finale' in block_text.lower():
+                        if log_func:
+                            log_func("[DEBUG] Skipping orchestration click because block contains 'Finale'")
+                        return False
                 # Capture the current URL for context.  This helps when
                 # reviewing logs to understand which page the click is
                 # occurring on.  If obtaining the URL fails, leave it
