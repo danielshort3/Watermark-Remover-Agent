@@ -36,7 +36,6 @@ import datetime
 import shutil
 import logging
 import os
-import re
 import time
 from typing import Optional, Any
 import random
@@ -65,6 +64,47 @@ from watermark_remover.utils.transposition_utils import (
 # watermark_remover/utils/selenium_utils.py for details.
 from watermark_remover.utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 from PIL import Image
+
+# ---------------------------------------------------------------------------
+# Sanitisation helper
+#
+# Define a single helper to convert song titles and other free‑form strings
+# into safe filesystem names.  This helper collapses any run of characters
+# that are not letters or digits into a single underscore and trims
+# leading/trailing underscores.  Using this function consistently
+# throughout the pipeline ensures that song titles like "At The Cross
+# (Love Ran Red)" produce the same directory name (e.g.
+# ``At_The_Cross_Love_Ran_Red``) across all stages (scraping, watermark
+# removal, upscaling and final assembly).  Without a unified sanitiser,
+# different stages produced names such as ``At_The_Cross_(Love_Ran_Red)``
+# (preserving parentheses) or ``At_The_Cross_Love_Ran_Red`` (without them),
+# causing intermediate and final files to end up in separate folders.
+import re
+
+def sanitize_title(value: str) -> str:
+    """Sanitise a string into a safe filename or directory name.
+
+    Replace any run of non‑alphanumeric characters (e.g. spaces, punctuation,
+    parentheses) with a single underscore, collapse multiple underscores into
+    one and strip leading/trailing underscores.
+
+    Parameters
+    ----------
+    value : str
+        The raw string to sanitise (e.g. a song title).
+
+    Returns
+    -------
+    str
+        A sanitized string containing only letters, digits and underscores.
+    """
+    if not value:
+        return ""
+    # Collapse non‑alphanumeric sequences into underscores
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", value.strip())
+    # Collapse multiple underscores
+    sanitized = re.sub(r"_+", "_", sanitized)
+    return sanitized.strip("_")
 
 # Import model definitions lazily.  These imports can be heavy and
 # require optional dependencies such as torch, torchvision and
@@ -203,11 +243,6 @@ except Exception:
     # Best‑effort: if we cannot set up file logging, continue silently
     pass
 
-def sanitize_title(title: str) -> str:
-    """Keep A–Z/a–z/0–9, space, (), -, collapse spaces/_ to _, trim _."""
-    safe = re.sub(r'[^A-Za-z0-9()\-\s]+', '_', title.strip())
-    safe = re.sub(r'[_\s]+', '_', safe)
-    return safe.strip('_')
 
 @tool
 def scrape_music(
@@ -281,9 +316,10 @@ def scrape_music(
     # stages will be stored under ``output/logs/<timestamp>/<safe_title>``.
     run_ts = os.environ.get("RUN_TS") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.environ.setdefault("RUN_TS", run_ts)
-    # Sanitise the title for use in directory names.  Replace any
-    # characters other than alphanumerics, spaces or hyphens with
-    # underscores, then collapse spaces into underscores.
+    # Sanitise the title for use in directory names using the unified
+    # sanitisation helper.  This removes any characters other than
+    # letters/digits and collapses runs of punctuation/whitespace into a
+    # single underscore.  See sanitize_title() at module level.
     safe_title = sanitize_title(title)
     # Compute the root of the logs for this run.  Individual subfolders
     # (song/artist/key/instrument) will be created later once we know
@@ -293,11 +329,11 @@ def scrape_music(
     # Sanitize the instrument and key ahead of time.  The key may
     # contain sharps or flats; sanitising it normalises these
     # characters for use in file paths.
-    import re
-    def _sanitize(value: str) -> str:
-        return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
-    safe_instrument = _sanitize(instrument) if instrument else 'unknown'
-    safe_key = _sanitize(key) if key else 'unknown'
+    # Use the same sanitiser for instrument and key.  This ensures
+    # consistency when building directory names and avoids mixing
+    # different patterns (e.g. parentheses vs. underscores).
+    safe_instrument = sanitize_title(instrument) if instrument else 'unknown'
+    safe_key = sanitize_title(key) if key else 'unknown'
     # Record preliminary metadata for later use when assembling the PDF.  We
     # capture the sanitised title, instrument and key along with the run
     # timestamp.  The artist will be filled in after scraping.
@@ -410,12 +446,16 @@ def scrape_music(
                 logger.info("SCRAPER: copied %s -> %s", src, dst)
         except Exception as copy_err:
             logger.error("SCRAPER: failed to copy scraped files: %s", copy_err)
-        # Update metadata with the sanitised artist and title
+        # Update metadata with the sanitised artist and title only.  Do **not**
+        # override the instrument or key here, as the selected values have
+        # already been recorded by `_scrape_with_selenium`.  Overwriting
+        # them with the requested values would cause the final PDF to be
+        # organised under the wrong key/instrument when a fallback key is
+        # chosen during scraping.
         try:
             SCRAPE_METADATA['artist'] = artist_meta
             SCRAPE_METADATA['title'] = safe_title
-            SCRAPE_METADATA['instrument'] = instrument
-            SCRAPE_METADATA['key'] = key
+            # leave SCRAPE_METADATA['instrument'] and ['key'] untouched
         except Exception:
             pass
         # Remove the temporary scraped directory and its parent as before
@@ -613,12 +653,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
         logger.error("SCRAPER: Selenium or webdriver_manager not installed: %s", e)
         return None
 
-    # Sanitize the title to create a safe directory name.  Replace any
-    # characters other than alphanumerics, spaces or hyphens with
-    # underscores.  Collapse spaces into underscores.
-    safe_title = ''.join(
-        c if c.isalnum() or c in (' ', '-') else '_' for c in title
-    ).strip().replace(' ', '_')
+    # Sanitise the title using the unified helper.  This collapses runs
+    # of non‑alphanumeric characters and ensures that parentheses and
+    # punctuation do not produce divergent names.
+    safe_title = sanitize_title(title)
     norm_key = normalize_key(key)
     # Create a temporary directory for this scraping run.  We place
     # temporary directories under the log directory so that they are
@@ -635,7 +673,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, *, _retry: bool
         TEMP_DIRS.append(root_dir)
     except Exception:
         pass
-    out_dir = os.path.join(root_dir, norm_key)
+    # Use the unified sanitiser for the key when constructing the output
+    # directory.  Without sanitising the key, names like 'Bb' could
+    # propagate punctuation inconsistently into folder names.
+    out_dir = os.path.join(root_dir, sanitize_title(norm_key))
     os.makedirs(out_dir, exist_ok=True)
 
     # Configure headless Chrome
@@ -1600,23 +1641,21 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
         # Use sanitised components for file and directory names.  The
         # title stored in metadata is already sanitised.  If any
         # component is missing, substitute a sensible default.
-        import re
-        def _sanitize(value: str) -> str:
-            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+        # Use unified sanitiser for title, artist, key and instrument names
         title_meta = meta.get('title', '') or 'unknown'
         artist_meta = meta.get('artist', '') or 'unknown'
         key_meta = meta.get('key', '') or 'unknown'
         instrument_meta = meta.get('instrument', '') or 'unknown'
-        title_dir = _sanitize(title_meta)
-        artist_dir = _sanitize(artist_meta)
-        key_dir = _sanitize(key_meta)
-        instrument_part = _sanitize(instrument_meta)
+        title_dir = sanitize_title(title_meta)
+        artist_dir = sanitize_title(artist_meta)
+        key_dir = sanitize_title(key_meta)
+        instrument_part = sanitize_title(instrument_meta)
         # Build final directory under output/music
         pdf_root = os.path.join(os.getcwd(), "output", "music")
         final_dir = os.path.join(pdf_root, title_dir, artist_dir, key_dir)
         os.makedirs(final_dir, exist_ok=True)
         # Compose file name
-        file_title = _sanitize(title_meta.lower()) if title_meta else 'output'
+        file_title = sanitize_title(title_meta.lower()) if title_meta else 'output'
         file_name = f"{file_title}_{instrument_part}_{key_dir}.pdf"
         final_pdf_path = os.path.join(final_dir, file_name)
         # Build debug directory under logs mirroring the song/artist/key/instrument
