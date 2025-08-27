@@ -1,42 +1,42 @@
-"""LangGraph pipeline for processing an order of worship PDF.
+"""LangGraph pipeline for processing an order of worship PDF with extensive debugging
+and LLM-only natural-language handling (no heuristic NLP).
 
-This graph extends the original Watermark Remover pipeline to handle
-"order of worship" documents.  Given a natural‑language instruction
-containing the name of a PDF file and a target instrument, the graph
-extracts a list of songs from the PDF, annotates each song with the
-desired instrument (respecting any per‑song overrides specified in the
-instruction) and then runs the scraping, watermark removal, upscaling
-and PDF assembly tools sequentially for each song.  The result is a
-list of individual PDF files, one per song, saved to disk.
+Key changes:
+- Adds robust debugging (run IDs, per-node timings, structured errors, persisted artifacts).
+- Uses ONLY the LLM (run_instruction) to parse user instructions and extract song metadata.
+- Removes all regex/rule-based NLP parsing for instructions and songs.
 
-Example input::
+Debug artifacts are written to:
+  output/debug/orders/<order_folder or 'unknown_date'>/<run_id>/
+including:
+  - run.log (full run-level logging)
+  - parser_prompt.txt / parser_raw_output.txt / parser_output.json
+  - pdf_text.txt
+  - song_extractor_prompt.txt / song_extractor_raw_output.txt / songs_llm_output.json
+  - songs_with_instruments.json
+  - per-song step IO (e.g., song_01_scrape_input.json, song_01_scrape_output.txt, etc.)
+  - final_state.json, errors.json, timings.json
 
-    {
-        "user_input": "Use the order of worship titled 'August 24, 2025.pdf' and extract songs for French Horn, then scrape each of them, remove the watermarks, upscale them, and assemble each song into an individual PDF."
-    }
-
-The parser node will identify the PDF filename (``August 24, 2025.pdf``),
-the default instrument (``French Horn``) and any per‑song overrides
-(e.g. ``make sure the second song is for Oboe instead``).  The
-extractor node reads the specified PDF, parses the song list and
-attaches the instrument information.  The processor node then loops
-over the songs, invoking the same chain of tools used by the
-Watermark Remover pipeline for each title.
+Toggle console+file debugging:
+  - Environment: ORDER_DEBUG=1 (default) or ORDER_DEBUG=0
+  - Or pass in the initial state: {"debug": True} (overrides env)
 """
 
 from __future__ import annotations
 
 import os
-import re
 import json
+import time
+import uuid
+import traceback
+import logging
 from typing import Any, Dict, List, Tuple
+from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
 
-# Import the global sanitiser from the tools module.  This helper converts
-# free‑form names (titles, instruments, keys) into safe filesystem names.
+# Import tools and utilities from your project
 from watermark_remover.agent.tools import sanitize_title, SCRAPE_METADATA, TEMP_DIRS
-
 from watermark_remover.agent.tools import (
     scrape_music,
     remove_watermark,
@@ -44,24 +44,232 @@ from watermark_remover.agent.tools import (
     assemble_pdf,
 )
 
-# Attempt to import the Ollama-backed LLM runner.  If unavailable, we
-# will fall back to heuristic parsing.  The run_instruction helper
-# invokes a LangChain agent via Ollama to interpret natural‑language
-# instructions into structured JSON.
+# Attempt to import the Ollama-backed LLM runner. If unavailable, we DO NOT fall back.
 try:
     from watermark_remover.agent.graph_ollama import run_instruction  # type: ignore
 except Exception:
     run_instruction = None  # type: ignore
 
 # ---------------------------------------------------------------------------
-# PDF parsing helpers (adapted from pdf_parse.py)
-#
-# We copy the PDF extraction logic here to avoid adding extra runtime
-# dependencies.  These functions attempt to extract text from a PDF via
-# multiple libraries and then parse lines of the form:
-#     "Holy Water [ We the Kingdom in F ]"
-# The resulting dictionary maps indices to song metadata (title, artist,
-# key).  The ``instrument`` field will be attached later.
+# Logging / Debugging Utilities
+# ---------------------------------------------------------------------------
+
+LOGGER_NAME = "order_of_worship"
+_logger = logging.getLogger(LOGGER_NAME)
+
+def _env_truthy(v: str | None) -> bool:
+    if v is None:
+        return False
+    return v.strip().lower() not in ("", "0", "false", "no", "off")
+
+def _debug_enabled(state: Dict[str, Any]) -> bool:
+    if isinstance(state.get("debug"), bool):
+        return state["debug"]
+    return _env_truthy(os.getenv("ORDER_DEBUG", "1"))
+
+def _ensure_logger_configured(level: int) -> None:
+    # Avoid duplicate handlers if module reloaded
+    if not _logger.handlers:
+        _logger.setLevel(level)
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+        ch.setFormatter(fmt)
+        _logger.addHandler(ch)
+
+def _get_run_id(state: Dict[str, Any]) -> str:
+    rid = state.get("run_id")
+    if not rid:
+        rid = uuid.uuid4().hex[:10]
+        state["run_id"] = rid
+    return rid
+
+def _get_order_folder(state: Dict[str, Any]) -> str:
+    # We rely ONLY on the LLM to set "order_folder". If absent, we keep "unknown_date".
+    of = state.get("order_folder")
+    if not of:
+        of = "unknown_date"
+    # Sanitize to be safe for filesystem
+    try:
+        return sanitize_title(of)
+    except Exception:
+        return of
+
+def _debug_dir_for(state: Dict[str, Any]) -> Path:
+    run_id = _get_run_id(state)
+    order_folder = _get_order_folder(state)
+    base = Path(os.getcwd()) / "output" / "debug" / "orders" / order_folder / run_id
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+def _ensure_file_handler(state: Dict[str, Any], base_dir: Path) -> None:
+    # Attach exactly one file handler per run
+    log_path = base_dir / "run.log"
+    already = any(
+        isinstance(h, logging.FileHandler) and getattr(h, "_log_path", None) == str(log_path)
+        for h in _logger.handlers
+    )
+    if not already:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+        fh.setFormatter(fmt)
+        setattr(fh, "_log_path", str(log_path))
+        _logger.addHandler(fh)
+
+def _write_text(base: Path, name: str, content: str) -> str:
+    p = base / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8", errors="ignore")
+    return str(p)
+
+def _write_json(base: Path, name: str, obj: Any) -> str:
+    p = base / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(p)
+
+def _record_error(state: Dict[str, Any], label: str, exc: BaseException) -> None:
+    errs: List[Dict[str, Any]] = state.get("errors", [])
+    info = {
+        "label": label,
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+    errs.append(info)
+    state["errors"] = errs
+    if _debug_enabled(state):
+        base = _debug_dir_for(state)
+        _write_json(base, "errors.json", errs)
+    _logger.exception("Error [%s]: %s", label, exc)
+
+def _start_timer() -> float:
+    return time.perf_counter()
+
+def _stop_timer(start: float) -> float:
+    return time.perf_counter() - start
+
+def _record_timing(state: Dict[str, Any], segment: str, seconds: float) -> None:
+    timings: Dict[str, float] = state.get("timings", {})
+    timings[segment] = timings.get(segment, 0.0) + seconds
+    state["timings"] = timings
+    if _debug_enabled(state):
+        base = _debug_dir_for(state)
+        _write_json(base, "timings.json", timings)
+
+MAX_LLM_RETRIES = int(os.getenv("ORDER_MAX_LLM_RETRIES", "2"))
+
+def _extract_json_from_llm_output(raw: Any) -> Any:
+    s = str(raw or "").strip()
+    # If the assistant includes a <think>…</think> wrapper, drop the wrapper.
+    end = s.rfind("</think>")
+    if end != -1:
+        s = s[end + len("</think>") :].lstrip()
+
+    if raw is None:
+        raise ValueError("LLM returned None (no content).")
+    if isinstance(raw, (dict, list)):
+        return raw
+
+    # Try to extract the outermost JSON object or array
+    lcb, rcb = s.find("{"), s.rfind("}")
+    if lcb != -1 and rcb != -1 and rcb > lcb:
+        try:
+            return json.loads(s[lcb : rcb + 1])
+        except Exception as e:
+            # fall through to try array
+            pass
+
+    lsb, rsb = s.find("["), s.rfind("]")
+    if lsb != -1 and rsb != -1 and rsb > lsb:
+        try:
+            return json.loads(s[lsb : rsb + 1])
+        except Exception:
+            pass
+
+    # Last attempt: try the whole string (might already be pure JSON)
+    try:
+        return json.loads(s)
+    except Exception as e:
+        raise ValueError(f"Failed to parse LLM output as JSON. First 200 chars: {s[:200]!r}") from e
+
+def _run_llm_strict_json(
+    state: Dict[str, Any],
+    label: str,
+    prompt: str,
+    expected: str = "object",   # "object", "array", or "object_or_array"
+) -> Any:
+    """
+    Calls run_instruction with retries and strict 'JSON only' guardrails.
+    Persists each attempt's prompt and raw output to debug dir.
+    Returns parsed JSON (dict or list). Raises ValueError after all retries fail.
+    """
+    if run_instruction is None:
+        raise RuntimeError("LLM 'run_instruction' is unavailable.")
+
+    attempts_log: List[Dict[str, Any]] = []
+    base = _debug_dir_for(state) if _debug_enabled(state) else None
+
+    # Build a stricter follow-up instruction used for retries
+    strict_suffix = (
+        "\n\nIMPORTANT:\n"
+        "- Reply with STRICT JSON ONLY (no code fences, no prose).\n"
+        f"- Expected top-level type: {expected}.\n"
+        "- If uncertain or fields are missing, reply with an empty object {} "
+        "or an empty array [] as appropriate.\n"
+    )
+
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        attempt_label = f"{label}.attempt{attempt}"
+        this_prompt = prompt if attempt == 1 else (prompt + strict_suffix)
+
+        # Persist prompt
+        if base is not None:
+            _write_text(base, f"{label}_prompt.attempt{attempt}.txt", this_prompt)
+
+        # Call LLM
+        raw = None
+        err_msg = None
+        parsed: Any = None
+        try:
+            raw = run_instruction(this_prompt)
+            # Persist raw
+            if base is not None:
+                _write_text(base, f"{label}_raw_output.attempt{attempt}.txt", str(raw))
+
+            parsed = _extract_json_from_llm_output(raw)
+
+            # Validate expected top-level type
+            if expected == "object" and not isinstance(parsed, dict):
+                raise ValueError(f"Expected a JSON object, got {type(parsed).__name__}.")
+            if expected == "array" and not isinstance(parsed, list):
+                raise ValueError(f"Expected a JSON array, got {type(parsed).__name__}.")
+            if expected == "object_or_array" and not isinstance(parsed, (dict, list)):
+                raise ValueError(f"Expected a JSON object or array, got {type(parsed).__name__}.")
+
+            # Success
+            attempts_log.append({"attempt": attempt, "status": "ok", "raw_len": len(str(raw))})
+            break
+
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            attempts_log.append({"attempt": attempt, "status": "fail", "error": err_msg})
+            if attempt == MAX_LLM_RETRIES:
+                # Persist attempts summary
+                if base is not None:
+                    _write_json(base, f"{label}_attempts.json", attempts_log)
+                raise
+
+    # Persist attempts summary
+    if base is not None:
+        _write_json(base, f"{label}_attempts.json", attempts_log)
+
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# PDF Text Extraction (not NLP; just I/O)
 # ---------------------------------------------------------------------------
 
 try:
@@ -79,47 +287,26 @@ try:
 except Exception:
     pdfminer_extract_text = None  # type: ignore
 
-
 def _read_pdf_text(pdf_path: str) -> str:
-    """Extract raw text from a PDF using one of several fallback libraries.
-
-    Parameters
-    ----------
-    pdf_path : str
-        Path to the PDF file on disk.
-
-    Returns
-    -------
-    str
-        The concatenated text extracted from all pages.
-
-    Raises
-    ------
-    RuntimeError
-        If none of the supported PDF libraries are available.
-    """
-    # Use pdfplumber if installed
+    """Extract raw text from a PDF using one of several fallback libraries."""
     if pdfplumber is not None:
         try:
-            text_chunks: List[str] = []
+            chunks: List[str] = []
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
-                    text_chunks.append(page.extract_text() or "")
-            return "\n".join(text_chunks)
+                    chunks.append(page.extract_text() or "")
+            return "\n".join(chunks)
         except Exception:
             pass
-    # Fallback to PyPDF2
     if PdfReader is not None:
         try:
             reader = PdfReader(pdf_path)  # type: ignore[call-arg]
-            text_chunks: List[str] = []
+            chunks: List[str] = []
             for page in reader.pages:
-                txt = page.extract_text() or ""
-                text_chunks.append(txt)
-            return "\n".join(text_chunks)
+                chunks.append(page.extract_text() or "")
+            return "\n".join(chunks)
         except Exception:
             pass
-    # Fallback to pdfminer.six
     if pdfminer_extract_text is not None:
         try:
             txt = pdfminer_extract_text(pdf_path)  # type: ignore[call-arg]
@@ -130,467 +317,420 @@ def _read_pdf_text(pdf_path: str) -> str:
         "Could not read PDF text. Please install pdfplumber, PyPDF2, or pdfminer.six."
     )
 
+# ---------------------------------------------------------------------------
+# LLM Prompts
+# ---------------------------------------------------------------------------
 
-_SONG_LINE_RE = re.compile(
-    r"""^\s*
-        (?:\d{1,2}:\d{2}\s+)?                # optional leading duration
-        (?P<title>.+?)                       # song title (non-greedy)
-        \s*\[\s*
-        (?P<artist>.+?)                      # artist/arranger text up to ' in '
-        \s+in\s+
-        (?P<key>[A-Ga-g](?:[#b])?(?:\s*(?:maj(?:or)?|min(?:or)?|m))?)  # musical key
-        \s*\]\s*$
-    """,
-    re.IGNORECASE | re.VERBOSE,
+_PARSER_SYSTEM = (
+    "You are a precise data extraction assistant. "
+    "Given an instruction about processing an 'order of worship' PDF, you MUST return "
+    "a single strict JSON object with exactly these keys: "
+    "pdf_name (string, must include '.pdf'), "
+    "default_instrument (string), "
+    "overrides (object mapping zero-based integer indices to instrument strings), "
+    "order_folder (string: folder name for this run). "
+    "Do not include any explanation text. If something is missing, return an empty string or empty object for that key."
 )
 
+_SONG_EXTRACT_SYSTEM = (
+    "You are a precise parser for 'order of worship' text. "
+    "Input is RAW TEXT extracted from a PDF. Identify the list of songs and return a single strict JSON object "
+    "mapping zero-based integer indices to objects with exactly: title (string), artist (string), key (string). "
+    "If details cannot be found for a field, use an empty string. Do not fabricate songs not present in the text. "
+    "Return only JSON, no extra commentary."
+)
 
-def _normalize_key(key: str) -> str:
-    """Normalise a musical key to a compact form.
-
-    Examples
-    --------
-    >>> _normalize_key('Bb major')
-    'Bb'
-    >>> _normalize_key('C# minor')
-    'C#m'
-    >>> _normalize_key('G m')
-    'Gm'
-    """
-    s = key.strip().replace("♭", "b").replace("♯", "#")
-    base_match = re.match(r"^[A-Ga-g](?:[#b])?", s)
-    base = (base_match.group(0).upper() if base_match else s.strip().upper())
-    is_minor = bool(re.search(r"(?:\bmin(?:or)?\b|\bm\b)$", s, re.IGNORECASE))
-    return base + ("m" if is_minor else "")
-
-
-def extract_songs_from_text(text: str) -> Dict[int, Dict[str, str]]:
-    """Parse song lines from raw PDF text into a dict keyed by index."""
-    songs: List[Dict[str, str]] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        # Only attempt to parse lines containing brackets
-        if "[" not in line or "]" not in line:
-            continue
-        m = _SONG_LINE_RE.match(line)
-        if not m:
-            continue
-        title = m.group("title").strip()
-        artist = m.group("artist").strip()
-        key = _normalize_key(m.group("key"))
-        songs.append({"title": title, "artist": artist, "key": key})
-    return {i: song for i, song in enumerate(songs)}
-
-
-def extract_songs_from_pdf(pdf_path: str) -> Dict[int, Dict[str, str]]:
-    """Extract songs from the given PDF file.
-
-    Parameters
-    ----------
-    pdf_path : str
-        Path to the PDF file on disk.
-
-    Returns
-    -------
-    Dict[int, Dict[str, str]]
-        A mapping from song index to a dictionary containing ``title``,
-        ``artist`` and ``key``.
-    """
-    text = _read_pdf_text(pdf_path)
-    return extract_songs_from_text(text)
-
-
-# ---------------------------------------------------------------------------
-# Natural language parsing helpers
-# ---------------------------------------------------------------------------
-
-_ORDINAL_MAP = {
-    "first": 0,
-    "second": 1,
-    "third": 2,
-    "fourth": 3,
-    "fifth": 4,
-    "sixth": 5,
-    "seventh": 6,
-    "eighth": 7,
-    "ninth": 8,
-    "tenth": 9,
-}
-
-
-def _parse_user_input(instruction: str) -> Tuple[str, str, Dict[int, str]]:
-    """Parse the user instruction for PDF filename, default instrument and overrides.
-
-    Parameters
-    ----------
-    instruction : str
-        The raw user instruction.
-
-    Returns
-    -------
-    Tuple[str, str, Dict[int, str]]
-        A tuple containing:
-        * pdf_name: the filename of the order of worship PDF (with extension)
-        * default_instrument: the instrument to use for all songs unless overridden
-        * overrides: a mapping from song index (0‑based) to an instrument
-
-    Notes
-    -----
-    The parser uses simple heuristics to extract relevant information.
-    It looks for a quoted filename ending with ``.pdf`` following the
-    word ``titled``.  It then finds phrases like ``songs for X`` to
-    determine the default instrument.  Per‑song overrides are detected
-    using patterns such as ``second song ... for Oboe`` or
-    ``make sure the 2nd song is for Oboe``.
-    """
-    pdf_name = ""
-    default_instrument = ""
-    overrides: Dict[int, str] = {}
-
-    # Extract PDF name
-    pdf_match = re.search(r"titled\s+['\"]([^'\"]+\.pdf)['\"]", instruction, re.IGNORECASE)
-    if pdf_match:
-        pdf_name = pdf_match.group(1).strip()
-
-    # Extract default instrument (look for "songs for X" or "for X" after "songs")
-    instr_match = re.search(
-        r"(?:extract\s+songs\s+for|songs\s+for|for)\s+([^,\.]+?)\s*(?:,|\.|…| and |$)",
-        instruction,
-        re.IGNORECASE,
+def _build_parser_prompt(instruction: str) -> str:
+    return (
+        _PARSER_SYSTEM
+        + "\n\nInstruction:\n"
+        + instruction
+        + "\n\nReturn ONLY the JSON object."
     )
-    if instr_match:
-        default_instrument = instr_match.group(1).strip()
 
-    # Extract per‑song overrides
-    # Pattern matches e.g. "second song is for Oboe", "2nd song is for Oboe"
-    override_pattern = re.compile(
-        r"(?:(?:the|that)\s+)?((?:\d+)(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+song[^,\.]*?for\s+([A-Za-z ]+?)\b",
-        re.IGNORECASE,
+def _build_song_extractor_prompt(pdf_text: str) -> str:
+    # We pass the raw text; LLM does all NLP extraction.
+    return (
+        _SONG_EXTRACT_SYSTEM
+        + "\n\nRAW ORDER OF WORSHIP TEXT:\n"
+        + pdf_text
+        + "\n\nReturn ONLY the JSON object."
     )
-    for om in override_pattern.finditer(instruction):
-        ordinal_raw = om.group(1).lower()
-        instr = om.group(2).strip()
-        idx: int = -1
-        # Convert ordinal word to index
-        if ordinal_raw.isdigit():
-            try:
-                idx = int(re.sub(r"(?:st|nd|rd|th)$", "", ordinal_raw)) - 1
-            except Exception:
-                idx = -1
-        else:
-            idx = _ORDINAL_MAP.get(re.sub(r"(?:st|nd|rd|th)$", "", ordinal_raw), -1)
-        if idx >= 0:
-            overrides[idx] = instr
-    return pdf_name, default_instrument, overrides
-
 
 # ---------------------------------------------------------------------------
-# LangGraph nodes
+# LangGraph Nodes
 # ---------------------------------------------------------------------------
 
 def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract metadata from the user instruction into the state.
-
-    This node reads the ``user_input`` key from the incoming state and
-    populates ``pdf_name``, ``default_instrument``, ``overrides`` and
-    ``order_folder`` keys.  If any of these fields already exist in the
-    state they are left unchanged.  Parsing is handled solely by the
-    Ollama‑powered LLM; there is no manual fallback.  If the LLM fails to
-    produce values, the corresponding keys remain unset and the graph
-    may fail downstream.
-    """
+    """LLM-only parsing of the user instruction into pdf_name, default_instrument, overrides, order_folder."""
+    # Configure logging based on debug flag
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
-    instruction = new_state.get("user_input", "") or ""
-    # Only parse if keys are missing
-    if not new_state.get("pdf_name") or not new_state.get("default_instrument") or not new_state.get("order_folder"):
-        # Attempt LLM parsing if available
-        pdf_name = ""
-        default_instrument = ""
+
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _ensure_file_handler(new_state, base)
+        _logger.debug("parser_node: starting with state keys: %s", list(new_state.keys()))
+
+    instruction = (new_state.get("user_input") or "").strip()
+    if not instruction:
+        _logger.warning("parser_node: 'user_input' is empty.")
+        _record_timing(new_state, "parser_node", _stop_timer(start))
+        return new_state
+
+    if run_instruction is None:
+        err = RuntimeError("LLM 'run_instruction' is unavailable; cannot parse user_input.")
+        _record_error(new_state, "parser_node.run_instruction_missing", err)
+        _record_timing(new_state, "parser_node", _stop_timer(start))
+        return new_state
+
+    try:
+        prompt = _build_parser_prompt(instruction)
+
+        data = _run_llm_strict_json(
+            state=new_state,
+            label="parser",
+            prompt=prompt,
+            expected="object",
+        )
+
+        if not isinstance(data, dict):
+            raise ValueError("Parser LLM did not return a JSON object.")
+
+        pdf_name = (data.get("pdf_name") or "").strip()
+        default_instrument = (data.get("default_instrument") or "").strip()
+        order_folder = (data.get("order_folder") or "").strip()
+        overrides_raw = data.get("overrides") or {}
+
+        # Convert overrides keys to ints if provided as strings
         overrides: Dict[int, str] = {}
-        order_folder = ""
-        if run_instruction is not None and instruction:
-            try:
-                llm_prompt = (
-                    "You are given a user instruction describing how to process an order of worship PDF. "
-                    "Extract the name of the PDF file (with .pdf extension) as 'pdf_name', the default instrument as "
-                    "'default_instrument', a mapping of zero-based song indices to instruments as 'overrides' (if any), "
-                    "and compute 'order_folder' based on the pdf_name. The order_folder should be the date portion of "
-                    "the pdf_name formatted as MM_DD_YYYY (e.g. 'August 24, 2025.pdf' -> '08_24_2025'). "
-                    "If the pdf_name does not contain a date, you may return a reasonable folder name by replacing "
-                    "non-alphanumeric characters with underscores and trimming. Return ONLY a valid JSON object with keys: "
-                    "pdf_name, default_instrument, overrides, order_folder."
-                    "\nInstruction: " + instruction
-                )
-                llm_output = run_instruction(llm_prompt)
-                data = None
-                if isinstance(llm_output, dict):
-                    data = llm_output
-                else:
-                    s = str(llm_output)
-                    start = s.find("{")
-                    end = s.rfind("}")
-                    if start != -1 and end != -1 and end > start:
-                        import json as _json
-                        data = _json.loads(s[start : end + 1])
-                    else:
-                        import json as _json
-                        data = _json.loads(s)
-                if isinstance(data, dict):
-                    pdf_name = (data.get("pdf_name") or "").strip()
-                    default_instrument = (data.get("default_instrument") or "").strip()
-                    order_folder = (data.get("order_folder") or "").strip()
-                    raw_overrides = data.get("overrides") or {}
-                    if isinstance(raw_overrides, dict):
-                        for k, v in raw_overrides.items():
-                            idx = None
-                            # normalise key indexes: handle numeric or ordinal strings
-                            if isinstance(k, int):
-                                idx = k
-                            else:
-                                ks = str(k).strip().lower()
-                                ks = re.sub(r"(?:st|nd|rd|th)$", "", ks)
-                                ks = ks.replace("song", "").strip()
-                                if ks.isdigit():
-                                    idx = int(ks)
-                                else:
-                                    idx = _ORDINAL_MAP.get(ks, None)
-                            if idx is not None:
-                                overrides[int(idx)] = str(v).strip()
-            except Exception:
-                # ignore LLM parsing errors
-                pdf_name = default_instrument = order_folder = ""
-                overrides = {}
-        # Do not attempt to parse the instruction heuristically.  If the LLM
-        # fails to return the necessary fields, leave them unset rather than
-        # inferring values via regex.  This avoids inconsistent behaviour
-        # between manual parsing and LLM parsing.  The graph will either
-        # succeed with the LLM output or halt due to missing metadata.
-        # Update state with parsed values if not already present
+        if isinstance(overrides_raw, dict):
+            for k, v in overrides_raw.items():
+                try:
+                    idx = int(k)
+                    overrides[idx] = (str(v) if v is not None else "").strip()
+                except Exception:
+                    # Keep it debuggable; skip invalid keys
+                    pass
+
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_json(base, "parser_output.json", {
+                "pdf_name": pdf_name,
+                "default_instrument": default_instrument,
+                "overrides": overrides,
+                "order_folder": order_folder
+            })
+
         if pdf_name and not new_state.get("pdf_name"):
             new_state["pdf_name"] = pdf_name
         if default_instrument and not new_state.get("default_instrument"):
             new_state["default_instrument"] = default_instrument
         if order_folder:
-            # Sanitize order_folder to a safe directory name using the global sanitiser
             try:
-                safe_order = sanitize_title(order_folder)
+                new_state["order_folder"] = sanitize_title(order_folder)
             except Exception:
-                safe_order = order_folder
-            new_state["order_folder"] = safe_order
-        # Merge overrides
-        current_overrides: Dict[int, str] = dict(new_state.get("overrides", {}))
-        current_overrides.update(overrides)
-        new_state["overrides"] = current_overrides
+                new_state["order_folder"] = order_folder
+
+        merged_overrides: Dict[int, str] = dict(new_state.get("overrides", {}))
+        merged_overrides.update(overrides)
+        new_state["overrides"] = merged_overrides
+
+    except Exception as e:
+        _record_error(new_state, "parser_node.exception", e)
+
+    finally:
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_json(base, "state_after_parser.json", {
+                k: v for k, v in new_state.items() if k not in ("songs", "final_pdfs")
+            })
+        _record_timing(new_state, "parser_node", _stop_timer(start))
+
     return new_state
 
 
 def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Read the specified PDF and attach song metadata to the state.
-
-    The node looks up ``pdf_name`` in the state and loads the PDF
-    from disk.  It then parses the song list and attaches an
-    ``instrument`` field to each entry.  The instrument is determined by
-    the ``default_instrument`` and any per‑song ``overrides``.  The
-    resulting list of songs is stored under the ``songs`` key in the
-    state.
-    """
+    """LLM-only extraction of songs from the PDF text; attaches instrument based on defaults and overrides."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
+
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _ensure_file_handler(new_state, base)
+        _logger.debug("extract_songs_node: begin")
+
     pdf_name = new_state.get("pdf_name")
-    default_instrument = new_state.get("default_instrument", "")
+    default_instrument = (new_state.get("default_instrument") or "").strip()
     overrides: Dict[int, str] = new_state.get("overrides", {}) or {}
+
     if not pdf_name:
-        # Nothing to do if no PDF specified
+        _logger.warning("extract_songs_node: 'pdf_name' missing; no songs extracted.")
         new_state["songs"] = {}
+        _record_timing(new_state, "extract_songs_node", _stop_timer(start))
         return new_state
-    # Construct absolute path; if the file does not exist in the CWD,
-    # attempt to locate it under a user‑specified directory (pdf_root or input_dir).
-    # When running inside Docker the PDFs are typically mounted under /app/input.
+
+    # Resolve a likely path; pure I/O (not NLP)
     pdf_path = pdf_name
     if not os.path.isabs(pdf_path):
         root_dir = new_state.get("pdf_root") or new_state.get("input_dir") or "input"
         candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
-        if os.path.exists(candidate):
-            pdf_path = candidate
-        else:
-            pdf_path = os.path.join(os.getcwd(), pdf_path)
-    songs: Dict[int, Dict[str, Any]] = {}
+        pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
+
+    if run_instruction is None:
+        err = RuntimeError("LLM 'run_instruction' is unavailable; cannot extract songs from PDF text.")
+        _record_error(new_state, "extract_songs_node.run_instruction_missing", err)
+        new_state["songs"] = {}
+        _record_timing(new_state, "extract_songs_node", _stop_timer(start))
+        return new_state
+
     try:
-        parsed = extract_songs_from_pdf(pdf_path)
-        for idx, meta in parsed.items():
+        # Read raw PDF text and persist it for troubleshooting
+        pdf_text = _read_pdf_text(pdf_path)
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_text(base, "pdf_text.txt", pdf_text)
+
+        # LLM prompt to extract songs (JSON only)
+        prompt = _build_song_extractor_prompt(pdf_text)
+
+        data = _run_llm_strict_json(
+            state=new_state,
+            label="song_extractor",
+            prompt=prompt,
+            expected="object_or_array",
+        )
+
+        # Accept dict or list; normalize to {idx: obj}
+        if isinstance(data, list):
+            normalized = {i: v for i, v in enumerate(data)}
+        elif isinstance(data, dict):
+            normalized = data
+        else:
+            raise ValueError(f"Unexpected JSON type from song extractor: {type(data).__name__}")
+
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_json(base, "songs_llm_output.json", normalized)
+
+        # Normalize song entries + attach instrument (structure only)
+        songs: Dict[int, Dict[str, Any]] = {}
+        for k, v in normalized.items():
+            try:
+                idx = int(k)
+            except Exception:
+                continue
+            if not isinstance(v, dict):
+                continue
+            title = (v.get("title") or "").strip()
+            artist = (v.get("artist") or "").strip()
+            key = (v.get("key") or "").strip()
             instrument = overrides.get(idx, default_instrument)
             songs[idx] = {
-                "title": meta.get("title", ""),
-                "artist": meta.get("artist", ""),
-                "key": meta.get("key", ""),
+                "title": title,
+                "artist": artist,
+                "key": key,
                 "instrument": instrument or "",
             }
-    except Exception:
-        # If parsing fails, log nothing
-        songs = {}
-    new_state["songs"] = songs
+
+        new_state["songs"] = songs
+
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_json(base, "songs_with_instruments.json", songs)
+
+    except Exception as e:
+        _record_error(new_state, "extract_songs_node.exception", e)
+        new_state["songs"] = {}
+
+    finally:
+        _record_timing(new_state, "extract_songs_node", _stop_timer(start))
+
     return new_state
 
 
 def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Process each song sequentially using the scraping pipeline.
-
-    For every song found in the ``songs`` dict, this node invokes the
-    ``scrape_music``, ``remove_watermark``, ``upscale_images`` and
-    ``assemble_pdf`` tools in order.  It collects the resulting PDF
-    filenames into a list stored under ``final_pdfs``.  If any step
-    fails for a particular song, the corresponding entry in the result
-    list will be ``None``.  This implementation uses the global
-    ``SCRAPE_METADATA`` populated by ``scrape_music`` to pick up the
-    actual key and instrument selected by the scraper (e.g. when a
-    requested key is not available).  It also writes each finished PDF
-    into an ``output/orders/<date_folder>`` directory, where
-    ``date_folder`` is derived from the PDF name (e.g. ``08_24_2025``).
-    Temporary directories recorded in ``TEMP_DIRS`` are cleaned up
-    after the PDF is assembled.
-    """
+    """Sequentially process songs via tools; capture step-by-step IO and errors for each song."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
+
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _ensure_file_handler(new_state, base)
+        _logger.debug("process_songs_node: begin")
+
     songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
     final_pdfs: List[str | None] = []
     input_dir_override = new_state.get("input_dir", "data/samples")
 
-    # Determine the order folder for this run.  Prefer the value parsed
-    # by the LLM (stored under ``order_folder``).  If not present,
-    # derive from the PDF name as before.
-    date_folder = new_state.get("order_folder") or "unknown_date"
-    if date_folder == "unknown_date":
-        pdf_name: str = new_state.get("pdf_name", "") or ""
-        if pdf_name:
-            base = os.path.splitext(os.path.basename(pdf_name))[0]
-            try:
-                import datetime
-                dt = datetime.datetime.strptime(base, "%B %d, %Y")
-                date_folder = dt.strftime("%m_%d_%Y")
-            except Exception:
-                cleaned = re.sub(r"[^0-9]+", "_", base)
-                cleaned = re.sub(r"_+", "_", cleaned).strip("_")
-                if cleaned:
-                    date_folder = cleaned
+    # We only use LLM-provided order_folder (if any); otherwise keep 'unknown_date'
+    date_folder = _get_order_folder(new_state)
 
     for idx in sorted(songs.keys()):
         song = songs[idx]
-        title = song.get("title", "Unknown Title")
-        instrument = song.get("instrument", "Unknown Instrument")
-        key = song.get("key", "Unknown Key")
+        safe_title = sanitize_title(song.get("title", "Unknown Title"))
+        per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
+        per_song_name = f"{per_song_prefix}_{safe_title}"
 
-        # Run through the tools
         try:
-            download_dir = scrape_music.invoke(
-                {
-                    "title": title,
-                    "instrument": instrument,
-                    "key": key,
-                    "input_dir": input_dir_override,
-                }
-            )
-        except Exception:
-            download_dir = None
-        if not download_dir:
-            final_pdfs.append(None)
-            continue
-        try:
-            processed_dir = remove_watermark.invoke({"input_dir": download_dir})
-        except Exception:
-            processed_dir = None
-        if not processed_dir:
-            final_pdfs.append(None)
-            continue
-        try:
-            upscaled_dir = upscale_images.invoke({"input_dir": processed_dir})
-        except Exception:
-            upscaled_dir = None
-        if not upscaled_dir:
-            final_pdfs.append(None)
-            continue
+            # 1) SCRAPE
+            scrape_input = {
+                "title": song.get("title", ""),
+                "instrument": song.get("instrument", ""),
+                "key": song.get("key", ""),
+                "input_dir": input_dir_override,
+            }
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_json(base, f"{per_song_name}_scrape_input.json", scrape_input)
 
-        # Use actual key and instrument from SCRAPE_METADATA if available
-        actual_key = SCRAPE_METADATA.get("key") or key
-        actual_instrument = SCRAPE_METADATA.get("instrument") or instrument
-        # Update the metadata to reflect the actual selections.  This
-        # ensures that assemble_pdf uses the correct key/instrument when
-        # constructing its directory structure.
-        try:
-            SCRAPE_METADATA['key'] = actual_key
-            SCRAPE_METADATA['instrument'] = actual_instrument
-        except Exception:
-            pass
-        # Sanitize components to build consistent file names
-        safe_title = sanitize_title(title)
-        safe_instrument = sanitize_title(actual_instrument)
-        safe_key = sanitize_title(actual_key)
-        # Zero‑pad the index (1‑based) for ordering
-        idx_str = str(idx + 1).zfill(2)
-        filename = f"{idx_str}_{safe_title}_{safe_instrument}_{safe_key}.pdf"
+            try:
+                download_dir = scrape_music.invoke(scrape_input)
+            except Exception as e:
+                download_dir = None
+                _record_error(new_state, f"{per_song_name}_scrape_exception", e)
 
-        # Compose output filename relative to the root (orders folder)
-        # Save inside output/music as before.  assemble_pdf will create necessary directories.
-        try:
-            pdf_path = assemble_pdf.invoke(
-                {
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_text(base, f"{per_song_name}_scrape_output.txt", str(download_dir))
+
+            if not download_dir:
+                final_pdfs.append(None)
+                continue
+
+            # 2) REMOVE WATERMARK
+            try:
+                rm_input = {"input_dir": download_dir}
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_json(base, f"{per_song_name}_remove_watermark_input.json", rm_input)
+                processed_dir = remove_watermark.invoke(rm_input)
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_text(base, f"{per_song_name}_remove_watermark_output.txt", str(processed_dir))
+            except Exception as e:
+                processed_dir = None
+                _record_error(new_state, f"{per_song_name}_remove_watermark_exception", e)
+
+            if not processed_dir:
+                final_pdfs.append(None)
+                continue
+
+            # 3) UPSCALE
+            try:
+                up_input = {"input_dir": processed_dir}
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_json(base, f"{per_song_name}_upscale_input.json", up_input)
+                upscaled_dir = upscale_images.invoke(up_input)
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_text(base, f"{per_song_name}_upscale_output.txt", str(upscaled_dir))
+            except Exception as e:
+                upscaled_dir = None
+                _record_error(new_state, f"{per_song_name}_upscale_exception", e)
+
+            if not upscaled_dir:
+                final_pdfs.append(None)
+                continue
+
+            # Use final key/instrument if scraper adjusted them
+            actual_key = SCRAPE_METADATA.get("key") or song.get("key", "")
+            actual_instrument = SCRAPE_METADATA.get("instrument") or song.get("instrument", "")
+
+            # Update SCRAPE_METADATA for downstream
+            try:
+                SCRAPE_METADATA["key"] = actual_key
+                SCRAPE_METADATA["instrument"] = actual_instrument
+            except Exception:
+                pass
+
+            safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
+            safe_key = sanitize_title(actual_key or "Unknown Key")
+
+            idx_str = str(idx + 1).zfill(2)
+            filename = f"{idx_str}_{safe_title}_{safe_instrument}_{safe_key}.pdf"
+
+            # 4) ASSEMBLE PDF
+            try:
+                as_input = {
                     "image_dir": upscaled_dir,
                     "output_pdf": filename,
                 }
-            )
-        except Exception:
-            pdf_path = None
-        if pdf_path and isinstance(pdf_path, str):
-            # Copy final PDF into orders folder as well
-            try:
-                # Build orders directory path
-                orders_root = os.path.join(os.getcwd(), "output", "orders", date_folder)
-                os.makedirs(orders_root, exist_ok=True)
-                target_path = os.path.join(orders_root, filename)
-                # Copy the file; import shutil here to avoid top‑level import
-                import shutil
-                shutil.copyfile(pdf_path, target_path)
-            except Exception:
-                pass
-        final_pdfs.append(
-            pdf_path if pdf_path and isinstance(pdf_path, str) else None
-        )
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_json(base, f"{per_song_name}_assemble_input.json", as_input)
+                pdf_path = assemble_pdf.invoke(as_input)
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_text(base, f"{per_song_name}_assemble_output.txt", str(pdf_path))
+            except Exception as e:
+                pdf_path = None
+                _record_error(new_state, f"{per_song_name}_assemble_exception", e)
 
-        # Clean up any temporary directories recorded during scraping
-        try:
-            import shutil
-            for tmp_dir in list(TEMP_DIRS):
+            # Copy final PDF into output/orders/<date_folder>
+            if pdf_path and isinstance(pdf_path, str):
                 try:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            # Clear the list for next song
-            TEMP_DIRS.clear()
-        except Exception:
-            pass
+                    orders_root = Path(os.getcwd()) / "output" / "orders" / date_folder
+                    orders_root.mkdir(parents=True, exist_ok=True)
+                    target_path = orders_root / filename
+
+                    import shutil
+                    shutil.copyfile(pdf_path, str(target_path))
+
+                    if _debug_enabled(new_state):
+                        base = _debug_dir_for(new_state)
+                        _write_text(base, f"{per_song_name}_final_target.txt", str(target_path))
+                except Exception as e:
+                    _record_error(new_state, f"{per_song_name}_copy_exception", e)
+
+            final_pdfs.append(pdf_path if isinstance(pdf_path, str) else None)
+
+            # Cleanup temps
+            try:
+                import shutil
+                for tmp_dir in list(TEMP_DIRS):
+                    try:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                TEMP_DIRS.clear()
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_text(base, f"{per_song_name}_temp_cleanup.txt", "TEMP_DIRS cleared.")
+            except Exception as e:
+                _record_error(new_state, f"{per_song_name}_temp_cleanup_exception", e)
+
+        except Exception as e:
+            _record_error(new_state, f"{per_song_name}_outer_exception", e)
+            final_pdfs.append(None)
 
     new_state["final_pdfs"] = final_pdfs
+
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _write_json(base, "final_state.json", {
+            k: v for k, v in new_state.items() if k not in ("songs",)  # songs can be large; already saved
+        })
+
+    _record_timing(new_state, "process_songs_node", _stop_timer(start))
     return new_state
 
 
 def compile_graph() -> Any:
-    """Construct and compile the order‑of‑worship graph.
-
-    Returns
-    -------
-    Any
-        A compiled graph ready for execution or visualisation with
-        LangGraph.  The graph expects an initial state containing at
-        least a ``user_input`` field.
-    """
+    """Construct and compile the order-of-worship graph."""
     graph = StateGraph(dict)
     graph.add_node("parser", parser_node)
     graph.add_node("extractor", extract_songs_node)
     graph.add_node("processor", process_songs_node)
-    # Wire the nodes in sequence: parse -> extract -> process
     graph.add_edge(START, "parser")
     graph.add_edge("parser", "extractor")
     graph.add_edge("extractor", "processor")
     graph.add_edge("processor", END)
     return graph.compile()
 
-
-# Expose a compiled graph instance for LangGraph CLI discovery.
+# Expose compiled graph
 graph = compile_graph()
