@@ -36,6 +36,7 @@ import datetime
 import shutil
 import logging
 import os
+import re
 import time
 from typing import Optional, Any
 import random
@@ -202,6 +203,11 @@ except Exception:
     # Best‑effort: if we cannot set up file logging, continue silently
     pass
 
+def sanitize_title(title: str) -> str:
+    """Keep A–Z/a–z/0–9, space, (), -, collapse spaces/_ to _, trim _."""
+    safe = re.sub(r'[^A-Za-z0-9()\-\s]+', '_', title.strip())
+    safe = re.sub(r'[_\s]+', '_', safe)
+    return safe.strip('_')
 
 @tool
 def scrape_music(
@@ -278,9 +284,7 @@ def scrape_music(
     # Sanitise the title for use in directory names.  Replace any
     # characters other than alphanumerics, spaces or hyphens with
     # underscores, then collapse spaces into underscores.
-    safe_title = ''.join(
-        c if c.isalnum() or c in (' ', '-') else '_' for c in title
-    ).strip().replace(' ', '_')
+    safe_title = sanitize_title(title)
     # Compute the root of the logs for this run.  Individual subfolders
     # (song/artist/key/instrument) will be created later once we know
     # the artist.  Do not create the per-song directory yet; it will be
