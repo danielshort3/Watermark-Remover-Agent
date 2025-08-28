@@ -234,6 +234,288 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
         return None
     except Exception:
         return None
+def _choose_best_key_with_llm(requested_key: str, available_labels: list[str]) -> str | None:
+    """Ask the local LLM to pick the single best key label from the provided list.
+
+    Rules:
+      - Choose the key with the smallest chromatic distance (0–6 semitones).
+      - If two are equally close, prefer the key *above* the request (so the player can transpose down).
+      - Treat enharmonics as equal; labels may contain slashes such as 'A#/Bb'.
+      - Return EXACTLY one of the provided labels verbatim (no new text).
+    """
+    if _llm_run_instruction is None or not available_labels:
+        return None
+    try:
+        # Mapping for clarity in the prompt; enharmonics share the same value
+        mapping = {
+            "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3, "E": 4,
+            "F": 5, "F#": 6, "Gb": 6, "G": 7, "G#": 8, "Ab": 8, "A": 9,
+            "A#": 10, "Bb": 10, "B": 11
+        }
+        options = "\n- " + "\n- ".join(available_labels)
+        prompt = (
+            "Task: Select the SINGLE best key label from the provided list.\n"
+            f"Requested key: {requested_key}\n"
+            f"Available labels (choose exactly one of these):\n{options}\n\n"
+            "Rules:\n"
+            "- Choose the label whose pitch class is the smallest chromatic distance (0–6) from the requested key.\n"
+            "- If two are equally close, prefer the label ABOVE the requested key (positive direction).\n"
+            "- Treat enharmonics as equal (a label like 'A#/Bb' represents both).\n"
+            "Return STRICT JSON: {\"label\": <one of the provided labels verbatim>}"
+            "\nMapping (for your reasoning): " + str(mapping)
+        )
+        raw = _llm_run_instruction(prompt)  # type: ignore
+        if not raw:
+            return None
+        s = str(raw).strip()
+        # Try to extract {"label":"..."}
+        import json as _json, re as _re
+        obj = None
+        m = _re.search(r"\{.*?\}", s, flags=_re.S)
+        if m:
+            try:
+                obj = _json.loads(m.group(0))
+            except Exception:
+                obj = None
+        if isinstance(obj, dict):
+            label = (obj.get("label") or obj.get("key") or "").strip()
+            if label in available_labels:
+                return label
+        # As fallback, if the response is exactly one of the labels
+        for lab in available_labels:
+            if lab == s or lab in s:
+                return lab if lab in available_labels else None
+        return None
+    except Exception:
+        return None
+
+
+def _rank_alternate_readings_with_llm(candidates: list[dict]) -> list[dict]:
+    """Use the LLM to rank alternate instrument/key candidates (best first).
+
+    Each candidate: {"instrument": str, "key": str, "family": "brass"|"sax"|"other", "why": str}
+    Preference: BRASS first, then SAX. Return STRICT JSON: {"order": [indices...]}
+    On failure or if LLM unavailable, return the input list unchanged.
+    """
+    if _llm_run_instruction is None or not candidates:
+        return candidates
+    try:
+        items = [
+            {"i": i, "instrument": c.get("instrument"), "key": c.get("key"), "family": c.get("family", "other")}
+            for i, c in enumerate(candidates)
+        ]
+        prompt = (
+            "Task: Rank alternate parts a French horn player can READ DIRECTLY (no extra transposition).\n"
+            "Prefer BRASS first, then SAX. Avoid others unless nothing else exists.\n"
+            f"Candidates: {items}\n"
+            "Return STRICT JSON: {\"order\": [indices in best-first order]}"
+        )
+        raw = _llm_run_instruction(prompt)  # type: ignore
+        if not raw:
+            return candidates
+        s = str(raw).strip()
+        import json as _json, re as _re
+        obj = None
+        m = _re.search(r"\{.*?\}", s, flags=_re.S)
+        if m:
+            try:
+                obj = _json.loads(m.group(0))
+            except Exception:
+                obj = None
+        order = obj.get("order") if isinstance(obj, dict) else None
+        if isinstance(order, list) and all(isinstance(k, int) for k in order):
+            ranked = [candidates[k] for k in order if 0 <= k < len(candidates)]
+            # append any not listed
+            remaining = [c for i, c in enumerate(candidates) if i not in order]
+            return ranked + remaining
+        return candidates
+    except Exception:
+        return candidates
+
+def _download_alternate_readings_if_helpful(
+    driver,
+    title: str,
+    requested_key_norm: str,
+    selected_instrument_label: str,
+    available_instrument_labels: list[str],
+    out_root: str,
+) -> None:
+    """Download an alternate instrument part that a French horn player can read directly (no extra transposition).
+
+    Runs only when the selected instrument is horn and the requested key was not available.
+    Preference: BRASS first, then SAX. Saves to out_root/alternate_readings/<Instrument>/<Key>/.
+    """
+    try:
+        # Local imports (avoid module-level hard deps)
+        from selenium.webdriver.common.by import By  # type: ignore
+        from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
+        from selenium.webdriver.support import expected_conditions as EC  # type: ignore
+        import time as _t
+        from watermark_remover.utils.transposition_utils import (
+            KEY_TO_SEMITONE as _K2S,
+            SEMITONE_TO_KEY as _S2K,
+            INSTRUMENT_TRANSPOSITIONS as _IT,
+        )
+
+        def _sanitize_local(v: str) -> str:
+            import re as _re
+            s = _re.sub(r"[^A-Za-z0-9]+", "_", (v or "").strip())
+            return _re.sub(r"_+", "_", s).strip("_")
+
+        # Compute concert semitone from horn request (C = W + t)
+        horn_t = _IT.get(selected_instrument_label, _IT.get("French Horn 1/2", -7))
+        req_semi = _K2S.get(normalize_key(requested_key_norm))
+        if req_semi is None:
+            return
+        concert_semi = (req_semi + horn_t) % 12
+
+        # Allowed families + membership
+        brass = {"Trumpet 1,2", "Trumpet 3", "Trombone 1/2", "Trombone 3/Tuba", "Euphonium", "Cornet", "Flugelhorn"}
+        sax = {"Alto Sax", "Tenor Sax 1/2", "Bari Sax"}
+        fam_of = {}
+        for lbl in brass:
+            fam_of[lbl] = "brass"
+        for lbl in sax:
+            fam_of[lbl] = "sax"
+        allow = set(fam_of)
+
+        # Helpers to open menus and list key labels
+        def _open_parts_menu():
+            SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=None)
+            _t.sleep(0.3)
+            return SeleniumHelper.find_element(driver, XPATHS['parts_parent'], timeout=5, log_func=None)
+
+        def _open_keys_menu():
+            SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=None)
+            _t.sleep(0.3)
+            return SeleniumHelper.find_element(driver, XPATHS['key_parent'], timeout=5, log_func=None)
+
+        def _list_visible_key_labels():
+            parent = _open_keys_menu()
+            labels = []
+            if parent is not None:
+                for b in parent.find_elements(By.TAG_NAME, 'button'):
+                    try:
+                        t = (b.text or '').strip()
+                        if t:
+                            labels.append(t)
+                    except Exception:
+                        continue
+            # Close
+            SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=None)
+            _t.sleep(0.2)
+            return labels
+
+        def _select_instrument_by_label(label: str) -> bool:
+            parent = _open_parts_menu()
+            if parent is None:
+                return False
+            buttons = parent.find_elements(By.TAG_NAME, 'button')
+            found = False
+            for btn in buttons:
+                try:
+                    if (btn.text or '').strip() == label:
+                        btn.click()
+                        found = True
+                        break
+                except Exception:
+                    continue
+            # Close parts
+            SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=None)
+            _t.sleep(0.2)
+            return found
+
+        # Consider only available labels in the UI and not the currently selected instrument
+        site_labels = [lbl for lbl in (available_instrument_labels or []) if (lbl in allow) and (lbl != selected_instrument_label)]
+        if not site_labels:
+            return
+
+        candidates = []
+        # Build candidate list that truly require NO FURTHER transposition to read
+        for label in site_labels:
+            t = _IT.get(label)
+            if t is None:
+                continue
+            req_written = (concert_semi - t) % 12
+            try:
+                if not _select_instrument_by_label(label):
+                    continue
+                key_labels = _list_visible_key_labels()
+                matched = None
+                for lab in key_labels:
+                    parts = [normalize_key(p) for p in lab.split('/')]
+                    semis = [_K2S.get(p) for p in parts if p in _K2S]
+                    if req_written in [s for s in semis if s is not None]:
+                        matched = lab
+                        break
+                if matched:
+                    why = f"Direct reading: target concert {_S2K.get(concert_semi, 'Unknown')} -> {label} written {matched}"
+                    candidates.append({"instrument": label, "key": matched, "why": why, "family": fam_of.get(label, "other")})
+            except Exception:
+                continue
+
+        if not candidates:
+            return
+
+        # Rank with LLM (prefer brass then sax); fallback to simple family order
+        ranked = _rank_alternate_readings_with_llm(candidates)
+        if ranked == candidates:
+            # simple fallback sort
+            order_map = {"brass": 0, "sax": 1, "other": 2}
+            ranked = sorted(candidates, key=lambda c: order_map.get(c.get("family", "other"), 2))
+        top = ranked[0]
+
+        # Select instrument and key and download pages to alternate folder
+        alt_dir = os.path.join(out_root, "alternate_readings", sanitize_title(top.get("instrument", "")), sanitize_title(top.get("key", "")))
+        os.makedirs(alt_dir, exist_ok=True)
+
+        # Ensure we're on the selected instrument/key
+        _select_instrument_by_label(top["instrument"])  # type: ignore
+        parent = _open_keys_menu()
+        if parent is not None:
+            for b in parent.find_elements(By.TAG_NAME, 'button'):
+                try:
+                    if (b.text or '').strip() == top["key"]:  # type: ignore
+                        b.click()
+                        break
+                except Exception:
+                    continue
+        SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=None)
+        _t.sleep(0.2)
+
+        # Now download visible pages
+        wait = WebDriverWait(driver, 10)
+        image_xpath = XPATHS['image_element']
+        next_xpath = XPATHS['next_button']
+        seen = set()
+        for _i in range(50):
+            try:
+                img_el = wait.until(EC.presence_of_element_located((By.XPATH, image_xpath)))
+            except Exception:
+                break
+            src = img_el.get_attribute('src')
+            if not src:
+                break
+            if src not in seen:
+                seen.add(src)
+                try:
+                    r = requests.get(src, timeout=10)
+                    if r.status_code == 200:
+                        name = os.path.basename(src.split('?')[0])
+                        with open(os.path.join(alt_dir, name), 'wb') as f:
+                            f.write(r.content)
+                except Exception:
+                    pass
+            # next
+            try:
+                nxt = wait.until(EC.element_to_be_clickable((By.XPATH, next_xpath)))
+                nxt.click()
+                _t.sleep(0.2)
+            except Exception:
+                break
+    except Exception:
+        return
+
 def _choose_best_instrument_heuristic(requested_instrument: str, available: list[str]) -> str | None:
     """Deterministic fallback for instrument selection.
 
@@ -1312,45 +1594,71 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     except Exception:
                         pass
                     break
-            # If not selected and we know the target semitone, choose the closest key (prefer downward)
+            # If not selected and we know the target semitone, ask the LLM to choose the closest;
+            # fall back to a deterministic nearest that prefers the *upward* key on ties.
             if not selected_key and target_semitone is not None and key_buttons:
-                closest = None
+                # Collect available labels verbatim from the DOM
+                available_labels = []
                 for btn in key_buttons:
                     try:
-                        btn_text = btn.text.strip()
+                        t = btn.text.strip()
+                        if t:
+                            available_labels.append(t)
                     except Exception:
                         continue
-                    if not btn_text:
-                        continue
-                    # Some key buttons may show enharmonic equivalents separated by '/'
-                    name_parts = [normalize_key(part) for part in btn_text.split('/')]
-                    # Map to semitones (pick the first valid mapping)
-                    semitone_vals = [KEY_TO_SEMITONE.get(p) for p in name_parts if p in KEY_TO_SEMITONE]
-                    if not semitone_vals:
-                        continue
-                    semitone = semitone_vals[0]
-                    # Compute signed distance from target key (mod 12)
-                    diff = (semitone - target_semitone) % 12
-                    if diff > 6:
-                        diff -= 12
-                    # Candidate tuple: minimize absolute diff, then prefer negative diff (downward)
-                    candidate = (abs(diff), 0 if diff < 0 else 1, diff, btn_text, btn)
-                    if closest is None or candidate < closest:
-                        closest = candidate
-                if closest:
-                    _, _, _, sel_text, sel_btn = closest
-                    selected_key = sel_text
-                    try:
-                        sel_btn.click()
-                    except Exception:
-                        pass
-            # Fallback: pick first available if no other key selected
-            if not selected_key and key_buttons:
-                selected_key = key_buttons[0].text.strip()
+                # 1) LLM pick (preferred)
                 try:
-                    key_buttons[0].click()
+                    llm_choice = _choose_best_key_with_llm(requested_norm, available_labels)
                 except Exception:
-                    pass
+                    llm_choice = None
+                if llm_choice and llm_choice in available_labels:
+                    for btn in key_buttons:
+                        try:
+                            if btn.text.strip() == llm_choice:
+                                selected_key = llm_choice
+                                try:
+                                    btn.click()
+                                except Exception:
+                                    pass
+                                break
+                        except Exception:
+                            continue
+                # 2) Fallback: deterministic nearest, prefer *above* on ties
+                if not selected_key:
+                    closest = None
+                    for btn in key_buttons:
+                        try:
+                            btn_text = btn.text.strip()
+                        except Exception:
+                            continue
+                        if not btn_text:
+                            continue
+                        # Some key buttons may show enharmonic equivalents separated by '/'
+                        name_parts = [normalize_key(part) for part in btn_text.split('/')]
+                        # Map to semitones (pick the first valid mapping)
+                        try:
+                            from watermark_remover.utils.transposition_utils import KEY_TO_SEMITONE as _K2S
+                        except Exception:
+                            _K2S = {}
+                        semitone_vals = [_K2S.get(p) for p in name_parts if p in _K2S]
+                        if not semitone_vals:
+                            continue
+                        semitone = semitone_vals[0]
+                        # Compute signed distance from target key (mod 12)
+                        diff = (semitone - target_semitone) % 12
+                        if diff > 6:
+                            diff -= 12
+                        # Candidate tuple: minimize absolute diff, then prefer POSITIVE diff (above) on ties
+                        candidate = (abs(diff), 0 if diff > 0 else 1, diff, btn_text, btn)
+                        if closest is None or candidate < closest:
+                            closest = candidate
+                    if closest:
+                        _, _, _, sel_text, sel_btn = closest
+                        selected_key = sel_text
+                        try:
+                            sel_btn.click()
+                        except Exception:
+                            pass
         # Close key menu (click again)
         SeleniumHelper.click_element(
             driver, XPATHS['key_button'], timeout=5, log_func=logger.debug
@@ -1594,6 +1902,23 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                 SCRAPE_METADATA['key'] = (selected_key or norm_key) or ''
             except Exception:
                 pass
+            # If we had to transpose (requested key not available) and the instrument is horn,
+            # download one directly-readable brass/sax alternate alongside the horn part.
+            try:
+                if selected_instrument and 'horn' in selected_instrument.lower():
+                    req_norm = normalize_key(key)
+                    sel_norm = normalize_key(selected_key or req_norm)
+                    if req_norm != sel_norm and available_instruments:
+                        _download_alternate_readings_if_helpful(
+                            driver=driver,
+                            title=title,
+                            requested_key_norm=req_norm,
+                            selected_instrument_label=selected_instrument,
+                            available_instrument_labels=available_instruments,
+                            out_root=os.path.dirname(out_dir),
+                        )
+            except Exception as _alt_err:
+                logger.debug("SCRAPER: alternate-reading step skipped: %s", _alt_err)
             # Track the downloaded directory for cleanup after the PDF is assembled
             try:
                 if out_dir not in TEMP_DIRS:
