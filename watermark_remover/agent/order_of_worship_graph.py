@@ -968,16 +968,275 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
     return new_state
 
 
+
+# =========================
+# Iterative per-song nodes
+# =========================
+
+def init_loop_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Initialize loop state before per-song processing."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
+    new_state: Dict[str, Any] = dict(state)
+
+    # Initialize loop counters and accumulators
+    if "song_idx" not in new_state or not isinstance(new_state.get("song_idx"), int):
+        new_state["song_idx"] = 0
+    new_state.setdefault("final_pdfs", [])
+
+    # Ensure derived order folder is computed once
+    try:
+        new_state["_date_folder"] = _get_order_folder(new_state)
+    except Exception:
+        new_state["_date_folder"] = "unknown_date"
+
+    _record_timing(new_state, "init_loop_node", _stop_timer(start))
+    return new_state
+
+
+def _per_song_labels(new_state: Dict[str, Any]) -> tuple[int, Dict[str, Any], str, str]:
+    """Utility: fetch current song payload and build nice debug name/prefix."""
+    idx = int(new_state.get("song_idx", 0))
+    songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
+    song = songs.get(idx, {}) if isinstance(songs, dict) else {}
+    # Build names for artifacts
+    safe_title = sanitize_title(song.get("title", "Unknown Title"))
+    per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
+    per_song_name = f"{per_song_prefix}_{safe_title}"
+    return idx, song, per_song_prefix, per_song_name
+
+
+def scraper_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Step 1: scrape; produces download_dir in state."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
+    new_state: Dict[str, Any] = dict(state)
+
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _ensure_file_handler(new_state, base)
+        _logger.debug("scraper_node: begin")
+
+    idx, song, per_song_prefix, per_song_name = _per_song_labels(new_state)
+    input_dir_override = new_state.get("input_dir", "data/samples")
+
+    scrape_input = {
+        "title": song.get("title", ""),
+        "instrument": song.get("instrument", ""),
+        "key": song.get("key", ""),
+        "input_dir": input_dir_override,
+        "artist": song.get("artist", ""),
+    }
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _write_json(base, f"{per_song_name}_scrape_input.json", scrape_input)
+
+    download_dir = None
+    try:
+        download_dir = scrape_music.invoke(scrape_input)
+    except Exception as e:
+        _record_error(new_state, f"{per_song_name}_scrape_exception", e)
+
+    if _debug_enabled(new_state):
+        base = _debug_dir_for(new_state)
+        _write_text(base, f"{per_song_name}_scrape_output.txt", str(download_dir))
+
+    new_state["download_dir"] = download_dir
+    _record_timing(new_state, "scraper_node", _stop_timer(start))
+    return new_state
+
+
+def watermark_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Step 2: watermark removal; consumes download_dir, produces processed_dir."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
+    new_state: Dict[str, Any] = dict(state)
+    idx, song, per_song_prefix, per_song_name = _per_song_labels(new_state)
+
+    download_dir = new_state.get("download_dir")
+    processed_dir = None
+    if download_dir:
+        try:
+            rm_input = {"input_dir": download_dir}
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_json(base, f"{per_song_name}_remove_watermark_input.json", rm_input)
+            processed_dir = remove_watermark.invoke(rm_input)
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_text(base, f"{per_song_name}_remove_watermark_output.txt", str(processed_dir))
+        except Exception as e:
+            _record_error(new_state, f"{per_song_name}_remove_watermark_exception", e)
+
+    new_state["processed_dir"] = processed_dir
+    _record_timing(new_state, "watermark_node", _stop_timer(start))
+    return new_state
+
+
+def upscaler_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Step 3: upscaling; consumes processed_dir, produces upscaled_dir."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
+    new_state: Dict[str, Any] = dict(state)
+    idx, song, per_song_prefix, per_song_name = _per_song_labels(new_state)
+
+    processed_dir = new_state.get("processed_dir")
+    upscaled_dir = None
+    if processed_dir:
+        try:
+            up_input = {"input_dir": processed_dir}
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_json(base, f"{per_song_name}_upscale_input.json", up_input)
+            upscaled_dir = upscale_images.invoke(up_input)
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_text(base, f"{per_song_name}_upscale_output.txt", str(upscaled_dir))
+        except Exception as e:
+            _record_error(new_state, f"{per_song_name}_upscale_exception", e)
+
+    new_state["upscaled_dir"] = upscaled_dir
+    _record_timing(new_state, "upscaler_node", _stop_timer(start))
+    return new_state
+
+
+def assembler_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Step 4: assemble PDF for current song; advances the index and cleans up temps."""
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
+    new_state: Dict[str, Any] = dict(state)
+
+    idx, song, per_song_prefix, per_song_name = _per_song_labels(new_state)
+    upscaled_dir = new_state.get("upscaled_dir")
+    date_folder = new_state.get("_date_folder") or _get_order_folder(new_state)
+
+    pdf_path: str | None = None
+    if upscaled_dir:
+        # Build filename using possibly adjusted metadata from scraper
+        try:
+            actual_key = SCRAPE_METADATA.get("key") or song.get("key", "")
+            actual_instrument = SCRAPE_METADATA.get("instrument") or song.get("instrument", "")
+            # Persist back for downstream (mirrors existing behavior)
+            try:
+                SCRAPE_METADATA["key"] = actual_key
+                SCRAPE_METADATA["instrument"] = actual_instrument
+            except Exception:
+                pass
+
+            safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
+            safe_key = sanitize_title(actual_key or "Unknown Key")
+            actual_title_for_name = SCRAPE_METADATA.get("title") or song.get("title", "Unknown Title")
+            safe_title_for_name = sanitize_title(actual_title_for_name)
+            idx_str = str(idx + 1).zfill(2)
+            filename = f"{idx_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
+
+            as_input = {"image_dir": upscaled_dir, "output_pdf": filename}
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_json(base, f"{per_song_name}_assemble_input.json", as_input)
+            pdf_path = assemble_pdf.invoke(as_input)
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_text(base, f"{per_song_name}_assemble_output.txt", str(pdf_path))
+
+            # Copy into orders folder
+            if pdf_path and isinstance(pdf_path, str):
+                try:
+                    orders_root = Path(os.getcwd()) / "output" / "orders" / date_folder
+                    orders_root.mkdir(parents=True, exist_ok=True)
+                    target_path = orders_root / filename
+                    import shutil as _shutil
+                    _shutil.copyfile(pdf_path, str(target_path))
+                    if _debug_enabled(new_state):
+                        base = _debug_dir_for(new_state)
+                        _write_text(base, f"{per_song_name}_final_target.txt", str(target_path))
+                except Exception as e:
+                    _record_error(new_state, f"{per_song_name}_copy_exception", e)
+        except Exception as e:
+            _record_error(new_state, f"{per_song_name}_assemble_outer_exception", e)
+
+    # Record result (even if None for failures)
+    final_pdfs: List[str | None] = list(new_state.get("final_pdfs", []))
+    final_pdfs.append(pdf_path if isinstance(pdf_path, str) else None)
+    new_state["final_pdfs"] = final_pdfs
+
+    # Cleanup TEMP_DIRS between songs
+    try:
+        import shutil as _shutil
+        for tmp_dir in list(TEMP_DIRS.values()):
+            try:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+        TEMP_DIRS.clear()
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_text(base, f"{per_song_name}_temp_cleanup.txt", "TEMP_DIRS cleared.")
+    except Exception as e:
+        _record_error(new_state, f"{per_song_name}_temp_cleanup_exception", e)
+
+    # Advance to next song
+    new_state["song_idx"] = int(new_state.get("song_idx", 0)) + 1
+
+    # If this was the last song, write a final_state snapshot for debugging
+    try:
+        songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
+        if new_state["song_idx"] >= len(songs):
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_json(base, "final_state.json", {
+                    k: v for k, v in new_state.items() if k not in ("songs",)
+                })
+    except Exception:
+        pass
+
+    _record_timing(new_state, "assembler_node", _stop_timer(start))
+    return new_state
+
+
+def should_continue(state: Dict[str, Any]) -> str:
+    """Conditional router after assembling a song."""
+    try:
+        idx = int(state.get("song_idx", 0))
+        songs: Dict[int, Dict[str, Any]] = state.get("songs", {}) or {}
+        return "continue" if idx < len(songs) else "end"
+    except Exception:
+        return "end"
+
+
 def compile_graph() -> Any:
-    """Construct and compile the order-of-worship graph."""
+    """Construct and compile the order-of-worship graph with per-song loop over four steps."""
     graph = StateGraph(dict)
+    # Parse instruction and extract songs (unchanged)
     graph.add_node("parser", parser_node)
     graph.add_node("extractor", extract_songs_node)
-    graph.add_node("processor", process_songs_node)
+
+    # New: four explicit per-song steps + init
+    graph.add_node("init", init_loop_node)
+    graph.add_node("scraper", scraper_node)
+    graph.add_node("watermark", watermark_node)
+    graph.add_node("upscaler", upscaler_node)
+    graph.add_node("assembler", assembler_node)
+
+    # Wiring
     graph.add_edge(START, "parser")
     graph.add_edge("parser", "extractor")
-    graph.add_edge("extractor", "processor")
-    graph.add_edge("processor", END)
+    graph.add_edge("extractor", "init")
+    graph.add_edge("init", "scraper")
+    graph.add_edge("scraper", "watermark")
+    graph.add_edge("watermark", "upscaler")
+    graph.add_edge("upscaler", "assembler")
+
+    # Loop: after assembling, either continue with next song or end
+    graph.add_conditional_edges(
+        "assembler",
+        should_continue,
+        {
+            "continue": "scraper",
+            "end": END,
+        },
+    )
+
     return graph.compile()
 
 # Expose compiled graph
