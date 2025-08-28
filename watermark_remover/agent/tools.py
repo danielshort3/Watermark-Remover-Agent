@@ -178,6 +178,7 @@ def _normalize_instrument_name(name: str) -> str:
     return s
 
 
+
 def _choose_best_instrument_with_llm(requested_instrument: str, available: list[str]) -> str | None:
     """Ask the local LLM (if available) to pick the best matching instrument label.
 
@@ -188,43 +189,51 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
     if _llm_run_instruction is None:
         return None
     try:
-        # Build prompt with numbered options for clarity
-        opts = [f"{i}: {lbl}" for i, lbl in enumerate(available)]
+        # Build prompt with explicit bullet list so the model can only choose from these.
+        options_block = "- " + "\n- ".join(available)
+
         prompt = (
-            "Task: Choose the SINGLE best matching instrument option for the requested instrument.\\n"
-            f"Requested instrument: {requested_instrument}\\n"
-            "Allowed options (return ONE label EXACTLY as shown):\\n- \" + \"\\n- \".join(available) + \"\\n"
-            "Guidelines:\\n"
-            "- Prefer brass and saxophones if synonyms apply (e.g., 'Horn in F', 'French Horn', 'F Horn' are equivalent).\\n"
-            "- Ignore options that are 'cover' or 'lead sheet' or 'orchestration score'.\\n"
-            "- If the exact label is not present, choose the closest synonym (e.g., 'French Horn 1/2' matches 'French Horn').\\n"
-            "- Reply in JSON: {\\\"label\\\": \\\"<exact option label>\\\"}.\\n"
+            "Task: Choose the SINGLE best matching instrument option for the requested instrument.\n"
+            f"Requested instrument: {requested_instrument}\n"
+            "Allowed options (return ONE label EXACTLY as shown):\n"
+            f"{options_block}\n"
+            "Guidelines:\n"
+            "- Prefer brass and saxophones if synonyms apply (e.g., 'Horn in F', 'French Horn', 'F Horn' are equivalent).\n"
+            "- Ignore options that are 'cover' or 'lead sheet' or 'orchestration score'.\n"
+            "- If the exact label is not present, choose the closest synonym (e.g., 'French Horn 1/2' matches 'French Horn').\n"
+            "- Reply in JSON: {\"label\": \"<exact option label>\"}.\n"
         )
         raw = _llm_run_instruction(prompt)  # type: ignore
-        s = str(raw).strip()
-        import json as _json, re as _re
-        m = _re.search(r"\\{.*?\\}", s, flags=_re.S)
-        obj = None
-        if m:
-            try:
-                obj = _json.loads(m.group(0))
-            except Exception:
-                obj = None
-        if isinstance(obj, dict) and isinstance(obj.get("label"), str):
-            label = obj["label"].strip()
+        if not raw:
+            return None
+        # Try strict JSON first
+        import json as _json
+        try:
+            data = _json.loads(raw)
+            label = (data.get("label") or "").strip()
             if label in available:
                 return label
-        # Fallback: attempt to match by integer index in text if present
-        m2 = _re.search(r"(\\d+)", s)
+        except Exception:
+            pass
+
+        # Fallback to regex capture of {"label":"..."}
+        import re as _re
+        m = _re.search(r'\{\s*\"label\"\s*:\s*\"([^\"]+)\"\s*\}', raw)
+        if m:
+            label = m.group(1).strip()
+            if label in available:
+                return label
+
+        # As a last resort, if the model returned an indexed choice like "2" or "2: French Horn",
+        # try to coerce to a valid label.
+        m2 = _re.search(r'\b(\d{1,3})\b', raw)
         if m2:
             idx = int(m2.group(1))
             if 0 <= idx < len(available):
                 return available[idx]
+        return None
     except Exception:
         return None
-    return None
-
-
 def _choose_best_instrument_heuristic(requested_instrument: str, available: list[str]) -> str | None:
     """Deterministic fallback for instrument selection.
 
@@ -665,20 +674,22 @@ def scrape_music(
         scraped_dir = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
     if scraped_dir:
-        # Determine final metadata from the scraper (set by _scrape_with_selenium).
-        # Fall back to the originally requested values when metadata is missing.
+        # Determine the artist from metadata (set by _scrape_with_selenium)
         title_meta = (SCRAPE_METADATA.get('title', '') or title)
         artist_meta = SCRAPE_METADATA.get('artist', '') or 'unknown'
-        instrument_meta = (SCRAPE_METADATA.get('instrument', '') or instrument or 'unknown')
-        key_meta = (SCRAPE_METADATA.get('key', '') or key or 'unknown')
-        # Use the unified sanitiser for consistency across all pipeline stages.
-        safe_title = sanitize_title(title_meta)
-        safe_artist = sanitize_title(artist_meta)
-        safe_instrument_selected = sanitize_title(instrument_meta)
-        safe_key_selected = sanitize_title(key_meta)
-        # Build the instrument directory using ACTUAL instrument/key so all stages align
+        import re
+        def _sanitize(value: str) -> str:
+            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
+        safe_title = _sanitize(title_meta)
+        safe_artist = _sanitize(artist_meta)
+        # Build the instrument directory under the log root using ACTUAL selected metadata
         instrument_dir = os.path.join(
-            log_root, safe_title, safe_artist, safe_key_selected, safe_instrument_selected)
+            log_root,
+            safe_title,
+            safe_artist,
+            safe_key,
+            safe_instrument,
+        )
         original_dir_final = os.path.join(instrument_dir, "1_original")
         os.makedirs(original_dir_final, exist_ok=True)
         # Copy scraped images into the 1_original directory.

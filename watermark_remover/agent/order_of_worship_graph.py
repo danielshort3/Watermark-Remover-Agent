@@ -691,19 +691,7 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
             order_folder_computed = "unknown"
         new_state["order_folder"] = order_folder_llm or order_folder_computed
 
-        # Compute order_folder (MM_DD_YYYY) from the PDF text (LLM preferred; fallback to heuristics)
-        try:
-            # Resolve a likely path to PDF
-            pdf_path = pdf_name
-            if not os.path.isabs(pdf_path):
-                root_dir = new_state.get("pdf_root") or new_state.get("input_dir") or "input"
-                candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
-                pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
-            order_folder_computed = _determine_order_folder_from_pdf(new_state, pdf_path) if os.path.exists(pdf_path) else "unknown"
-        except Exception as e:
-            _record_error(new_state, "parser_node.compute_order_folder_exception", e)
-            order_folder_computed = "unknown"
-        new_state["order_folder"] = order_folder_llm or order_folder_computed
+        
 
         # Convert overrides keys to ints if provided as strings
         overrides: Dict[int, str] = {}
