@@ -1,7 +1,7 @@
 {
   "dependencies": ["./"],
   "graphs": {
-    "watermark-remover": "watermark_remover.agent.multi_agent_graph:graph",
+    "watermark-remover": "watermark_remover.agent.single_song_graph:graph",
     "order-of-worship": "watermark_remover.agent.order_of_worship_graph:graph"
   }
 }

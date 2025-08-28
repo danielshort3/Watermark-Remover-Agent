@@ -133,6 +133,156 @@ CANDIDATES:
         return None
     return None
 
+
+
+def _normalize_instrument_name(name: str) -> str:
+    r"""Normalize an instrument label for comparison.
+
+    - Lowercase
+    - Remove punctuation and extra whitespace
+    - Map common synonyms (e.g., "horn in f" -> "frenchhorn")
+    r"""
+    import re as _re
+    s = (name or "").strip().lower()
+    # Remove punctuation
+    s = _re.sub(r"[^a-z0-9\s/+-]", " ", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+    # Canonical buckets
+    synonyms = {
+        "frenchhorn": [
+            "horn", "f horn", "french horn", "horn in f", "horn in f 1", "horn in f 2",
+            "horn 1", "horn 2", "horn 1 2", "horn in f 1/2", "f horn 1/2", "horn in f 1 & 2"
+        ],
+        "trumpet": ["trumpet", "trumpets", "bb trumpet", "trumpet 1", "trumpet 2", "trumpet 3", "trumpet 1 2"],
+        "trombone": ["trombone", "trombones", "trombone 1", "trombone 2", "trombone 3"],
+        "tuba": ["tuba", "bass tuba"],
+        "tenorsax": ["tenor sax", "tenor saxophone", "bb tenor sax"],
+        "altosax": ["alto sax", "alto saxophone", "eb alto sax"],
+        "barisax": ["bari sax", "baritone sax", "baritone saxophone", "eb baritone sax"],
+        "euphonium": ["euphonium", "baritone (bc)", "baritone (tc)", "baritone treble clef"],
+        "cornet": ["cornet"],
+        "flugelhorn": ["flugelhorn"],
+        "clarinet": ["clarinet", "bb clarinet"],
+        # Exclude woodwinds like flute/violin later via allowlist
+    }
+    for canon, alts in synonyms.items():
+        for alt in alts:
+            if s == alt:
+                return canon
+    # Substring detection
+    for canon, alts in synonyms.items():
+        for alt in alts:
+            if alt in s:
+                return canon
+    # Default to the cleaned string
+    return s
+
+
+def _choose_best_instrument_with_llm(requested_instrument: str, available: list[str]) -> str | None:
+    """Ask the local LLM (if available) to pick the best matching instrument label.
+
+    The LLM MUST return *one of* the provided labels verbatim. If the LLM is
+    unavailable, this function returns None and callers should use a heuristic
+    fallback.
+    """
+    if _llm_run_instruction is None:
+        return None
+    try:
+        # Build prompt with numbered options for clarity
+        opts = [f"{i}: {lbl}" for i, lbl in enumerate(available)]
+        prompt = (
+            "Task: Choose the SINGLE best matching instrument option for the requested instrument.\\n"
+            f"Requested instrument: {requested_instrument}\\n"
+            "Allowed options (return ONE label EXACTLY as shown):\\n- \" + \"\\n- \".join(available) + \"\\n"
+            "Guidelines:\\n"
+            "- Prefer brass and saxophones if synonyms apply (e.g., 'Horn in F', 'French Horn', 'F Horn' are equivalent).\\n"
+            "- Ignore options that are 'cover' or 'lead sheet' or 'orchestration score'.\\n"
+            "- If the exact label is not present, choose the closest synonym (e.g., 'French Horn 1/2' matches 'French Horn').\\n"
+            "- Reply in JSON: {\\\"label\\\": \\\"<exact option label>\\\"}.\\n"
+        )
+        raw = _llm_run_instruction(prompt)  # type: ignore
+        s = str(raw).strip()
+        import json as _json, re as _re
+        m = _re.search(r"\\{.*?\\}", s, flags=_re.S)
+        obj = None
+        if m:
+            try:
+                obj = _json.loads(m.group(0))
+            except Exception:
+                obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("label"), str):
+            label = obj["label"].strip()
+            if label in available:
+                return label
+        # Fallback: attempt to match by integer index in text if present
+        m2 = _re.search(r"(\\d+)", s)
+        if m2:
+            idx = int(m2.group(1))
+            if 0 <= idx < len(available):
+                return available[idx]
+    except Exception:
+        return None
+    return None
+
+
+def _choose_best_instrument_heuristic(requested_instrument: str, available: list[str]) -> str | None:
+    """Deterministic fallback for instrument selection.
+
+    Strategy:
+    1) Canonicalize names and look for exact canonical match (e.g., 'horn in f' -> 'frenchhorn').
+    2) If multiple matches exist (e.g., 'French Horn 1/2' and 'French Horn 3'), prefer the 1/2 or 1 label.
+    3) Otherwise, do case‑insensitive exact and substring match.
+    4) Finally, fuzzy ratio > 0.85 using difflib.
+    """
+    if not available:
+        return None
+    req_norm = _normalize_instrument_name(requested_instrument)
+    # Build canonical mapping
+    canon_map: dict[str, str] = {lbl: _normalize_instrument_name(lbl) for lbl in available}
+    # 1) Canonical match
+    same = [lbl for lbl, canon in canon_map.items() if canon == req_norm]
+    if same:
+        # Prefer explicit horn section numbering commonly used on PraiseCharts
+        prefs = ["1/2", "1 & 2", "1 2", "1", "2", "3"]
+        for p in prefs:
+            for lbl in same:
+                if p in lbl:
+                    return lbl
+        return same[0]
+    # Special: requested is horn, match anything in horn family
+    if req_norm == "frenchhorn":
+        horn_like = [lbl for lbl, canon in canon_map.items() if canon == "frenchhorn" or "horn" in lbl.lower()]
+        if horn_like:
+            prefs = ["1/2", "1 & 2", "1 2", "1", "2", "3"]
+            for p in prefs:
+                for lbl in horn_like:
+                    if p in lbl:
+                        return lbl
+            return horn_like[0]
+    # 3) Case-insensitive exact/substring
+    rlow = (requested_instrument or "").strip().lower()
+    for lbl in available:
+        if lbl.strip().lower() == rlow:
+            return lbl
+    for lbl in available:
+        if rlow in lbl.strip().lower() or lbl.strip().lower() in rlow:
+            return lbl
+    # 4) Fuzzy
+    try:
+        from difflib import SequenceMatcher as _SM
+        scores = []
+        for lbl in available:
+            score = _SM(None, rlow, lbl.lower()).ratio()
+            scores.append((score, lbl))
+        scores.sort(reverse=True)
+        if scores and scores[0][0] >= 0.85:
+            return scores[0][1]
+    except Exception:
+        pass
+    # Default: first available (stable)
+    return available[0] if available else None
+
+
 def _reorder_candidates(title: str, artist: Optional[str], candidates: list[dict]) -> list[dict]:
     """Reorder the list using LLM if available; otherwise, fuzzy title/artist similarity."""
     # LLM pick first
@@ -1304,52 +1454,35 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             if part_text not in available_instruments:
                 available_instruments.append(part_text)
         # Determine the most appropriate instrument selection
-        requested_lower = instrument.lower()
-        # Exact match
-        for btn in parts_buttons:
+        # Use LLM (if available) to pick the best match among available instruments.
+        selected_instrument = None
+        if available_instruments:
+            # Ask LLM first
             try:
-                part_text = btn.text.strip()
+                llm_choice = _choose_best_instrument_with_llm(instrument, available_instruments)
             except Exception:
-                continue
-            if not part_text:
-                continue
-            lower = part_text.lower()
-            if 'cover' in lower or 'lead sheet' in lower:
-                continue
-            if lower == requested_lower:
-                selected_instrument = part_text
-                try:
-                    btn.click()
-                except Exception:
-                    pass
-                break
-        # Substring/horn match
-        if not selected_instrument:
-            for btn in parts_buttons:
-                try:
-                    part_text = btn.text.strip()
-                except Exception:
-                    continue
-                if not part_text:
-                    continue
-                lower = part_text.lower()
-                if 'cover' in lower or 'lead sheet' in lower:
-                    continue
-                if (
-                    requested_lower == lower
-                    or requested_lower in lower
-                    or lower in requested_lower
-                    or (
-                        'horn' in requested_lower and 'horn' in lower
-                    )
-                ):
-                    selected_instrument = part_text
+                llm_choice = None
+            if llm_choice and llm_choice in available_instruments:
+                selected_instrument = llm_choice
+            # Deterministic fallback
+            if not selected_instrument:
+                selected_instrument = _choose_best_instrument_heuristic(instrument, available_instruments)
+            # Click the chosen instrument
+            if selected_instrument:
+                for btn in parts_buttons:
                     try:
-                        btn.click()
+                        btn_text = btn.text.strip()
                     except Exception:
-                        pass
-                    break
-        # Default: first available
+                        continue
+                    if not btn_text:
+                        continue
+                    if btn_text.strip() == selected_instrument.strip():
+                        try:
+                            btn.click()
+                        except Exception:
+                            pass
+                        break
+        # If still nothing selected but we have buttons/instruments, click the first one
         if not selected_instrument and available_instruments:
             selected_instrument = available_instruments[0]
             for btn in parts_buttons:

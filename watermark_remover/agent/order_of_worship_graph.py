@@ -34,10 +34,39 @@ import logging
 from typing import Any, Dict, List, Tuple
 from pathlib import Path
 
+
+
+# --- Runtime safety knobs ----------------------------------------------------
+# Make recursion errors less likely in deep tool/graph stacks.
+try:
+    import sys as _sys
+    _RL = int(os.getenv("ORDER_RECURSION_LIMIT", "10000"))
+    if _RL > _sys.getrecursionlimit():
+        _sys.setrecursionlimit(_RL)
+except Exception:
+    # If setting fails (e.g., restricted runtime), just continue.
+    pass
+# -----------------------------------------------------------------------------
 from langgraph.graph import StateGraph, START, END
 
 # Import tools and utilities from your project
 from watermark_remover.agent.tools import sanitize_title, SCRAPE_METADATA, TEMP_DIRS
+
+
+def _iter_temp_dirs():
+    """Return a *list* of temp directories regardless of TEMP_DIRS' type.
+
+    Supports both list[str] and dict[str, str] (legacy). Ignores non-str items.
+    """
+    try:
+        td = TEMP_DIRS
+        if isinstance(td, dict):
+            it = list(td.values())
+        else:
+            it = list(td or [])
+    except Exception:
+        it = []
+    return [p for p in it if isinstance(p, str)]
 from watermark_remover.agent.tools import (
     scrape_music,
     remove_watermark,
@@ -525,6 +554,43 @@ def _determine_order_folder_from_pdf(state: Dict[str, Any], pdf_path: str) -> st
     except Exception:
         return date or "unknown"
 
+
+def _ensure_order_pdf_copied(state: Dict[str, Any]) -> None:
+    """Copy the source order-of-worship PDF into output/orders/<date>/00_<date>_Order.pdf."""
+    try:
+        pdf_name = (state.get("pdf_name") or "").strip()
+        if not pdf_name:
+            return
+
+        # Resolve path similar to other utilities
+        pdf_path = pdf_name
+        if not os.path.isabs(pdf_path):
+            root_dir = state.get("pdf_root") or state.get("input_dir") or "input"
+            candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
+            pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
+        if not os.path.exists(pdf_path):
+            return
+
+        date_folder = state.get("_date_folder") or _get_order_folder(state) or "unknown_date"
+
+        orders_root = Path(os.getcwd()) / "output" / "orders" / date_folder
+        orders_root.mkdir(parents=True, exist_ok=True)
+        target = orders_root / f"00_{date_folder}_Order.pdf"
+
+        if not target.exists():
+            import shutil as _shutil
+            _shutil.copyfile(pdf_path, str(target))
+
+        if _debug_enabled(state):
+            try:
+                base = _debug_dir_for(state)
+                _write_text(base, "order_pdf_target.txt", str(target))
+            except Exception:
+                pass
+
+    except Exception as e:
+        _record_error(state, "ensure_order_pdf_copied.exception", e)
+
 # ---------------------------------------------------------------------------
 # LLM Prompts
 # ---------------------------------------------------------------------------
@@ -813,6 +879,12 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # We only use LLM-provided order_folder (if any); otherwise keep 'unknown_date'
     date_folder = _get_order_folder(new_state)
+    # (Legacy path) Ensure order PDF is present as 00_ file
+    try:
+        _ensure_order_pdf_copied(new_state)
+    except Exception as e:
+        _record_error(new_state, "process_songs_node.ensure_order_pdf_copied_exception", e)
+
 
     for idx in sorted(songs.keys()):
         song = songs[idx]
@@ -940,7 +1012,7 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
             # Cleanup temps
             try:
                 import shutil
-                for tmp_dir in list(TEMP_DIRS):
+                for tmp_dir in _iter_temp_dirs():
                     try:
                         shutil.rmtree(tmp_dir, ignore_errors=True)
                     except Exception:
@@ -987,6 +1059,12 @@ def init_loop_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure derived order folder is computed once
     try:
         new_state["_date_folder"] = _get_order_folder(new_state)
+        # Ensure 00_{date}_Order.pdf exists in output/orders/<date>
+        try:
+            _ensure_order_pdf_copied(new_state)
+        except Exception as e:
+            _record_error(new_state, "init_loop_node.ensure_order_pdf_copied_exception", e)
+
     except Exception:
         new_state["_date_folder"] = "unknown_date"
 
@@ -1163,7 +1241,7 @@ def assembler_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Cleanup TEMP_DIRS between songs
     try:
         import shutil as _shutil
-        for tmp_dir in list(TEMP_DIRS.values()):
+        for tmp_dir in _iter_temp_dirs():
             try:
                 _shutil.rmtree(tmp_dir, ignore_errors=True)
             except Exception:
@@ -1240,4 +1318,5 @@ def compile_graph() -> Any:
     return graph.compile()
 
 # Expose compiled graph
-graph = compile_graph()
+_DEFAULT_RL = int(os.getenv("ORDER_RECURSION_LIMIT", "100"))
+graph = compile_graph().with_config({"recursion_limit": _DEFAULT_RL})
