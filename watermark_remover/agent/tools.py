@@ -665,22 +665,20 @@ def scrape_music(
         scraped_dir = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
     if scraped_dir:
-        # Determine the artist from metadata (set by _scrape_with_selenium)
+        # Determine final metadata from the scraper (set by _scrape_with_selenium).
+        # Fall back to the originally requested values when metadata is missing.
         title_meta = (SCRAPE_METADATA.get('title', '') or title)
         artist_meta = SCRAPE_METADATA.get('artist', '') or 'unknown'
-        import re
-        def _sanitize(value: str) -> str:
-            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
-        safe_title = _sanitize(title_meta)
-        safe_artist = _sanitize(artist_meta)
-        # Build the instrument directory under the log root using ACTUAL selected metadata
+        instrument_meta = (SCRAPE_METADATA.get('instrument', '') or instrument or 'unknown')
+        key_meta = (SCRAPE_METADATA.get('key', '') or key or 'unknown')
+        # Use the unified sanitiser for consistency across all pipeline stages.
+        safe_title = sanitize_title(title_meta)
+        safe_artist = sanitize_title(artist_meta)
+        safe_instrument_selected = sanitize_title(instrument_meta)
+        safe_key_selected = sanitize_title(key_meta)
+        # Build the instrument directory using ACTUAL instrument/key so all stages align
         instrument_dir = os.path.join(
-            log_root,
-            safe_title,
-            safe_artist,
-            safe_key,
-            safe_instrument,
-        )
+            log_root, safe_title, safe_artist, safe_key_selected, safe_instrument_selected)
         original_dir_final = os.path.join(instrument_dir, "1_original")
         os.makedirs(original_dir_final, exist_ok=True)
         # Copy scraped images into the 1_original directory.
