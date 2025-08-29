@@ -137,7 +137,7 @@ def run_instruction(instruction: str) -> str:
             action_name = plan.get('action')
             action_input = plan.get('action_input', {}) or {}
             # Map action names to tool functions
-            from watermark_remover.agent.tools import (
+            from watermark_remover.tools import (
                 scrape_music,
                 remove_watermark,
                 upscale_images,
@@ -182,7 +182,7 @@ def run_instruction(instruction: str) -> str:
     # a different key when the requested one is unavailable).  We strip
     # newline characters as the CSV formatter will sanitise them.
     try:
-        from watermark_remover.agent.tools import logger  # type: ignore
+        from watermark_remover.tools import logger  # type: ignore
         # Use extra to ensure CSV columns align
         logger.info(
             f"AGENT_THOUGHTS: {str(answer).strip()}",
