@@ -19,7 +19,9 @@ import sys
 # Adjust sys.path so that the `watermark_remover` package can be imported when
 # running tests via `python -m unittest`.  This inserts the repository root
 # (the parent of this tests directory) at the beginning of sys.path.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(repo_root, "src"))
+sys.path.insert(0, repo_root)
 
 from watermark_remover.agent.graph_ollama import run_instruction
 

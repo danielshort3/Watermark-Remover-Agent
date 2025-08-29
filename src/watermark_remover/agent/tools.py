@@ -53,7 +53,7 @@ from langchain_core.tools import tool
 # does not exist in the local library.  It is defined in
 # watermark_remover.utils.transposition_utils and copied from the
 # original Watermark‑Remover project.
-from watermark_remover.utils.transposition_utils import (
+from utils.transposition_utils import (
     get_transposition_suggestions,
     normalize_key,
 )
@@ -62,7 +62,7 @@ from watermark_remover.utils.transposition_utils import (
 # definitions mirror those used by the Watermark Remover GUI and ensure that
 # our agent navigates PraiseCharts using the same selectors.  See
 # watermark_remover/utils/selenium_utils.py for details.
-from watermark_remover.utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
+from utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 from PIL import Image
 
 # Optional LLM ranking support (uses local Ollama-backed agent if available)
@@ -180,57 +180,89 @@ def _normalize_instrument_name(name: str) -> str:
 
 
 def _choose_best_instrument_with_llm(requested_instrument: str, available: list[str]) -> str | None:
-    """Ask the local LLM (if available) to pick the best matching instrument label.
+    """Ask the local LLM to pick the best matching instrument option from the dropdown.
 
-    The LLM MUST return *one of* the provided labels verbatim. If the LLM is
-    unavailable, this function returns None and callers should use a heuristic
-    fallback.
+    - Compares the parsed input instrument against the actual available labels.
+    - Accepts synonyms (e.g., "Horn in F", "French Horn", "F Horn").
+    - Prefers sectioned labels (e.g., "French Horn 1/2", "Horn 1 & 2").
+    - Returns EXACTLY one of the provided labels or an index into the list.
     """
-    if _llm_run_instruction is None:
+    if _llm_run_instruction is None or not available:
         return None
     try:
-        # Build prompt with explicit bullet list so the model can only choose from these.
-        options_block = "- " + "\n- ".join(available)
+        # Build an index-mapped option list and include a canonical form for clarity
+        def _canon(s: str) -> str:
+            try:
+                return _normalize_instrument_name(s)
+            except Exception:
+                return (s or "").strip().lower()
+
+        indexed = [{"i": i, "label": lab, "canon": _canon(lab)} for i, lab in enumerate(available)]
+        req_canon = _canon(requested_instrument)
 
         prompt = (
-            "Task: Choose the SINGLE best matching instrument option for the requested instrument.\n"
-            f"Requested instrument: {requested_instrument}\n"
-            "Allowed options (return ONE label EXACTLY as shown):\n"
-            f"{options_block}\n"
-            "Guidelines:\n"
-            "- Prefer brass and saxophones if synonyms apply (e.g., 'Horn in F', 'French Horn', 'F Horn' are equivalent).\n"
-            "- Ignore options that are 'cover' or 'lead sheet' or 'orchestration score'.\n"
-            "- If the exact label is not present, choose the closest synonym (e.g., 'French Horn 1/2' matches 'French Horn').\n"
-            "- Reply in JSON: {\"label\": \"<exact option label>\"}.\n"
+            "You are selecting an instrument option from a dropdown.\n"
+            f"Requested instrument (raw): {requested_instrument}\n"
+            f"Requested instrument (canonical): {req_canon}\n"
+            "Options (choose EXACTLY one by index or label):\n"
+            f"{indexed}\n"
+            "Rules:\n"
+            "- Match by canonical form and common synonyms (e.g., 'frenchhorn' ~ 'horn in f').\n"
+            "- Prefer sectioned labels (e.g., '1/2', '1 & 2') when multiple horn options exist.\n"
+            "- Avoid 'cover', 'lead sheet', 'score' if present.\n"
+            "- Return STRICT JSON as either {\"index\": <int>} or {\"label\": \"<exact option label>\"}."
         )
+
         raw = _llm_run_instruction(prompt)  # type: ignore
         if not raw:
             return None
-        # Try strict JSON first
-        import json as _json
-        try:
-            data = _json.loads(raw)
-            label = (data.get("label") or "").strip()
-            if label in available:
-                return label
-        except Exception:
-            pass
 
-        # Fallback to regex capture of {"label":"..."}
-        import re as _re
-        m = _re.search(r'\{\s*\"label\"\s*:\s*\"([^\"]+)\"\s*\}', raw)
-        if m:
-            label = m.group(1).strip()
-            if label in available:
-                return label
+        # Parse JSON-ish output
+        import json as _json, re as _re
+        sel_label: str | None = None
+        sel_index: int | None = None
 
-        # As a last resort, if the model returned an indexed choice like "2" or "2: French Horn",
-        # try to coerce to a valid label.
-        m2 = _re.search(r'\b(\d{1,3})\b', raw)
-        if m2:
-            idx = int(m2.group(1))
-            if 0 <= idx < len(available):
-                return available[idx]
+        # Extract first {...}
+        m_obj = _re.search(r"\{.*?\}", str(raw), flags=_re.S)
+        if m_obj:
+            try:
+                obj = _json.loads(m_obj.group(0))
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                v = obj.get("label") or obj.get("choice")
+                if isinstance(v, str) and v in available:
+                    sel_label = v
+                i = obj.get("index")
+                try:
+                    if isinstance(i, int) and 0 <= i < len(available):
+                        sel_index = i
+                except Exception:
+                    pass
+
+        # Fallbacks
+        if sel_label is None and sel_index is None:
+            # If the model returned a bare number
+            m_idx = _re.search(r"\b(\d{1,3})\b", str(raw))
+            if m_idx:
+                try:
+                    k = int(m_idx.group(1))
+                    if 0 <= k < len(available):
+                        sel_index = k
+                except Exception:
+                    pass
+        # If only an index was recovered
+        if sel_index is not None:
+            return available[sel_index]
+        # If a label was recovered but not exactly matched, do a canonical pass
+        if sel_label is not None and sel_label not in available:
+            sel_canon = _canon(sel_label)
+            for lab in available:
+                if _canon(lab) == sel_canon:
+                    return lab
+        # If a label was recovered and valid
+        if sel_label in available:  # type: ignore[operator]
+            return sel_label
         return None
     except Exception:
         return None
@@ -649,7 +681,7 @@ def sanitize_title(value: str) -> str:
 # runtime.
 try:
     import torch  # type: ignore
-    from watermark_remover.inference.model_functions import (
+    from models.model_functions import (
         UNet,
         VDSR,
         PIL_to_tensor,
@@ -668,7 +700,9 @@ else:
 # LOG_LEVEL environment variable (e.g. export LOG_LEVEL=DEBUG).  If not set,
 # INFO is used by default.  Only configure the basicConfig once to avoid
 # interfering with parent application logging configuration.
-_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+from config.settings import DEFAULT_LOG_LEVEL
+
+_log_level = os.environ.get("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
 try:
     logging.basicConfig(
         level=getattr(logging, _log_level, logging.INFO),
@@ -1655,10 +1689,29 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     if closest:
                         _, _, _, sel_text, sel_btn = closest
                         selected_key = sel_text
+                        # Robust click on the selected key option
+                        _clicked = False
                         try:
-                            sel_btn.click()
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", sel_btn)
                         except Exception:
                             pass
+                        try:
+                            sel_btn.click()
+                            _clicked = True
+                        except Exception:
+                            _clicked = False
+                        if not _clicked:
+                            try:
+                                from selenium.webdriver import ActionChains  # type: ignore
+                                ActionChains(driver).move_to_element(sel_btn).pause(0.05).click(sel_btn).perform()
+                                _clicked = True
+                            except Exception:
+                                _clicked = False
+                        if not _clicked:
+                            try:
+                                driver.execute_script("arguments[0].click();", sel_btn)
+                            except Exception:
+                                pass
         # Close key menu (click again)
         SeleniumHelper.click_element(
             driver, XPATHS['key_button'], timeout=5, log_func=logger.debug
@@ -1685,6 +1738,32 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     )
             except Exception:
                 pass
+        # Small helper for robust element clicks (handles overlays/intercepts)
+        def _robust_click(web_el) -> bool:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", web_el)
+            except Exception:
+                pass
+            # Try native click first
+            try:
+                web_el.click()
+                return True
+            except Exception:
+                pass
+            # Try action chains
+            try:
+                from selenium.webdriver import ActionChains  # type: ignore
+                ActionChains(driver).move_to_element(web_el).pause(0.05).click(web_el).perform()
+                return True
+            except Exception:
+                pass
+            # Fall back to JS click
+            try:
+                driver.execute_script("arguments[0].click();", web_el)
+                return True
+            except Exception:
+                return False
+
         # Gather available instruments
         available_instruments: list[str] = []
         selected_instrument: str | None = None
@@ -1786,27 +1865,43 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                 selected_instrument = _choose_best_instrument_heuristic(instrument, available_instruments)
             # Click the chosen instrument
             if selected_instrument:
+                clicked_any = False
                 for btn in parts_buttons:
                     try:
-                        btn_text = btn.text.strip()
+                        btn_text = (btn.text or '').strip()
                     except Exception:
                         continue
                     if not btn_text:
                         continue
                     if btn_text.strip() == selected_instrument.strip():
-                        try:
-                            btn.click()
-                        except Exception:
-                            pass
-                        break
+                        if _robust_click(btn):
+                            clicked_any = True
+                            break
+                # Fallback: canonical match if exact label didn't match
+                if not clicked_any:
+                    try:
+                        sel_canon = _normalize_instrument_name(selected_instrument)
+                        for btn in parts_buttons:
+                            try:
+                                bt = (btn.text or '').strip()
+                            except Exception:
+                                continue
+                            if not bt:
+                                continue
+                            if _normalize_instrument_name(bt) == sel_canon:
+                                if _robust_click(btn):
+                                    clicked_any = True
+                                    break
+                    except Exception:
+                        pass
         # If still nothing selected but we have buttons/instruments, click the first one
         if not selected_instrument and available_instruments:
             selected_instrument = available_instruments[0]
             for btn in parts_buttons:
                 try:
-                    if btn.text.strip() == selected_instrument:
-                        btn.click()
-                        break
+                    if (btn.text or '').strip() == selected_instrument:
+                        if _robust_click(btn):
+                            break
                 except Exception:
                     continue
         # Close parts menu

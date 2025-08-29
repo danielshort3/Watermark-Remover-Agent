@@ -85,6 +85,57 @@ print(result)
 Both methods return a string with the result or a diagnostic error if
 the Ollama server cannot be reached or the model is missing.
 
+## Project Structure (src‑layout)
+
+The repo follows a clean `src/` layout with clear boundaries between application code, utilities, models, tests, and scripts.
+
+```
+.
+├─ src/
+│  ├─ watermark_remover/
+│  │  ├─ __init__.py
+│  │  └─ agent/
+│  │     ├─ __init__.py
+│  │     ├─ graph_ollama.py
+│  │     ├─ ollama_agent.py
+│  │     ├─ single_song_graph.py
+│  │     └─ order_of_worship_graph.py
+│  ├─ utils/
+│  │  ├─ __init__.py
+│  │  ├─ selenium_utils.py
+│  │  └─ transposition_utils.py
+│  ├─ models/
+│  │  ├─ __init__.py
+│  │  └─ model_functions.py  # UNet, VDSR, PIL/tensor helpers
+│  └─ config/
+│     ├─ __init__.py
+│     └─ settings.py       # default OLLAMA URL/MODEL, log level
+├─ tests/
+│  ├─ test_agent_tools.py
+│  └─ test_graph_ollama.py
+├─ scripts/
+│  └─ run_agent.py
+├─ data/
+│  └─ README.md
+├─ models/                 # weights/checkpoints live here (data only)
+├─ input/                  # sample inputs (if any)
+├─ output/                 # logs/results
+├─ langgraph.json          # depends on ./src for module imports
+├─ requirements.txt
+└─ Dockerfile
+```
+
+Notes:
+- Python modules live under `src/`. Tests add `src/` to `sys.path` for direct invocation.
+- ML/DL code is in `src/models/model_functions.py` and imported as `models.*`.
+- Utilities live in `src/utils/` and are imported as `utils.*`.
+- Central defaults are in `src/config/settings.py` (e.g., `DEFAULT_OLLAMA_URL`, `DEFAULT_OLLAMA_MODEL`, `DEFAULT_LOG_LEVEL`).
+- `langgraph.json` includes `"dependencies": ["./src", "./"]` so LangGraph can import graph modules.
+
+Removed dead code/duplicates:
+- Dropped `multi_agent_graph` from `watermark_remover.agent.__all__` (file was not present).
+- Removed duplicate top‑level `watermark_remover/` stub that only contained `__pycache__`.
+
 ## Notes on scraping and key selection
 
 The `scrape_music` tool has been extended beyond a stub.  Its search

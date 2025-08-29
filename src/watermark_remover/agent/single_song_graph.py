@@ -22,6 +22,8 @@ may be provided to override or supplement the metadata extracted by the model.
 """
 from __future__ import annotations
 
+# Note: moved under src/ layout for consistency.
+
 import os
 import json
 from typing import Any, Dict

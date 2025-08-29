@@ -26,6 +26,7 @@ import json
 import os
 import urllib.request
 from typing import Any, Optional
+from config.settings import DEFAULT_OLLAMA_URL
 
 # AgentType and initialize_agent are imported lazily within get_ollama_agent to
 # avoid raising ImportError on module import when langchain is missing.  See
@@ -86,7 +87,7 @@ def get_ollama_agent(
     # Determine the base URL for the Ollama server.  Users can override this
     # via the function argument or the OLLAMA_URL environment variable.
     if base_url is None:
-        base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        base_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
     # Ensure the required dependencies are available.  We lazily import
     # AgentType and initialize_agent to allow this module to be imported
     # without langchain installed.  The chat model is also optional.

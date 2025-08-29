@@ -6,4 +6,4 @@ The contents of this file are intentionally minimal to allow importing
 submodules without side effects.
 """
 
-__all__ = []
+__all__ = []  # package moved under src/ layout

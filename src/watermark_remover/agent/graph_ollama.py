@@ -16,6 +16,7 @@ import os
 import json
 import urllib.request
 from typing import Any, Dict
+from config.settings import DEFAULT_OLLAMA_URL, DEFAULT_OLLAMA_MODEL
 
 
 def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
@@ -74,8 +75,8 @@ def run_instruction(instruction: str) -> str:
             "No instruction provided. Please supply a natural‑language task "
             "for the agent to perform."
         )
-    base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
+    base_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
     diag = _ping_ollama(base_url, model)
     if not diag.get("ok", False):
         return f"Cannot reach Ollama at {base_url}: {diag.get('error', 'Unknown error')}"

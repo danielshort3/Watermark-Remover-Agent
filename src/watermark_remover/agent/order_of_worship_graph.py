@@ -24,6 +24,8 @@ Toggle console+file debugging:
 
 from __future__ import annotations
 
+# Note: this module was moved under the src/ layout for a cleaner structure.
+
 import re
 import os
 import json
@@ -556,7 +558,12 @@ def _determine_order_folder_from_pdf(state: Dict[str, Any], pdf_path: str) -> st
 
 
 def _ensure_order_pdf_copied(state: Dict[str, Any]) -> None:
-    """Copy the source order-of-worship PDF into output/orders/<date>/00_<date>_Order.pdf."""
+    """Copy the source order-of-worship PDF into output/orders/<date>/
+    with filename pattern: 00_<Month>_<DD>_<YYYY>_Order_Of_Worship.pdf.
+
+    Example: for 08_31_2025 the file becomes
+    00_August_31_2025_Order_Of_Worship.pdf
+    """
     try:
         pdf_name = (state.get("pdf_name") or "").strip()
         if not pdf_name:
@@ -575,7 +582,24 @@ def _ensure_order_pdf_copied(state: Dict[str, Any]) -> None:
 
         orders_root = Path(os.getcwd()) / "output" / "orders" / date_folder
         orders_root.mkdir(parents=True, exist_ok=True)
-        target = orders_root / f"00_{date_folder}_Order.pdf"
+        # Build pretty filename using Month name if date_folder is MM_DD_YYYY
+        try:
+            import re as _re
+            import calendar as _cal
+            m = _re.fullmatch(r"(?P<m>\d{1,2})_(?P<d>\d{1,2})_(?P<y>\d{4})", date_folder)
+            if m:
+                month_num = int(m.group("m"))
+                day_num = int(m.group("d"))
+                year_num = int(m.group("y"))
+                month_name = _cal.month_name[month_num] if 1 <= month_num <= 12 else str(month_num)
+                pretty = f"{month_name}_{day_num:02d}_{year_num:04d}"
+            else:
+                # Fallback: just use the folder name
+                pretty = date_folder
+        except Exception:
+            pretty = date_folder
+
+        target = orders_root / f"00_{pretty}_Order_Of_Worship.pdf"
 
         if not target.exists():
             import shutil as _shutil
@@ -1047,7 +1071,7 @@ def init_loop_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure derived order folder is computed once
     try:
         new_state["_date_folder"] = _get_order_folder(new_state)
-        # Ensure 00_{date}_Order.pdf exists in output/orders/<date>
+        # Ensure 00_<Month>_<DD>_<YYYY>_Order_Of_Worship.pdf exists in output/orders/<date>
         try:
             _ensure_order_pdf_copied(new_state)
         except Exception as e:

@@ -7,6 +7,7 @@ instrument/key combinations when a requested key is unavailable.  The
 agent uses these helpers to offer intelligent fallbacks when scraping
 sheet music.  See the original project for full context.
 """
+ # Moved to src/utils for better project structure.
 
 from typing import List, Dict, Tuple
 

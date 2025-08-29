@@ -14,6 +14,7 @@ channel (grayscale) images sized to 792×612 pixels.  All model
 operations clamp outputs into the [0, 1] range to produce valid
 images.
 """
+ # Moved under src/models to align with src-based layout.
 
 from __future__ import annotations
 
