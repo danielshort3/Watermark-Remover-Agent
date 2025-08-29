@@ -86,26 +86,18 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
         for i, c in enumerate(candidates):
             t = str(c.get("title", "")).strip()
             a = str(c.get("artist", "") or "").strip()
-            items.append(f"{i}: TITLE='{t}' | ARTIST='{a}'")
+            meta = str((c.get("meta") or c.get("text3") or "")).strip()
+            items.append({"i": i, "title": t, "artist": a, "meta": meta})
         req_artist = "" if _is_default_arrangement(artist) else (artist or "")
         instr = (
-            "You are matching a hymn/worship song search result to a requested song. "
-            "Pick the SINGLE best index (0-based) from the list. "
-            "Rules: "
-            "1) Exact title match beats partials. "
-            "2) If an artist is provided, prefer that artist (ignore 'default arrangement'). "
-            "3) Prefer common worship arrangements over covers. "
-            "4) If unsure, choose the most likely canonical version. "
-            "Return ONLY JSON like {\"index\": <int>, \"confidence\": <float>}."
+            "You are matching hymn/worship song search results to a user request.\n"
+            "Choose the SINGLE best candidate by index.\n"
+            "Rules: 1) Exact title match beats partials. 2) If an artist is provided, prefer it (ignore 'default arrangement').\n"
+            "3) Prefer canonical worship arrangements over covers/lead sheets/scores. 4) Break ties by most common worship usage.\n"
+            "Return STRICT JSON: {\"index\": <int>, \"confidence\": <float 0..1>, \"reason\": \"short\"}."
         )
         prompt = (
-            f"""{instr}
-Requested Title: {title}
-Requested Artist: {req_artist or 'N/A'}
-
-CANDIDATES:
-{chr(10).join(items)}
-"""
+            f"{instr}\nRequested Title: {title}\nRequested Artist: {req_artist or 'N/A'}\nCANDIDATES: {items}\n"
         )
         raw = _llm_run_instruction(prompt)  # type: ignore
         s = str(raw).strip()
@@ -119,16 +111,56 @@ CANDIDATES:
                 obj = _json.loads(m.group(0))
             except Exception:
                 obj = None
+        # Try nested action_input structure. It may be a dict or a JSON string.
+        if isinstance(obj, dict) and "index" not in obj and "action_input" in obj:
+            ai = obj.get("action_input")
+            if isinstance(ai, dict):
+                try:
+                    idx = int(ai.get("index"))
+                    if 0 <= idx < len(candidates):
+                        return idx
+                except Exception:
+                    pass
+            if isinstance(ai, str):
+                # Attempt to parse the string as JSON
+                try:
+                    ai_obj = _json.loads(ai)
+                    if isinstance(ai_obj, dict) and "index" in ai_obj:
+                        idx = int(ai_obj.get("index"))
+                        if 0 <= idx < len(candidates):
+                            return idx
+                except Exception:
+                    # Regex fallback to capture "index": <int>
+                    m_idx = _re.search(r'"index"\s*:\s*(\d+)', ai)
+                    if m_idx:
+                        try:
+                            idx = int(m_idx.group(1))
+                            if 0 <= idx < len(candidates):
+                                return idx
+                        except Exception:
+                            pass
+        # Direct top-level index handling
         if isinstance(obj, dict) and "index" in obj:
-            idx = int(obj.get("index"))
+            try:
+                idx = int(obj.get("index"))
+            except Exception:
+                idx = -1
             if 0 <= idx < len(candidates):
+                try:
+                    conf = float(obj.get("confidence", 0.0))
+                except Exception:
+                    conf = 0.0
+                reason = str(obj.get("reason", ""))
+                try:
+                    logger.info(
+                        "LLM_CANDIDATE_CHOICE index=%s confidence=%.2f reason=%s", idx, conf, reason,
+                        extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                    )
+                except Exception:
+                    pass
                 return idx
-        # Fallback: find first integer in text
-        m2 = _re.search(r"(\d+)", s)
-        if m2:
-            idx = int(m2.group(1))
-            if 0 <= idx < len(candidates):
-                return idx
+        # Avoid naive "first integer" fallback that can pick 1 from confidence 1.0
+        # Instead, if we cannot parse an index, return None so heuristics handle ordering.
     except Exception:
         return None
     return None
@@ -147,30 +179,14 @@ def _normalize_instrument_name(name: str) -> str:
     # Remove punctuation
     s = _re.sub(r"[^a-z0-9\s/+-]", " ", s)
     s = _re.sub(r"\s+", " ", s).strip()
-    # Canonical buckets
-    synonyms = {
-        "frenchhorn": [
-            "horn", "f horn", "french horn", "horn in f", "horn in f 1", "horn in f 2",
-            "horn 1", "horn 2", "horn 1 2", "horn in f 1/2", "f horn 1/2", "horn in f 1 & 2"
-        ],
-        "trumpet": ["trumpet", "trumpets", "bb trumpet", "trumpet 1", "trumpet 2", "trumpet 3", "trumpet 1 2"],
-        "trombone": ["trombone", "trombones", "trombone 1", "trombone 2", "trombone 3"],
-        "tuba": ["tuba", "bass tuba"],
-        "tenorsax": ["tenor sax", "tenor saxophone", "bb tenor sax"],
-        "altosax": ["alto sax", "alto saxophone", "eb alto sax"],
-        "barisax": ["bari sax", "baritone sax", "baritone saxophone", "eb baritone sax"],
-        "euphonium": ["euphonium", "baritone (bc)", "baritone (tc)", "baritone treble clef"],
-        "cornet": ["cornet"],
-        "flugelhorn": ["flugelhorn"],
-        "clarinet": ["clarinet", "bb clarinet"],
-        # Exclude woodwinds like flute/violin later via allowlist
-    }
-    for canon, alts in synonyms.items():
+    # Canonical buckets (dynamic via INSTRUMENT_SYNONYMS)
+    synonyms = INSTRUMENT_SYNONYMS
+    for canon, alts in list(synonyms.items()):
         for alt in alts:
             if s == alt:
                 return canon
     # Substring detection
-    for canon, alts in synonyms.items():
+    for canon, alts in list(synonyms.items()):
         for alt in alts:
             if alt in s:
                 return canon
@@ -197,19 +213,51 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
             except Exception:
                 return (s or "").strip().lower()
 
-        indexed = [{"i": i, "label": lab, "canon": _canon(lab)} for i, lab in enumerate(available)]
         req_canon = _canon(requested_instrument)
+        # Restrict options to those matching the requested canonical instrument when possible
+        canon_matched = [lab for lab in available if _canon(lab) == req_canon]
+        # If no canonical matches, conditionally filter out non-part categories only when user asked
+        # for an instrumental part (e.g., horn/trumpet/sax). If the user asked for piano/choir/score,
+        # we keep those labels.
+        if req_canon in INSTRUMENTAL_PART_CANONS:
+            bad_terms = ["piano", "vocal", "choir", "lyrics", "score", "conductor", "sheet"]
+            fallback_filtered = [lab for lab in available if all(bt not in lab.lower() for bt in bad_terms)] or available
+        else:
+            fallback_filtered = available
+        options_source = canon_matched if canon_matched else fallback_filtered
+
+        # If exactly one canonical match exists, choose it deterministically
+        if len(canon_matched) == 1:
+            try:
+                logger.info(
+                    "INSTRUMENT_CANONICAL_AUTO label=%s", canon_matched[0],
+                    extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                )
+            except Exception:
+                pass
+            return canon_matched[0]
+
+        indexed = [{"i": i, "label": lab, "canon": _canon(lab)} for i, lab in enumerate(options_source)]
+
+        if req_canon in INSTRUMENTAL_PART_CANONS:
+            rules_extra = (
+                "- Prefer sectioned labels (e.g., '1/2', '1 & 2') when multiple horn options exist.\n"
+                "- DO NOT choose generic or choral/piano options unless the request was for those.\n"
+            )
+        else:
+            rules_extra = (
+                "- If the request is 'Piano/Vocal' or 'Choir', you may choose those exact categories.\n"
+            )
 
         prompt = (
             "You are selecting an instrument option from a dropdown.\n"
             f"Requested instrument (raw): {requested_instrument}\n"
             f"Requested instrument (canonical): {req_canon}\n"
-            "Options (choose EXACTLY one by index or label):\n"
+            "Options (choose EXACTLY one by index or label; you MUST select a label whose canonical form equals the requested canonical if present):\n"
             f"{indexed}\n"
             "Rules:\n"
-            "- Match by canonical form and common synonyms (e.g., 'frenchhorn' ~ 'horn in f').\n"
-            "- Prefer sectioned labels (e.g., '1/2', '1 & 2') when multiple horn options exist.\n"
-            "- Avoid 'cover', 'lead sheet', 'score' if present.\n"
+            "- STRICT: Only select a label whose canonical form equals requested canonical when such labels exist.\n"
+            f"{rules_extra}"
             "- Return STRICT JSON as either {\"index\": <int>} or {\"label\": \"<exact option label>\"}."
         )
 
@@ -231,12 +279,34 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
                 obj = None
             if isinstance(obj, dict):
                 v = obj.get("label") or obj.get("choice")
-                if isinstance(v, str) and v in available:
+                if isinstance(v, str) and v in options_source:
                     sel_label = v
                 i = obj.get("index")
+                if i is None and isinstance(obj.get("action_input"), dict):
+                    try:
+                        i = obj["action_input"].get("index")
+                    except Exception:
+                        i = None
                 try:
-                    if isinstance(i, int) and 0 <= i < len(available):
+                    if isinstance(i, int) and 0 <= i < len(options_source):
                         sel_index = i
+                except Exception:
+                    pass
+                # Optional telemetry
+                try:
+                    conf = float(obj.get("confidence", 0.0)) if isinstance(obj.get("confidence", None), (int, float)) else 0.0
+                except Exception:
+                    conf = 0.0
+                reason = str(obj.get("reason", ""))
+                try:
+                    logger.info(
+                        "LLM_INSTRUMENT_CHOICE index=%s label=%s confidence=%.2f reason=%s",
+                        sel_index if sel_index is not None else "",
+                        sel_label if sel_label is not None else "",
+                        conf,
+                        reason,
+                        extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                    )
                 except Exception:
                     pass
 
@@ -253,7 +323,7 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
                     pass
         # If only an index was recovered
         if sel_index is not None:
-            return available[sel_index]
+            return options_source[sel_index]
         # If a label was recovered but not exactly matched, do a canonical pass
         if sel_label is not None and sel_label not in available:
             sel_canon = _canon(sel_label)
@@ -311,8 +381,28 @@ def _choose_best_key_with_llm(requested_key: str, available_labels: list[str]) -
                 obj = None
         if isinstance(obj, dict):
             label = (obj.get("label") or obj.get("key") or "").strip()
+            try:
+                conf = float(obj.get("confidence", 0.0)) if isinstance(obj.get("confidence", None), (int, float)) else 0.0
+            except Exception:
+                conf = 0.0
+            reason = str(obj.get("reason", ""))
             if label in available_labels:
+                try:
+                    logger.info(
+                        "LLM_KEY_CHOICE label=%s confidence=%.2f reason=%s", label, conf, reason,
+                        extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                    )
+                except Exception:
+                    pass
                 return label
+            # Also accept nested action_input style: {"action":"Final Answer", "action_input":{"label": "..."}}
+            try:
+                ai = obj.get("action_input") if isinstance(obj.get("action_input"), dict) else None
+                ai_label = (ai.get("label") or ai.get("key") or "").strip() if ai else ""
+                if ai_label and ai_label in available_labels:
+                    return ai_label
+            except Exception:
+                pass
         # As fallback, if the response is exactly one of the labels
         for lab in available_labels:
             if lab == s or lab in s:
@@ -813,6 +903,70 @@ except Exception:
     # Best‑effort: if we cannot set up file logging, continue silently
     pass
 
+# ---------------------------------------------------------------------------
+# Instrument synonym mapping (dynamic)
+# ---------------------------------------------------------------------------
+
+# Base synonyms; extend at runtime as new variants are observed.
+INSTRUMENT_SYNONYMS: dict[str, list[str]] = {
+    "frenchhorn": [
+        "horn", "f horn", "french horn", "horn in f", "horn in f 1", "horn in f 2",
+        "horn 1", "horn 2", "horn 1 2", "horn in f 1/2", "f horn 1/2", "horn in f 1 & 2",
+        "french horn 1/2", "horn 1 & 2",
+    ],
+    "trumpet": ["trumpet", "trumpets", "bb trumpet", "trumpet 1", "trumpet 2", "trumpet 3", "trumpet 1 2"],
+    "trombone": ["trombone", "trombones", "trombone 1", "trombone 2", "trombone 3"],
+    "tuba": ["tuba", "bass tuba"],
+    "tenorsax": ["tenor sax", "tenor saxophone", "bb tenor sax"],
+    "altosax": ["alto sax", "alto saxophone", "eb alto sax"],
+    "barisax": ["bari sax", "baritone sax", "baritone saxophone", "eb baritone sax"],
+    "euphonium": ["euphonium", "baritone (bc)", "baritone (tc)", "baritone treble clef"],
+    "cornet": ["cornet"],
+    "flugelhorn": ["flugelhorn"],
+    "clarinet": ["clarinet", "bb clarinet"],
+    # Non-brass/woodwind categories that may be explicitly requested by the user
+    "pianovocal": ["piano/vocal", "piano vocal", "piano/vocal (satb)", "piano/vocal satb", "piano vocal satb"],
+    "choirvocals": ["choir vocals", "choir vocals (satb)", "satb", "choir"],
+    "rhythmchart": ["rhythm chart", "rhythm"],
+    "pianosheet": ["piano sheet"],
+    "score": ["score", "conductor's score", "conductor", "full score"],
+    "lyrics": ["lyrics", "lead sheet", "lead sheets"],
+}
+
+# Canon groups that represent individual transposing/reading instruments where we should
+# avoid selecting choral/piano/score options unless explicitly requested.
+INSTRUMENTAL_PART_CANONS: set[str] = {
+    "frenchhorn", "trumpet", "trombone", "tuba",
+    "altosax", "tenorsax", "barisax",
+    "clarinet", "euphonium", "cornet", "flugelhorn",
+}
+
+def _learn_instrument_synonym(user_label: str, chosen_label: str) -> None:
+    """Record a dynamic synonym mapping from the user's input to the chosen label's canon.
+
+    This lets future runs resolve the user term to the right canonical bucket.
+    """
+    try:
+        canon = _normalize_instrument_name(chosen_label)
+        if not canon:
+            return
+        raw = (user_label or "").strip().lower()
+        if not raw:
+            return
+        # Avoid adding duplicates
+        bucket = INSTRUMENT_SYNONYMS.setdefault(canon, [])
+        if raw not in bucket:
+            bucket.append(raw)
+            try:
+                logger.info(
+                    "LEARNED_INSTRUMENT_SYNONYM canon=%s new_synonym=%s", canon, raw,
+                    extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 @tool
 def scrape_music(
@@ -1004,7 +1158,10 @@ def scrape_music(
             safe_title,
             safe_artist,
             safe_key,
-            safe_instrument,
+            # Use the SELECTED instrument (set by _scrape_with_selenium) if available;
+            # fall back to the requested instrument. This avoids creating both
+            # 'French_Horn' and 'French_Horn_1_2' folders for the same song.
+            _sanitize(SCRAPE_METADATA.get('instrument') or instrument),
         )
         original_dir_final = os.path.join(instrument_dir, "1_original")
         os.makedirs(original_dir_final, exist_ok=True)
@@ -1836,7 +1993,12 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             parts_buttons = SeleniumHelper.find_elements(
                 driver, XPATHS['parts_list'], timeout=5, log_func=logger.debug
             )
-        # Populate available instruments excluding covers and lead sheets
+        # Determine the canonical form of the requested instrument for conditional filtering
+        try:
+            req_canon = _normalize_instrument_name(instrument)
+        except Exception:
+            req_canon = (instrument or "").strip().lower()
+        # Populate available instruments; exclude non-part categories only when the user requested an instrumental part
         for btn in parts_buttons:
             try:
                 part_text = btn.text.strip()
@@ -1845,8 +2007,19 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             if not part_text:
                 continue
             lower = part_text.lower()
-            if 'cover' in lower or 'lead sheet' in lower:
-                continue
+            if req_canon in INSTRUMENTAL_PART_CANONS:
+                if (
+                    'cover' in lower
+                    or 'lead sheet' in lower
+                    or 'piano/vocal' in lower
+                    or 'choir' in lower
+                    or "conductor's score" in lower
+                    or 'conductor' in lower
+                    or 'score' in lower
+                    or 'lyrics' in lower
+                    or 'piano sheet' in lower
+                ):
+                    continue
             if part_text not in available_instruments:
                 available_instruments.append(part_text)
         # Determine the most appropriate instrument selection
@@ -1876,6 +2049,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     if btn_text.strip() == selected_instrument.strip():
                         if _robust_click(btn):
                             clicked_any = True
+                            try:
+                                _learn_instrument_synonym(instrument, selected_instrument)
+                            except Exception:
+                                pass
                             break
                 # Fallback: canonical match if exact label didn't match
                 if not clicked_any:
@@ -1891,6 +2068,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                             if _normalize_instrument_name(bt) == sel_canon:
                                 if _robust_click(btn):
                                     clicked_any = True
+                                    try:
+                                        _learn_instrument_synonym(instrument, selected_instrument)
+                                    except Exception:
+                                        pass
                                     break
                     except Exception:
                         pass
@@ -1901,6 +2082,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                 try:
                     if (btn.text or '').strip() == selected_instrument:
                         if _robust_click(btn):
+                            try:
+                                _learn_instrument_synonym(instrument, selected_instrument)
+                            except Exception:
+                                pass
                             break
                 except Exception:
                     continue
