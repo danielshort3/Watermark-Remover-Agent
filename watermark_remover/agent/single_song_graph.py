@@ -40,7 +40,7 @@ try:
 except Exception:
     ChatOllama = None  # type: ignore
 
-from watermark_remover.tools import (
+from watermark_remover.agent.tools import (
     scrape_music,
     remove_watermark,
     upscale_images,

@@ -22,14 +22,6 @@ model (e.g. `qwen3:30b`) to decide which tool to call and when.
   ollama pull qwen3:30b
   ```
 
-* **PDF text extraction**: The order-of-worship workflow reads text
-  from input PDFs.  Install `pdfminer.six` (in addition to `PyPDF2`,
-  which is already required) for more robust parsing:
-
-  ```bash
-  pip install pdfminer.six
-  ```
-
 ## Building the image
 
 The heavy dependencies (torch, torchvision, pytorch‑msssim, opencv,
@@ -75,7 +67,7 @@ agent = get_ollama_agent(model_name="qwen3:30b")
 
 # Ask the agent to download some sheet music, remove the watermark,
 # upscale it and assemble a PDF.  The agent will call the appropriate
-# tools defined in ``watermark_remover.tools``.
+# tools defined in watermark_remover.agent.tools.
 response = agent.invoke({"input": "Download Fur Elise sheet music, remove the watermark, upscale it, and assemble into a PDF."})
 print(response)
 ```
@@ -93,13 +85,44 @@ print(result)
 Both methods return a string with the result or a diagnostic error if
 the Ollama server cannot be reached or the model is missing.
 
-## Notes on scraping
+## Notes on scraping and key selection
 
-The `scrape_music` tool relies on Selenium to fetch preview images from
-PraiseCharts.  If the requested piece cannot be retrieved—for example due
-to missing browser dependencies or network access—the tool raises
-`FileNotFoundError`.  You can customise the scraping behaviour by
-modifying `_scrape_with_selenium` in `watermark_remover/tools/scrape.py`.
+The `scrape_music` tool has been extended beyond a stub.  Its search
+strategy is now:
+
+1. **Local search:** It looks under `data/samples` for a directory whose
+   name contains the requested `title` (case insensitive).  Each
+   subdirectory within that title is treated as a key or arrangement.
+   If the requested `key` is present, that folder is returned.
+2. **Transposition suggestions:** If the title exists but the key
+   doesn’t, the tool computes direct and closest alternatives using the
+   transposition helpers from `watermark_remover.utils.transposition_utils`.
+   It raises a `ValueError` with a helpful message containing the
+   available keys and suggested instrument/key combinations.  The
+   LangChain agent can interpret this message and ask the user whether an
+   alternate key or instrument would work.
+3. **Online scraping:** If no title is found locally, the tool
+   automatically uses Selenium to search PraiseCharts for the piece,
+   click the first result, iterate through the preview images, download
+   them via HTTP and save them into
+   `data/samples/<sanitized_title>/<norm_key>`.  The provided
+   `Dockerfile` now automatically downloads and installs the most
+   recent stable Google Chrome binary and its dependencies at build
+   time.  This means Selenium can run a headless Chrome browser out
+   of the box without requiring you to mount a browser from the host.
+   If you prefer to use a different browser (such as Chromium or
+   Firefox) you can modify the Dockerfile accordingly.  Should the
+   scraping logic fail for any reason (e.g. no network connectivity or
+   website changes), `_scrape_with_selenium` returns `None` and
+   `scrape_music` falls back to raising a `FileNotFoundError`.
+
+If you wish to refine the scraping logic—such as selecting specific
+instruments, keys or orchestration parts—you can extend
+`_scrape_with_selenium` in `watermark_remover/agent/tools.py`.  The
+current implementation downloads whatever preview images are available
+for the first search result.  See the original
+**Watermark‑Remover** repository’s `download/` and `threads/` modules for
+detailed examples.
 
 ## Model weights
 

@@ -2,7 +2,7 @@
 
 This module exposes a simple function that constructs a LangChain agent
 powered by a local Ollama model (such as ``qwen3:30b``) and a set of tools
-defined in :mod:`watermark_remover.tools`.  The agent can reason
+defined in :mod:`watermark_remover.agent.tools`.  The agent can reason
 about user instructions in natural language and decide when to call
 individual tools like ``scrape_music``, ``remove_watermark``, ``upscale_images``
 or ``assemble_pdf``.  For example, a user might ask the agent to
@@ -40,7 +40,7 @@ try:
 except Exception:
     ChatOllama = None  # type: ignore
 
-from watermark_remover.tools import (
+from watermark_remover.agent.tools import (
     scrape_music,
     remove_watermark,
     upscale_images,

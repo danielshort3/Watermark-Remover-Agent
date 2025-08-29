@@ -13,9 +13,8 @@ requests
 pytest
 numpy
 
-# PDF parsing dependencies for the order-of-worship graph
+# PDF parsing dependency for the order-of-worship graph
 PyPDF2
-pdfminer.six
 
 # Additional packages required for LangGraph support.  The ``langgraph`` package
 # provides the core graph abstractions while ``langgraph-cli`` installs the

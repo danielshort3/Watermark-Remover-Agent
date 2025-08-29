@@ -50,7 +50,7 @@ except Exception:
 from langgraph.graph import StateGraph, START, END
 
 # Import tools and utilities from your project
-from watermark_remover.tools import sanitize_title, SCRAPE_METADATA, TEMP_DIRS
+from watermark_remover.agent.tools import sanitize_title, SCRAPE_METADATA, TEMP_DIRS
 
 
 def _iter_temp_dirs():
@@ -67,7 +67,7 @@ def _iter_temp_dirs():
     except Exception:
         it = []
     return [p for p in it if isinstance(p, str)]
-from watermark_remover.tools import (
+from watermark_remover.agent.tools import (
     scrape_music,
     remove_watermark,
     upscale_images,
