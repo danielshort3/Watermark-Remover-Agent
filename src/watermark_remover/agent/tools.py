@@ -1152,12 +1152,19 @@ def scrape_music(
             return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
         safe_title = _sanitize(title_meta)
         safe_artist = _sanitize(artist_meta)
-        # Build the instrument directory under the log root using ACTUAL selected metadata
+        # Build the instrument directory under the log root using ACTUAL selected metadata.
+        # Important: use the key chosen by the scraper (if available), not the originally
+        # requested key. This ensures folder names reflect the final selection.
+        try:
+            actual_key_for_logs = SCRAPE_METADATA.get('key') or key
+        except Exception:
+            actual_key_for_logs = key
+        safe_key_for_logs = _sanitize(actual_key_for_logs or 'unknown')
         instrument_dir = os.path.join(
             log_root,
             safe_title,
             safe_artist,
-            safe_key,
+            safe_key_for_logs,
             # Use the SELECTED instrument (set by _scrape_with_selenium) if available;
             # fall back to the requested instrument. This avoids creating both
             # 'French_Horn' and 'French_Horn_1_2' folders for the same song.
