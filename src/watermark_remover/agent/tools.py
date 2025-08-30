@@ -167,6 +167,45 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
 
 
 
+def _llm_error_doctor(context: dict) -> dict | None:
+    """Ask local LLM for a recovery action when a Selenium step fails.
+
+    Expects a small context dict. Returns a dict like:
+    {"action": "wait_longer|scroll_to_key_button|refresh_page|open_parts_then_key|back_to_results|scroll_to_orchestration|click_chords_then_orchestration|scroll_to_image|scroll_to_next_button|reopen_orchestration", "why": "..."}
+    """
+    if _llm_run_instruction is None:
+        return None
+    try:
+        import json as _json
+        prompt = (
+            "You are an automation error doctor for a sheet-music site.\n"
+            "Given the failure context, choose ONE recovery action that is most likely to succeed.\n"
+            "Allowed actions: wait_longer, scroll_to_key_button, refresh_page, open_parts_then_key, back_to_results, scroll_to_orchestration, click_chords_then_orchestration, scroll_to_image, scroll_to_next_button, reopen_orchestration.\n"
+            "Return STRICT JSON: {\"action\": <one>, \"why\": \"short reason\"}.\n\n"
+            f"Context: {_json.dumps(context)[:1800]}\n"
+        )
+        raw = _llm_run_instruction(prompt)  # type: ignore
+        s = str(raw)
+        # Extract first JSON object
+        import re as _re
+        m = _re.search(r"\{.*?\}", s, flags=_re.S)
+        if not m:
+            return None
+        obj = None
+        try:
+            obj = _json.loads(m.group(0))
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        act = str(obj.get("action", "")).strip()
+        if act not in {"wait_longer", "scroll_to_key_button", "refresh_page", "open_parts_then_key", "back_to_results", "scroll_to_orchestration", "click_chords_then_orchestration", "scroll_to_image", "scroll_to_next_button", "reopen_orchestration"}:
+            return None
+        return {"action": act, "why": str(obj.get("why", ""))}
+    except Exception:
+        return None
+
+
 def _normalize_instrument_name(name: str) -> str:
     r"""Normalize an instrument label for comparison.
 
@@ -586,10 +625,30 @@ def _download_alternate_readings_if_helpful(
             order_map = {"brass": 0, "sax": 1, "other": 2}
             ranked = sorted(candidates, key=lambda c: order_map.get(c.get("family", "other"), 2))
         top = ranked[0]
+        # Log advisor decision and persist a small summary alongside downloads
+        try:
+            import json as _json
+            logger.info(
+                "ALTERNATE_PART_ADVISOR choice=%s key=%s why=%s",
+                top.get("instrument", ""), top.get("key", ""), (top.get("why", "") or ""),
+            )
+        except Exception:
+            pass
 
         # Select instrument and key and download pages to alternate folder
         alt_dir = os.path.join(out_root, "alternate_readings", sanitize_title(top.get("instrument", "")), sanitize_title(top.get("key", "")))
         os.makedirs(alt_dir, exist_ok=True)
+        try:
+            import json as _json, time as _t2
+            advice_path = os.path.join(alt_dir, "advisor.json")
+            with open(advice_path, "w", encoding="utf-8") as f:
+                _json.dump({
+                    "selected": {"instrument": top.get("instrument"), "key": top.get("key"), "why": top.get("why")},
+                    "candidates": candidates,
+                    "timestamp": _t2.time(),
+                }, f, indent=2)
+        except Exception:
+            pass
 
         # Ensure we're on the selected instrument/key
         _select_instrument_by_label(top["instrument"])  # type: ignore
@@ -610,11 +669,38 @@ def _download_alternate_readings_if_helpful(
         image_xpath = XPATHS['image_element']
         next_xpath = XPATHS['next_button']
         seen = set()
+        attempted_image_recovery = False
         for _i in range(50):
             try:
                 img_el = wait.until(EC.presence_of_element_located((By.XPATH, image_xpath)))
             except Exception:
-                break
+                if not attempted_image_recovery:
+                    attempted_image_recovery = True
+                    advice = _llm_error_doctor({
+                        "step": "image_wait",
+                        "url": driver.current_url if hasattr(driver, 'current_url') else '',
+                    })
+                    action = advice.get("action") if isinstance(advice, dict) else None
+                    try:
+                        if action == "scroll_to_image":
+                            el = SeleniumHelper.find_element(driver, image_xpath, timeout=2, log_func=None)
+                            if el:
+                                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                _t.sleep(0.3)
+                        elif action == "refresh_page":
+                            driver.refresh()
+                            _t.sleep(1.0)
+                        elif action == "wait_longer":
+                            _t.sleep(1.0)
+                    except Exception:
+                        pass
+                    # retry once
+                    try:
+                        img_el = wait.until(EC.presence_of_element_located((By.XPATH, image_xpath)))
+                    except Exception:
+                        break
+                else:
+                    break
             src = img_el.get_attribute('src')
             if not src:
                 break
@@ -634,7 +720,31 @@ def _download_alternate_readings_if_helpful(
                 nxt.click()
                 _t.sleep(0.2)
             except Exception:
-                break
+                # One-time pagination recovery
+                advice = _llm_error_doctor({
+                    "step": "paginate_next",
+                    "url": driver.current_url if hasattr(driver, 'current_url') else '',
+                })
+                action = advice.get("action") if isinstance(advice, dict) else None
+                try:
+                    if action == "scroll_to_next_button":
+                        el = SeleniumHelper.find_element(driver, next_xpath, timeout=2, log_func=None)
+                        if el:
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                            _t.sleep(0.2)
+                    elif action == "refresh_page":
+                        driver.refresh()
+                        _t.sleep(1.0)
+                    elif action == "wait_longer":
+                        _t.sleep(0.8)
+                except Exception:
+                    pass
+                try:
+                    nxt = wait.until(EC.element_to_be_clickable((By.XPATH, next_xpath)))
+                    nxt.click()
+                    _t.sleep(0.2)
+                except Exception:
+                    break
     except Exception:
         return
 
@@ -1758,21 +1868,61 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                 except Exception:
                     orch_ok = False
                 if not orch_ok:
-                    # Close the tab and switch back to the original search results tab.
+                    # Try LLM-guided recovery to open orchestration before skipping
+                    advice = _llm_error_doctor({
+                        "step": "open_orchestration",
+                        "url": driver.current_url if hasattr(driver, 'current_url') else '',
+                        "title": cand.get('title', 'unknown'),
+                    })
+                    action = advice.get("action") if isinstance(advice, dict) else None
+                    if action:
+                        try:
+                            logger.info(
+                                "ERROR_DOCTOR action=%s why=%s", action, advice.get('why', ''),
+                                extra={"button_text": "", "xpath": XPATHS.get('orchestration_header', ''), "url": driver.current_url, "screenshot": ""},
+                            )
+                        except Exception:
+                            pass
                     try:
-                        driver.close()
+                        if action == "scroll_to_orchestration":
+                            el = SeleniumHelper.find_element(driver, XPATHS['orchestration_header'], timeout=3, log_func=None)
+                            if el:
+                                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                time.sleep(0.3)
+                                orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                        elif action == "click_chords_then_orchestration":
+                            SeleniumHelper.click_element(driver, XPATHS['chords_button'], timeout=5, log_func=logger.debug)
+                            time.sleep(0.4)
+                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                        elif action == "refresh_page":
+                            driver.refresh()
+                            time.sleep(1.0)
+                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                        elif action == "wait_longer":
+                            time.sleep(1.0)
+                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                        elif action == "reopen_orchestration":
+                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                        elif action == "back_to_results":
+                            orch_ok = False
                     except Exception:
                         pass
-                    try:
-                        driver.switch_to.window(original_window)
-                    except Exception:
-                        pass
-                    logger.info(
-                        "SCRAPER: candidate '%s' has no orchestration; skipping",
-                        cand.get('title', 'unknown'),
-                    )
-                    # Skip to the next candidate without re‑running the search.
-                    continue
+                    if not orch_ok:
+                        # Close the tab and switch back to the original search results tab.
+                        try:
+                            driver.close()
+                        except Exception:
+                            pass
+                        try:
+                            driver.switch_to.window(original_window)
+                        except Exception:
+                            pass
+                        logger.info(
+                            "SCRAPER: candidate '%s' has no orchestration; skipping",
+                            cand.get('title', 'unknown'),
+                        )
+                        # Skip to the next candidate without re‑running the search.
+                        continue
                 else:
                     # Orchestration opened successfully in the new tab
                     selected = cand
@@ -1801,24 +1951,91 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
         # gather keys and instruments.
         available_keys: list[str] = []
         selected_key: str | None = None
-        # Open key menu.  If the key menu cannot be opened, skip this candidate
+        # Open key menu.  If opening fails, ask the LLM error doctor once for a recovery.
         key_menu_ok = SeleniumHelper.click_element(
             driver, XPATHS['key_button'], timeout=5, log_func=logger.debug
         )
-        # Random delay to mimic human interaction after opening the key menu
         time.sleep(random.uniform(0.3, 0.8))
         if not key_menu_ok:
-            logger.info(
-                "SCRAPER: unable to open key menu for '%s'; skipping candidate",
-                selected.get('title', title) if selected else title,
-            )
-            # Attempt to go back to search results
+            # Build lightweight context
+            visible_buttons = []
             try:
-                driver.back()
-                time.sleep(1)
+                btns = driver.find_elements(By.TAG_NAME, 'button')  # type: ignore
+                for b in btns[:20]:
+                    try:
+                        t = (b.text or '').strip()
+                        if t:
+                            visible_buttons.append(t)
+                    except Exception:
+                        continue
             except Exception:
                 pass
-            return None
+            ctx = {
+                "step": "open_key_menu",
+                "url": driver.current_url if hasattr(driver, 'current_url') else '',
+                "title": (selected.get('title', title) if selected else title),
+                "visible_buttons": visible_buttons,
+            }
+            advice = _llm_error_doctor(ctx)
+            action = advice.get("action") if isinstance(advice, dict) else None
+            if action:
+                try:
+                    logger.info(
+                        "ERROR_DOCTOR action=%s why=%s", action, advice.get('why', ''),
+                        extra={"button_text": "", "xpath": XPATHS.get('key_button', ''), "url": ctx.get("url", ""), "screenshot": ""},
+                    )
+                except Exception:
+                    pass
+            # Apply action
+            if action == "scroll_to_key_button":
+                try:
+                    el = SeleniumHelper.find_element(driver, XPATHS['key_button'], timeout=3, log_func=None)
+                    if el:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        time.sleep(0.3)
+                        key_menu_ok = SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
+                except Exception:
+                    pass
+            elif action == "open_parts_then_key":
+                try:
+                    SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug)
+                    time.sleep(0.3)
+                    SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug)
+                    time.sleep(0.3)
+                    key_menu_ok = SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
+                except Exception:
+                    pass
+            elif action == "refresh_page":
+                try:
+                    driver.refresh()
+                    time.sleep(1.0)
+                    key_menu_ok = SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
+                except Exception:
+                    pass
+            elif action == "wait_longer":
+                time.sleep(1.2)
+                key_menu_ok = SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
+            elif action == "back_to_results":
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+                try:
+                    driver.switch_to.window(original_window)
+                except Exception:
+                    pass
+                return None
+            if not key_menu_ok:
+                logger.info(
+                    "SCRAPER: unable to open key menu for '%s'; skipping candidate",
+                    selected.get('title', title) if selected else title,
+                )
+                try:
+                    driver.back()
+                    time.sleep(1)
+                except Exception:
+                    pass
+                return None
         # Fetch list items
         key_parent_el = SeleniumHelper.find_element(
             driver, XPATHS['key_parent'], timeout=5, log_func=logger.debug
@@ -2163,7 +2380,33 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
         # Re-open the key menu and re-select the desired/closest key now that the
         # instrument is chosen. Some sites reset the key when the instrument changes.
         try:
-            if SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug):
+            clicked = SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
+            if not clicked:
+                # Ask the doctor for a recovery action to reopen the key menu
+                advice = _llm_error_doctor({
+                    "step": "reopen_key_after_instrument",
+                    "url": driver.current_url if hasattr(driver, 'current_url') else '',
+                    "instrument": selected_instrument or instrument,
+                })
+                action = advice.get("action") if isinstance(advice, dict) else None
+                if action == "open_parts_then_key":
+                    SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug)
+                    time.sleep(0.3)
+                    SeleniumHelper.click_element(driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug)
+                    time.sleep(0.3)
+                elif action == "scroll_to_key_button":
+                    el = SeleniumHelper.find_element(driver, XPATHS['key_button'], timeout=3, log_func=None)
+                    if el:
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        time.sleep(0.3)
+                elif action == "refresh_page":
+                    driver.refresh()
+                    time.sleep(1.0)
+                elif action == "wait_longer":
+                    time.sleep(1.0)
+                # Try again regardless of action
+                SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug)
+            if True:
                 time.sleep(random.uniform(0.2, 0.6))
                 key_parent_el2 = SeleniumHelper.find_element(
                     driver, XPATHS['key_parent'], timeout=5, log_func=logger.debug
