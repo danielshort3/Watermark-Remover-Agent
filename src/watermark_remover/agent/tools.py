@@ -70,12 +70,115 @@ try:
     from watermark_remover.agent.graph_ollama import run_instruction as _llm_run_instruction  # type: ignore
 except Exception:
     _llm_run_instruction = None  # type: ignore
+try:
+    from watermark_remover.agent.prompts import (
+        build_candidate_selection_prompt,
+        build_error_doctor_prompt,
+        build_instrument_selection_prompt,
+        build_key_choice_prompt,
+        build_alternate_readings_ranking_prompt,
+        build_alternate_readings_ranking_prompt,
+        log_prompt,
+        log_prompt,
+        log_llm_response,
+    )
+except Exception:
+    # Defer import issues to runtime paths where they are used
+    build_candidate_selection_prompt = None  # type: ignore
+    build_error_doctor_prompt = None  # type: ignore
+    build_instrument_selection_prompt = None  # type: ignore
+    build_key_choice_prompt = None  # type: ignore
+    build_alternate_readings_ranking_prompt = None  # type: ignore
 
 def _is_default_arrangement(artist: Optional[str]) -> bool:
     if not artist:
         return False
     a = artist.strip().lower()
     return "default" in a and "arrangement" in a
+
+def _normalize_title_for_match(s: str) -> str:
+    """Normalize a song title for exact-ish matching.
+
+    - Lowercase and trim
+    - Remove trailing parenthetical/bracketed segments like "(Simplified)", "[Acoustic]"
+    - Remove trailing " - ..." suffixes (e.g., " - Live", " - Studio Version")
+    - Collapse whitespace
+    """
+    try:
+        import re as _re
+        t = (s or "").strip().lower()
+        # Remove one or more trailing bracketed segments
+        prev = None
+        while prev != t:
+            prev = t
+            t = _re.sub(r"\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*$", "", t)
+        # Remove trailing hyphen suffixes (e.g., " - Live")
+        t = _re.sub(r"\s*-\s+[^-]+$", "", t)
+        # Collapse whitespace
+        t = _re.sub(r"\s+", " ", t).strip()
+        return t
+    except Exception:
+        return (s or "").strip().lower()
+
+def _title_matches_exactish(requested: str, candidate: str) -> bool:
+    """Return True if candidate's MAIN title equals requested after normalization.
+
+    Treats titles like "Amazing Grace (Simplified)" or "Amazing Grace - Live"
+    as exact matches for requested "Amazing Grace". Does not match
+    "This Is Amazing Grace" or "Broken Vessels (Amazing Grace)".
+    """
+    req = _normalize_title_for_match(requested)
+    cand = _normalize_title_for_match(candidate)
+    return req == cand
+
+def _variant_rank(requested: str, candidate: str) -> tuple[int, int]:
+    """Rank how closely a candidate title variant matches the requested main title.
+
+    Lower is better. Returns a tuple (category, penalty_length):
+      0 = exact equality (no extra tokens)
+      1 = arrangement descriptor variant (parenthetical/hyphen) from an allowlist (e.g., 'Simplified', 'Hymn', 'Traditional', 'Hymn Sheet')
+      2 = benign performance descriptor (e.g., 'Live', 'Acoustic', 'Studio')
+      3 = other appended text (likely derivative/retitled), de-prioritized
+    penalty_length is the length of the extra descriptor to break ties (shorter preferred).
+    """
+    raw_req = (requested or "").strip()
+    raw_cand = (candidate or "").strip()
+    req = _normalize_title_for_match(raw_req)
+    # Identify extra descriptor at the end of candidate
+    import re as _re
+    cand_main = raw_cand
+    extra = ""
+    # Extract trailing parenthetical/bracketed first
+    m = _re.search(r"\s*([\(\[\{][^\)\]\}]*[\)\]\}])\s*$", cand_main)
+    if m:
+        extra = m.group(1)
+        cand_main = cand_main[: m.start()].rstrip()
+    # Then hyphen suffix
+    m2 = _re.search(r"\s*-\s+([^\-]+)$", cand_main)
+    if m2 and not extra:
+        extra = m2.group(1)
+        cand_main = cand_main[: m2.start()].rstrip()
+    # Normalize main for comparison
+    cand_main_norm = _normalize_title_for_match(cand_main)
+    if cand_main_norm != req:
+        # Treat as non-exact variant group; assign worst category
+        return (3, len(extra))
+    # Exact equality with no extra
+    if not extra:
+        return (0, 0)
+    # Normalize descriptor text
+    desc = extra.strip().strip("()[]{} ").strip().lower()
+    # Allowlist: arrangement descriptors that keep the composition the same
+    allowlist = {
+        "simplified", "hymn", "traditional", "hymn sheet", "lead sheet", "original key",
+    }
+    benign = {"live", "acoustic", "radio edit", "studio", "demo"}
+    if desc in allowlist:
+        return (1, len(desc))
+    if desc in benign:
+        return (2, len(desc))
+    # Otherwise treat as de-prioritized derivative/retitled variant
+    return (3, len(desc))
 
 def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], candidates: list[dict]) -> int | None:
     if _llm_run_instruction is None:
@@ -89,16 +192,30 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
             meta = str((c.get("meta") or c.get("text3") or "")).strip()
             items.append({"i": i, "title": t, "artist": a, "meta": meta})
         req_artist = "" if _is_default_arrangement(artist) else (artist or "")
-        instr = (
-            "You are matching hymn/worship song search results to a user request.\n"
-            "Choose the SINGLE best candidate by index.\n"
-            "Rules: 1) Exact title match beats partials. 2) If an artist is provided, prefer it (ignore 'default arrangement').\n"
-            "3) Prefer canonical worship arrangements over covers/lead sheets/scores. 4) Break ties by most common worship usage.\n"
-            "Return STRICT JSON: {\"index\": <int>, \"confidence\": <float 0..1>, \"reason\": \"short\"}."
-        )
-        prompt = (
-            f"{instr}\nRequested Title: {title}\nRequested Artist: {req_artist or 'N/A'}\nCANDIDATES: {items}\n"
-        )
+        if build_candidate_selection_prompt is not None:
+            prompt = build_candidate_selection_prompt(title, req_artist, items)
+        else:
+            instr = (
+                "You are matching hymn/worship song search results to a user request.\n"
+                "Choose the SINGLE best candidate by index.\n"
+                "STRICT RULES (highest priority first):\n"
+                "1) Exact title on the MAIN title wins. Treat 'Amazing Grace (Simplified)' or 'Amazing Grace - Live' as exact matches for 'Amazing Grace'.\n"
+                "   Do NOT select titles where the requested phrase is not the MAIN title (e.g., 'This Is Amazing Grace', 'Broken Vessels (Amazing Grace)').\n"
+                "2) If an artist is provided, prefer it (ignore 'default arrangement').\n"
+                "3) Prefer canonical worship arrangements over covers/lead sheets/scores.\n"
+                "4) Break ties by most common worship usage.\n"
+                "Return STRICT JSON: {\"index\": <int>, \"confidence\": <float 0..1>, \"reason\": \"short\"}."
+            )
+            prompt = (
+                f"{instr}\nRequested Title: {title}\nRequested Artist: {req_artist or 'N/A'}\nCANDIDATES: {items}\n"
+            )
+        try:
+            if 'amazing grace' in (title or '').lower():
+                # example conditional; log all prompts regardless
+                pass
+            log_prompt("candidate_selection", prompt)
+        except Exception:
+            pass
         raw = _llm_run_instruction(prompt)  # type: ignore
         s = str(raw).strip()
         # Try to extract JSON block
@@ -118,6 +235,14 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
                 try:
                     idx = int(ai.get("index"))
                     if 0 <= idx < len(candidates):
+                        # Enforce exact-ish title preference if applicable
+                        try:
+                            req_t = (title or "").strip()
+                            exact_idxs = [j for j, c in enumerate(candidates) if _title_matches_exactish(req_t, str(c.get("title", "")))]
+                            if exact_idxs and idx not in exact_idxs:
+                                idx = exact_idxs[0]
+                        except Exception:
+                            pass
                         return idx
                 except Exception:
                     pass
@@ -128,6 +253,14 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
                     if isinstance(ai_obj, dict) and "index" in ai_obj:
                         idx = int(ai_obj.get("index"))
                         if 0 <= idx < len(candidates):
+                            # Enforce exact-ish title preference if applicable
+                            try:
+                                req_t = (title or "").strip()
+                                exact_idxs = [j for j, c in enumerate(candidates) if _title_matches_exactish(req_t, str(c.get("title", "")))]
+                                if exact_idxs and idx not in exact_idxs:
+                                    idx = exact_idxs[0]
+                            except Exception:
+                                pass
                             return idx
                 except Exception:
                     # Regex fallback to capture "index": <int>
@@ -136,6 +269,14 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
                         try:
                             idx = int(m_idx.group(1))
                             if 0 <= idx < len(candidates):
+                                # Enforce exact-ish title preference if applicable
+                                try:
+                                    req_t = (title or "").strip()
+                                    exact_idxs = [j for j, c in enumerate(candidates) if _title_matches_exactish(req_t, str(c.get("title", "")))]
+                                    if exact_idxs and idx not in exact_idxs:
+                                        idx = exact_idxs[0]
+                                except Exception:
+                                    pass
                                 return idx
                         except Exception:
                             pass
@@ -146,6 +287,17 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
             except Exception:
                 idx = -1
             if 0 <= idx < len(candidates):
+                # Enforce exact-ish title preference and variant ranking among exact-ish
+                try:
+                    req_t = (title or "").strip()
+                    exact_idxs = [i for i, c in enumerate(candidates) if _title_matches_exactish(req_t, str(c.get("title", "")))]
+                    if exact_idxs:
+                        # Top-ranked exact-ish by variant rank
+                        top_exact = sorted(exact_idxs, key=lambda i2: _variant_rank(req_t, str(candidates[i2].get("title", ""))))[0]
+                        if idx not in exact_idxs or idx != top_exact:
+                            idx = top_exact
+                except Exception:
+                    pass
                 try:
                     conf = float(obj.get("confidence", 0.0))
                 except Exception:
@@ -177,14 +329,30 @@ def _llm_error_doctor(context: dict) -> dict | None:
         return None
     try:
         import json as _json
-        prompt = (
+        prompt = build_error_doctor_prompt(context) if build_error_doctor_prompt else (
             "You are an automation error doctor for a sheet-music site.\n"
             "Given the failure context, choose ONE recovery action that is most likely to succeed.\n"
             "Allowed actions: wait_longer, scroll_to_key_button, refresh_page, open_parts_then_key, back_to_results, scroll_to_orchestration, click_chords_then_orchestration, scroll_to_image, scroll_to_next_button, reopen_orchestration.\n"
             "Return STRICT JSON: {\"action\": <one>, \"why\": \"short reason\"}.\n\n"
             f"Context: {_json.dumps(context)[:1800]}\n"
         )
+        try:
+            log_prompt("error_doctor", prompt)
+        except Exception:
+            pass
         raw = _llm_run_instruction(prompt)  # type: ignore
+        try:
+            log_llm_response("instrument_selection", raw)
+        except Exception:
+            pass
+        try:
+            log_llm_response("error_doctor", raw)
+        except Exception:
+            pass
+        try:
+            log_llm_response("candidate_selection", raw)
+        except Exception:
+            pass
         s = str(raw)
         # Extract first JSON object
         import re as _re
@@ -255,6 +423,32 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
         req_canon = _canon(requested_instrument)
         # Restrict options to those matching the requested canonical instrument when possible
         canon_matched = [lab for lab in available if _canon(lab) == req_canon]
+        # If one or more canonical matches exist, choose deterministically to avoid LLM dithering
+        if canon_matched:
+            # Prefer sectioned horn labels and common numbering if present
+            prefs = ["1/2", "1 & 2", "1 2", "1", "2", "3"]
+            for p in prefs:
+                for lab in canon_matched:
+                    try:
+                        if p in lab:
+                            try:
+                                logger.info(
+                                    "INSTRUMENT_CANONICAL_AUTO label=%s", lab,
+                                    extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                                )
+                            except Exception:
+                                pass
+                            return lab
+                    except Exception:
+                        continue
+            try:
+                logger.info(
+                    "INSTRUMENT_CANONICAL_AUTO label=%s", canon_matched[0],
+                    extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+                )
+            except Exception:
+                pass
+            return canon_matched[0]
         # If no canonical matches, conditionally filter out non-part categories only when user asked
         # for an instrumental part (e.g., horn/trumpet/sax). If the user asked for piano/choir/score,
         # we keep those labels.
@@ -266,15 +460,7 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
         options_source = canon_matched if canon_matched else fallback_filtered
 
         # If exactly one canonical match exists, choose it deterministically
-        if len(canon_matched) == 1:
-            try:
-                logger.info(
-                    "INSTRUMENT_CANONICAL_AUTO label=%s", canon_matched[0],
-                    extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
-                )
-            except Exception:
-                pass
-            return canon_matched[0]
+        # Note: len(canon_matched) == 1 handled by block above
 
         indexed = [{"i": i, "label": lab, "canon": _canon(lab)} for i, lab in enumerate(options_source)]
 
@@ -288,7 +474,7 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
                 "- If the request is 'Piano/Vocal' or 'Choir', you may choose those exact categories.\n"
             )
 
-        prompt = (
+        prompt = build_instrument_selection_prompt(requested_instrument, req_canon, options_source, req_canon in INSTRUMENTAL_PART_CANONS) if build_instrument_selection_prompt else (
             "You are selecting an instrument option from a dropdown.\n"
             f"Requested instrument (raw): {requested_instrument}\n"
             f"Requested instrument (canonical): {req_canon}\n"
@@ -299,8 +485,16 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
             f"{rules_extra}"
             "- Return STRICT JSON as either {\"index\": <int>} or {\"label\": \"<exact option label>\"}."
         )
+        try:
+            log_prompt("instrument_selection", prompt)
+        except Exception:
+            pass
 
         raw = _llm_run_instruction(prompt)  # type: ignore
+        try:
+            log_llm_response("key_choice", raw)
+        except Exception:
+            pass
         if not raw:
             return None
 
@@ -393,11 +587,10 @@ def _choose_best_key_with_llm(requested_key: str, available_labels: list[str]) -
             "F": 5, "F#": 6, "Gb": 6, "G": 7, "G#": 8, "Ab": 8, "A": 9,
             "A#": 10, "Bb": 10, "B": 11
         }
-        options = "\n- " + "\n- ".join(available_labels)
-        prompt = (
+        prompt = build_key_choice_prompt(requested_key, available_labels) if build_key_choice_prompt else (
             "Task: Select the SINGLE best key label from the provided list.\n"
             f"Requested key: {requested_key}\n"
-            f"Available labels (choose exactly one of these):\n{options}\n\n"
+            f"Available labels (choose exactly one of these):\n- " + "\n- ".join(available_labels) + "\n\n"
             "Rules:\n"
             "- Choose the label whose pitch class is the smallest chromatic distance (0–6) from the requested key.\n"
             "- If two are equally close, prefer the label ABOVE the requested key (positive direction).\n"
@@ -405,7 +598,15 @@ def _choose_best_key_with_llm(requested_key: str, available_labels: list[str]) -
             "Return STRICT JSON: {\"label\": <one of the provided labels verbatim>}"
             "\nMapping (for your reasoning): " + str(mapping)
         )
+        try:
+            log_prompt("key_choice", prompt)
+        except Exception:
+            pass
         raw = _llm_run_instruction(prompt)  # type: ignore
+        try:
+            log_llm_response("alternate_readings_ranking", raw)
+        except Exception:
+            pass
         if not raw:
             return None
         s = str(raw).strip()
@@ -465,12 +666,16 @@ def _rank_alternate_readings_with_llm(candidates: list[dict]) -> list[dict]:
             {"i": i, "instrument": c.get("instrument"), "key": c.get("key"), "family": c.get("family", "other")}
             for i, c in enumerate(candidates)
         ]
-        prompt = (
+        prompt = build_alternate_readings_ranking_prompt(items) if build_alternate_readings_ranking_prompt else (
             "Task: Rank alternate parts a French horn player can READ DIRECTLY (no extra transposition).\n"
             "Prefer BRASS first, then SAX. Avoid others unless nothing else exists.\n"
             f"Candidates: {items}\n"
             "Return STRICT JSON: {\"order\": [indices in best-first order]}"
         )
+        try:
+            log_prompt("alternate_readings_ranking", prompt)
+        except Exception:
+            pass
         raw = _llm_run_instruction(prompt)  # type: ignore
         if not raw:
             return candidates
@@ -807,15 +1012,25 @@ def _choose_best_instrument_heuristic(requested_instrument: str, available: list
 
 
 def _reorder_candidates(title: str, artist: Optional[str], candidates: list[dict]) -> list[dict]:
-    """Reorder the list using LLM if available; otherwise, fuzzy title/artist similarity."""
-    # LLM pick first
-    best = _choose_best_candidate_index_with_llm(title, artist, candidates)
+    """Reorder candidates with strict exact(ish)-title preference, then LLM/fuzzy ranking."""
+    # 0) Strict exact(ish) title group first (main title equality), sorted by variant quality
+    req_t = (title or "").strip()
+    exact_idxs = [i for i, c in enumerate(candidates) if _title_matches_exactish(req_t, str(c.get("title", "")))]
     remaining = list(range(len(candidates)))
-    if best is not None and 0 <= best < len(candidates):
-        remaining.remove(best)
-        ordered = [candidates[best]]
+    ordered: list[dict] = []
+    if exact_idxs:
+        # Sort exact-ish by variant rank (prefer exact, then arrangement descriptors like 'Simplified', then benign like 'Live', then others)
+        exact_sorted = sorted(exact_idxs, key=lambda i: _variant_rank(req_t, str(candidates[i].get("title", ""))))
+        for i in exact_sorted:
+            ordered.append(candidates[i])
+            if i in remaining:
+                remaining.remove(i)
     else:
-        ordered = []
+        # 1) If no exact titles, take an LLM pick first (if available)
+        best = _choose_best_candidate_index_with_llm(title, artist, candidates)
+        if best is not None and 0 <= best < len(candidates) and best in remaining:
+            remaining.remove(best)
+            ordered = [candidates[best]]
 
     # Fuzzy rank the rest by title/artist similarity
     from difflib import SequenceMatcher
@@ -1112,8 +1327,9 @@ def scrape_music(
     key: str,
     input_dir: Optional[str] = None,
     artist: Optional[str] = None,
-) -> str:
-    """Return a directory of sheet music images for the requested title/key.
+    top_n: int = 1,
+) -> str | list[dict]:
+    """Return a directory (or directories) of sheet music images for the requested title/key.
 
     This implementation searches a local library under ``data/samples`` for a
     matching piece.  If the exact title and key are not found, it will
@@ -1153,9 +1369,10 @@ def scrape_music(
 
     Returns
     -------
-    str
-        Path to the directory containing images for the requested title and
-        key.
+    str | list[dict]
+        - If a single match is downloaded, returns a string path to the image directory.
+        - If multiple matches are downloaded (when top_n > 1 via internal call), returns a list of
+          objects: {"image_dir": <str>, "meta": {"title": str, "artist": str, "instrument": str, "key": str, "run_ts": str}}
 
     Raises
     ------
@@ -1283,8 +1500,54 @@ def scrape_music(
     # suggestions and raise an informative error.  This early return
     # ensures that the legacy library search code below is never
     # executed.
+    # Multi-candidate scraping is handled by the Selenium helper. It returns a list of
+    # temporary directories and per-candidate metadata which we then copy into the
+    # unified run log structure.
     try:
-        scraped_dir = _scrape_with_selenium(title, instrument, key, artist=artist)
+        # When top_n > 1, iteratively scrape while skipping previously chosen (title, artist) pairs
+        if int(top_n) <= 1:
+            scraped = _scrape_with_selenium(title, instrument, key, artist=artist)
+        else:
+            scraped = []
+            skips: set[tuple[str, str]] = set()
+            for _i in range(int(top_n)):
+                tmp = _scrape_with_selenium(title, instrument, key, artist=artist, top_n=1, _retry=False, skip_idents=skips)  # type: ignore[call-arg]
+                if not tmp:
+                    break
+                # tmp may be a string path or a list of dicts (e.g., existing_pdf cases)
+                if isinstance(tmp, list):
+                    # Extend scraped with provided items; update skip set from their meta
+                    for it in tmp:
+                        if not isinstance(it, dict):
+                            continue
+                        scraped.append(it)
+                        try:
+                            m = it.get('meta') or {}
+                            sel_t = str(m.get('title', title))
+                            sel_a = str(m.get('artist', artist or ''))
+                            skips.add((sel_t, sel_a))
+                        except Exception:
+                            pass
+                    continue
+                # Build per-result meta snapshot before next iteration mutates SCRAPE_METADATA
+                try:
+                    meta = {
+                        'title': str(SCRAPE_METADATA.get('title', title)),
+                        'artist': str(SCRAPE_METADATA.get('artist', artist or '')),
+                        'instrument': str(SCRAPE_METADATA.get('instrument', instrument)),
+                        'key': str(SCRAPE_METADATA.get('key', key)),
+                        'run_ts': run_ts,
+                    }
+                except Exception:
+                    meta = {'title': title, 'artist': artist or '', 'instrument': instrument, 'key': key, 'run_ts': run_ts}
+                scraped.append({'tmp_dir': tmp, 'meta': meta})
+                # Capture chosen ident from metadata to avoid reselecting it
+                try:
+                    sel_t = str(meta.get('title', title))
+                    sel_a = str(meta.get('artist', artist or ''))
+                    skips.add((sel_t, sel_a))
+                except Exception:
+                    pass
     except AlreadyExistsError as exists_err:
         # Not an error: the final PDF for this title/artist/key/instrument already exists.
         # Log at info level and return None so the caller can skip this song.
@@ -1294,77 +1557,93 @@ def scrape_music(
             pass
         return None
     except Exception as scrape_err:
-        scraped_dir = None
+        scraped = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
-    if scraped_dir:
-        # Determine the artist from metadata (set by _scrape_with_selenium)
-        title_meta = (SCRAPE_METADATA.get('title', '') or title)
-        artist_meta = SCRAPE_METADATA.get('artist', '') or 'unknown'
+    if scraped:
         import re
-        def _sanitize(value: str) -> str:
-            return re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
-        safe_title = _sanitize(title_meta)
-        safe_artist = _sanitize(artist_meta)
-        # Build the instrument directory under the log root using ACTUAL selected metadata.
-        # Important: use the key chosen by the scraper (if available), not the originally
-        # requested key. This ensures folder names reflect the final selection.
-        try:
-            actual_key_for_logs = SCRAPE_METADATA.get('key') or key
-        except Exception:
-            actual_key_for_logs = key
-        safe_key_for_logs = _sanitize(actual_key_for_logs or 'unknown')
-        instrument_dir = os.path.join(
-            log_root,
-            safe_title,
-            safe_artist,
-            safe_key_for_logs,
-            # Use the SELECTED instrument (set by _scrape_with_selenium) if available;
-            # fall back to the requested instrument. This avoids creating both
-            # 'French_Horn' and 'French_Horn_1_2' folders for the same song.
-            _sanitize(SCRAPE_METADATA.get('instrument') or instrument),
-        )
-        original_dir_final = os.path.join(instrument_dir, "1_original")
-        os.makedirs(original_dir_final, exist_ok=True)
-        # Copy scraped images into the 1_original directory.
-        try:
-            imgs = [
-                p for p in glob.glob(os.path.join(scraped_dir, "*"))
-                if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
-            ]
-            for src in imgs:
-                dst = os.path.join(original_dir_final, os.path.basename(src))
-                shutil.copyfile(src, dst)
-                logger.info("SCRAPER: copied %s -> %s", src, dst)
-        except Exception as copy_err:
-            logger.error("SCRAPER: failed to copy scraped files: %s", copy_err)
-        # Update metadata with the sanitised artist and title only.  Do **not**
-        # override the instrument or key here, as the selected values have
-        # already been recorded by `_scrape_with_selenium`.  Overwriting
-        # them with the requested values would cause the final PDF to be
-        # organised under the wrong key/instrument when a fallback key is
-        # chosen during scraping.
-        try:
-            SCRAPE_METADATA['artist'] = artist_meta
-            SCRAPE_METADATA['title'] = safe_title
-            # leave SCRAPE_METADATA['instrument'] and ['key'] untouched
-        except Exception:
-            pass
-        # Remove the temporary scraped directory and its parent as before
-        try:
-            shutil.rmtree(scraped_dir, ignore_errors=True)
-            scrape_parent = os.path.dirname(scraped_dir.rstrip(os.sep))
-            if os.path.basename(scrape_parent).startswith(f"{safe_title}_"):
-                shutil.rmtree(scrape_parent, ignore_errors=True)
-        except Exception:
-            pass
-        logger.info(
-            "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s'",
-            title,
-            instrument,
-            SCRAPE_METADATA.get('key') or key,
-        )
+        def _sanitize(v: str) -> str:
+            return re.sub(r"[^A-Za-z0-9]+", "_", (v or "").strip()).strip("_")
+        results: list[dict] = []
+        # Support both legacy single-dir string and new structured list
+        if isinstance(scraped, str):
+            scraped_list = [{
+                'tmp_dir': scraped,
+                'meta': {
+                    'title': SCRAPE_METADATA.get('title', title),
+                    'artist': SCRAPE_METADATA.get('artist', artist or ''),
+                    'instrument': SCRAPE_METADATA.get('instrument', instrument),
+                    'key': SCRAPE_METADATA.get('key', key),
+                    'run_ts': run_ts,
+                }
+            }]
+        else:
+            # Already a list of dicts; items may be {'tmp_dir','meta'} or {'existing_pdf','meta'}
+            scraped_list = scraped  # type: ignore
+
+        for item in scraped_list:
+            meta = item.get('meta') or {}
+            existing_pdf = item.get('existing_pdf')
+            if existing_pdf:
+                results.append({'existing_pdf': existing_pdf, 'meta': {
+                    'title': meta.get('title') or title,
+                    'artist': meta.get('artist') or '',
+                    'instrument': meta.get('instrument') or instrument,
+                    'key': meta.get('key') or key,
+                    'run_ts': run_ts,
+                }})
+                continue
+            tmp_dir = item.get('tmp_dir') or item.get('scraped_dir')
+            meta = item.get('meta') or {}
+            m_title = meta.get('title') or title
+            m_artist = meta.get('artist') or ''
+            m_key = meta.get('key') or key
+            m_instr = meta.get('instrument') or instrument
+
+            instrument_dir = os.path.join(
+                log_root,
+                _sanitize(m_title),
+                _sanitize(m_artist or 'unknown'),
+                _sanitize(m_key or 'unknown'),
+                _sanitize(m_instr or 'unknown'),
+            )
+            original_dir_final = os.path.join(instrument_dir, "1_original")
+            os.makedirs(original_dir_final, exist_ok=True)
+            try:
+                imgs = [
+                    p for p in glob.glob(os.path.join(tmp_dir, "*"))
+                    if p.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+                ]
+                for src in imgs:
+                    dst = os.path.join(original_dir_final, os.path.basename(src))
+                    shutil.copyfile(src, dst)
+                    logger.info("SCRAPER: copied %s -> %s", src, dst)
+            except Exception as copy_err:
+                logger.error("SCRAPER: failed to copy scraped files: %s", copy_err)
+            results.append({"image_dir": original_dir_final, "meta": {
+                'title': m_title,
+                'artist': m_artist,
+                'instrument': m_instr,
+                'key': m_key,
+                'run_ts': run_ts,
+            }})
+            # best-effort cleanup temp
+            try:
+                parent = os.path.dirname(tmp_dir.rstrip(os.sep))
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                if os.path.basename(parent).startswith(f"{_sanitize(title)}_"):
+                    shutil.rmtree(parent, ignore_errors=True)
+            except Exception:
+                pass
         logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
-        return original_dir_final
+        # If multiple results, return the list; otherwise return the single path for backward compatibility
+        if len(results) == 1:
+            # Update global metadata for downstream nodes to reflect the match
+            try:
+                SCRAPE_METADATA.update(results[0]['meta'])  # type: ignore[index]
+            except Exception:
+                pass
+            return results[0]['image_dir']  # type: ignore[index]
+        return results
     # If scraping failed, compute transposition suggestions for the agent to
     # potentially present to the user.  We always raise an error here
     # because there is no local library fallback.
@@ -1504,7 +1783,7 @@ def scrape_music(
 # scraping fails for any reason, the function returns ``None`` so
 # ``scrape_music`` can fall back to other logic.
 
-def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optional[str] = None, *, _retry: bool = False) -> Optional[str]:
+def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optional[str] = None, *, top_n: int = 1, _retry: bool = False, skip_idents: Optional[set[tuple[str, str]]] = None) -> Optional[str] | Optional[list[dict]]:
     """Attempt to scrape sheet music from an online catalogue.
 
     This helper uses a headless Chrome browser (via Selenium WebDriver) to
@@ -1582,8 +1861,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
     # propagate punctuation inconsistently into folder names.
     # Start with the requested key; we may later detect the actual key
     # from the downloaded filenames and record it in metadata for naming.
-    out_dir = os.path.join(root_dir, sanitize_title(norm_key))
-    os.makedirs(out_dir, exist_ok=True)
+    # out_dir will be created per-candidate later to avoid collisions when top_n > 1
 
     # Configure headless Chrome
     options = webdriver.ChromeOptions()
@@ -1773,11 +2051,22 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
 
         # Build the initial list of song candidates
         song_candidates = perform_search()
-        # Reorder candidates using LLM/fuzzy matching
+        # Reorder candidates using strict exact(ish) match preference then LLM/fuzzy
         try:
             song_candidates = _reorder_candidates(title, artist, song_candidates) or song_candidates
         except Exception:
             pass
+        # Belt-and-suspenders: compute the set of exact(ish) candidates to enforce at iteration time
+        try:
+            req_t_norm = (title or "").strip()
+            exactish_idents: set[tuple[str, str]] = set()
+            for c in song_candidates:
+                ct = str(c.get('title', '') or '')
+                ca = str(c.get('artist', '') or '')
+                if _title_matches_exactish(req_t_norm, ct):
+                    exactish_idents.add((ct, ca))
+        except Exception:
+            exactish_idents = set()
         # Set of attempted song identifiers to avoid infinite loops
         attempted: set[tuple[str, str]] = set()
         selected = None
@@ -1792,6 +2081,21 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                 ident = (cand.get('title', ''), cand.get('artist', ''))
                 if ident in attempted:
                     continue
+                # If caller asked to skip specific (title, artist) pairs (e.g., previously selected), honor that
+                if skip_idents and ident in skip_idents:
+                    # Mark as attempted so we don't loop forever when all candidates are skipped
+                    attempted.add(ident)
+                    continue
+                # If we have any exact(ish) matches available, defer non-exact candidates until those are attempted
+                try:
+                    if exactish_idents:
+                        # If this candidate is not an exact(ish) match and there exists an unattempted exact(ish) one, skip
+                        if ident not in exactish_idents:
+                            any_unattempted_exact = any((e not in attempted) for e in exactish_idents)
+                            if any_unattempted_exact:
+                                continue
+                except Exception:
+                    pass
                 attempted.add(ident)
                 artist_name = cand.get('artist', '') or ''
                 song_index = cand['index']
@@ -2528,9 +2832,10 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             final_dir = os.path.join(os.getcwd(), 'output', 'music', title_dir, artist_dir, key_dir)
             final_pdf_path = os.path.join(final_dir, filename)
             if os.path.isfile(final_pdf_path):
+                # Do NOT skip: we will overwrite existing output. Continue with download flow.
                 try:
                     logger.info(
-                        "SCRAPER: skipping existing output for '%s' by %s (%s, %s): %s",
+                        "SCRAPER: existing output found for '%s' by %s (%s, %s): %s — will overwrite",
                         chosen_title,
                         chosen_artist or 'unknown',
                         chosen_instrument,
@@ -2539,18 +2844,6 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     )
                 except Exception:
                     pass
-                # Close the product tab and switch back to search results
-                try:
-                    driver.close()
-                except Exception:
-                    pass
-                try:
-                    driver.switch_to.window(original_window)
-                except Exception:
-                    pass
-                raise AlreadyExistsError(
-                    f"Already exists: {chosen_title} by {chosen_artist} [{chosen_instrument}, {chosen_key}]"
-                )
         except AlreadyExistsError:
             # Bubble up this sentinel to scrape_music for graceful skip
             raise
@@ -2567,6 +2860,25 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
         downloaded_urls: set[str] = set()
         inferred_key_from_file: Optional[str] = None
         prev_page_num: Optional[str] = None
+        # Ensure a per-candidate output directory exists for downloaded images
+        try:
+            cand_title_safe = sanitize_title((selected.get('title', title) if selected else title) or 'unknown')
+        except Exception:
+            cand_title_safe = sanitize_title(title)
+        try:
+            key_label = (selected_key or norm_key) or ''
+        except Exception:
+            key_label = norm_key
+        key_safe = sanitize_title(str(key_label or 'unknown'))
+        try:
+            cand_dir = os.path.join(root_dir, cand_title_safe)
+            os.makedirs(cand_dir, exist_ok=True)
+            out_dir = os.path.join(cand_dir, key_safe)
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            # Fallback to root_dir if anything goes wrong
+            out_dir = os.path.join(root_dir, key_safe or 'tmp')
+            os.makedirs(out_dir, exist_ok=True)
         # Loop through preview images.  Use a reasonable upper limit to avoid infinite loops.
         for _ in range(50):
             try:
@@ -2669,9 +2981,29 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             except Exception:
                 pass
             return out_dir
-        # Otherwise, scraping failed
+        # Otherwise, scraping failed for this candidate; close tab and try next candidate via recursive retry
         logger.warning("SCRAPER: no images downloaded for title '%s'", title)
-        return None
+        try:
+            driver.close()
+        except Exception:
+            pass
+        try:
+            driver.switch_to.window(original_window)
+        except Exception:
+            pass
+        # Build skip set to avoid re-selecting the same candidate
+        try:
+            sel_ident = (selected.get('title', title) if selected else title, artist_name or '')
+        except Exception:
+            sel_ident = (title, artist_name or '')
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        # Merge skip sets
+        new_skips = set(skip_idents) if skip_idents else set()
+        new_skips.add(sel_ident)
+        return _scrape_with_selenium(title, instrument, key, artist=artist, top_n=top_n, _retry=_retry, skip_idents=new_skips)
     except Exception as e:
         logger.error("SCRAPER: exception during scraping: %s", e)
         return None

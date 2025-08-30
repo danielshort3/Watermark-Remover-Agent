@@ -2,12 +2,9 @@
 Helpers for invoking the Ollama‑powered chat agent.
 
 This module provides a direct interface to execute natural‑language
-instructions using a LangChain agent backed by an Ollama model.  It does
-not implement or expose any LangGraph nodes or graphs.  To run a task
-simply call :func:`run_instruction` with your prompt.  If you need
-a reusable agent instance, import :func:`get_ollama_agent` from
-``watermark_remover.agent.ollama_agent`` and use its ``invoke``
-method directly.
+instructions using a single ChatOllama LLM (no LangChain AgentExecutor).
+It avoids deprecated Agent APIs and keeps calls lightweight for our
+classification/ranking prompts.
 """
 
 from __future__ import annotations
@@ -45,6 +42,25 @@ def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
     except Exception as exc:
         out.update(ok=False, error=f"Failed to query tags: {exc}")
     return out
+
+
+try:
+    from langchain_ollama import ChatOllama  # type: ignore
+except Exception:
+    ChatOllama = None  # type: ignore
+
+_LLM: Any = None
+
+
+def _get_llm() -> Any:
+    base_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+    if ChatOllama is None:
+        raise ImportError("ChatOllama is not available; install langchain-ollama.")
+    global _LLM
+    if _LLM is None:
+        _LLM = ChatOllama(model=model, base_url=base_url, temperature=0.0, keep_alive=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
+    return _LLM
 
 
 def run_instruction(instruction: str) -> str:
@@ -85,82 +101,16 @@ def run_instruction(instruction: str) -> str:
             f"Model '{model}' not found on Ollama server. Available models: "
             f"{diag.get('models')}"
         )
+    # Use a single ChatOllama instance and call invoke directly.
     try:
-        from watermark_remover.agent.ollama_agent import get_ollama_agent  # type: ignore
-    except Exception as exc:
-        return (
-            "Failed to import get_ollama_agent: required dependencies "
-            f"are missing. Original error: {exc}"
-        )
-    try:
-        # Request verbose output from the agent.  When verbose=True the
-        # underlying LangChain agent will print its reasoning to stdout.
-        agent = get_ollama_agent(model_name=model, base_url=base_url, verbose=True)
-    except Exception as exc:
-        return f"Failed to create Ollama agent: {exc}"
-    try:
-        # Use the agent's run method to execute the task end‑to‑end.  This
-        # avoids returning intermediate JSON and ensures the agent calls
-        # tools automatically.  Pass the raw prompt as input; run() will
-        # interpret it as the user message.
-        try:
-            response = agent.run(prompt)  # type: ignore[no-untyped-call]
-        except Exception:
-            # Fall back to invoke with the structured input if run is not available
-            response = agent.invoke({"input": prompt})
+        llm = _get_llm()
+        response = llm.invoke(prompt)  # type: ignore
+        answer = response.content if hasattr(response, "content") else str(response)
     except Exception as exc:
         return f"Error executing instruction: {exc}"
-    # Extract the answer from the agent response.  The LLM may return
-    # structured objects or plain strings.  When using the Ollama backend
-    # with the provided prompt instructions, the 'output' key will include
-    # both the agent's reasoning (between <think> tags) and the final
-    # answer.  We capture this string as the answer.
-    if isinstance(response, dict):
-        answer = response.get("output") or response.get("result") or response
-    else:
-        answer = response
     # Fallback: if the answer looks like a plan (contains an action and action_input)
     # but the agent did not execute the tool, parse and run the tool manually.
-    try:
-        # If answer is a dict with 'action', treat it as a plan
-        plan = None
-        if isinstance(answer, dict) and 'action' in answer:
-            plan = answer
-        elif isinstance(answer, str) and answer.strip().startswith('{'):
-            import json as _json
-            try:
-                parsed = _json.loads(answer)
-                if isinstance(parsed, dict) and 'action' in parsed:
-                    plan = parsed
-            except Exception:
-                plan = None
-        if plan:
-            action_name = plan.get('action')
-            action_input = plan.get('action_input', {}) or {}
-            # Map action names to tool functions
-            from watermark_remover.agent.tools import (
-                scrape_music,
-                remove_watermark,
-                upscale_images,
-                assemble_pdf,
-            )
-            tool_map = {
-                'scrape_music': scrape_music,
-                'remove_watermark': remove_watermark,
-                'upscale_images': upscale_images,
-                'assemble_pdf': assemble_pdf,
-            }
-            func = tool_map.get(action_name)
-            if func:
-                try:
-                    result_val = func(**action_input)
-                    # Overwrite answer with actual result
-                    answer = result_val
-                except Exception as tool_exc:
-                    answer = f"Error running tool {action_name}: {tool_exc}"
-    except Exception:
-        # If fallback fails, ignore and keep original answer
-        pass
+    # No tool-execution plan handling is needed for our classification prompts.
     # Persist the thought process and steps to a log file under the
     # output directory.  Each invocation appends to the log with the
     # instruction and the model's full response.  This allows users to

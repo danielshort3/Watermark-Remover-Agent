@@ -48,6 +48,11 @@ from watermark_remover.agent.tools import (
     upscale_images,
     assemble_pdf,
 )
+try:
+    from watermark_remover.agent.prompts import build_single_song_parser_prompt, log_prompt
+except Exception:
+    build_single_song_parser_prompt = None  # type: ignore
+    log_prompt = None  # type: ignore
 
 # Regular expression utilities for fallback parsing.
 import re
@@ -111,14 +116,15 @@ def parser_node(state: dict) -> dict:
         return new_state
     llm = _get_llm()
     # Formulate a prompt instructing the model to return JSON only.
-    prompt = (
-        "You are a JSON API that extracts structured metadata from a natural-language "
-        "instruction about downloading sheet music. Given the instruction, return a JSON "
-        "object with the fields 'title', 'instrument' and 'key'. If any element is missing, "
-        "return an empty string for that field. Do not include any extra keys or text.\n\n"
-        f"Instruction: {instruction}\n\n"
-        "JSON:"
+    prompt = build_single_song_parser_prompt(instruction) if build_single_song_parser_prompt else (
+        "You are a JSON API that extracts structured metadata from a natural-language instruction about downloading sheet music. "
+        f"Instruction: {instruction}\n\nJSON:"
     )
+    try:
+        if log_prompt:
+            log_prompt("single_song_parser", prompt)
+    except Exception:
+        pass
     try:
         # ChatOllama's invoke method may return a message object or raw string.
         response = llm.invoke(prompt)  # type: ignore[no-untyped-call]
@@ -127,6 +133,15 @@ def parser_node(state: dict) -> dict:
             text = response.content  # type: ignore[assignment]
         else:
             text = response  # type: ignore[assignment]
+        try:
+            if log_prompt:
+                log_prompt("single_song_parser", prompt)
+            if log_prompt:
+                # reuse function for response as well
+                from watermark_remover.agent.prompts import log_llm_response  # type: ignore
+                log_llm_response("single_song_parser", text)
+        except Exception:
+            pass
         # Attempt to parse JSON; if this fails, we will fall back to regex.
         meta = json.loads(text)
     except Exception:
