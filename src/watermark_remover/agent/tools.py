@@ -739,6 +739,15 @@ def _reorder_candidates(title: str, artist: Optional[str], candidates: list[dict
 # causing intermediate and final files to end up in separate folders.
 import re
 
+
+class AlreadyExistsError(Exception):
+    """Raised when the final PDF for a chosen title/artist/key/instrument already exists.
+
+    This is used internally by the scraper to signal an early, non-error exit so
+    that callers can skip processing without treating it as a failure.
+    """
+    pass
+
 def sanitize_title(value: str) -> str:
     """Sanitise a string into a safe filename or directory name.
 
@@ -763,6 +772,24 @@ def sanitize_title(value: str) -> str:
     # Collapse multiple underscores
     sanitized = re.sub(r"_+", "_", sanitized)
     return sanitized.strip("_")
+
+def extract_key_from_filename(fname: str) -> Optional[str]:
+    """Extract the musical key label from a sheet image filename.
+
+    Expects filenames like '<slug>_<instrument>_<Key>_001.png' and returns the
+    detected key (normalised), e.g. 'C', 'Ab', 'F#'. Returns None if no key is
+    recognised.
+    """
+    try:
+        import re as _re
+        m = _re.search(r"_([A-G](?:b|#)?)_\d+\.(?:png|jpg|jpeg|tif|tiff)$", fname, flags=_re.I)
+        if not m:
+            return None
+        raw = m.group(1)
+        # Reuse the project-wide normaliser
+        return normalize_key(raw) or None
+    except Exception:
+        return None
 
 # Import model definitions lazily.  These imports can be heavy and
 # require optional dependencies such as torch, torchvision and
@@ -1088,13 +1115,21 @@ def scrape_music(
             # explicit directory, no artist information is available,
             # so we default to 'unknown'.
             safe_artist = 'unknown'
+            # Try to infer the actual key from the first image filename
+            inferred_key = None
+            try:
+                first_base = os.path.basename(sorted(imgs)[0])
+                inferred_key = extract_key_from_filename(first_base)
+            except Exception:
+                inferred_key = None
             # Build the full instrument directory under the log root:
             # logs/<run_ts>/<song>/<artist>/<key>/<instrument>/
+            actual_key_for_logs = inferred_key or key
             instrument_dir = os.path.join(
                 log_root,
                 safe_title,
                 safe_artist,
-                safe_key,
+                sanitize_title(actual_key_for_logs or 'unknown'),
                 safe_instrument,
             )
             original_dir_final = os.path.join(instrument_dir, "1_original")
@@ -1113,7 +1148,7 @@ def scrape_music(
                 # Title should reflect the ACTUAL selected candidate, not the requested title
                 SCRAPE_METADATA['title'] = cand.get('title', title)
                 SCRAPE_METADATA['instrument'] = instrument
-                SCRAPE_METADATA['key'] = key
+                SCRAPE_METADATA['key'] = (inferred_key or key) or ''
             except Exception:
                 pass
             logger.info(
@@ -1122,7 +1157,7 @@ def scrape_music(
                 len(imgs),
                 title,
                 instrument,
-                key,
+                inferred_key or key,
             )
             logger.debug("SCRAPER: sample files: %s", imgs[:5])
             logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
@@ -1140,6 +1175,14 @@ def scrape_music(
     # executed.
     try:
         scraped_dir = _scrape_with_selenium(title, instrument, key, artist=artist)
+    except AlreadyExistsError as exists_err:
+        # Not an error: the final PDF for this title/artist/key/instrument already exists.
+        # Log at info level and return None so the caller can skip this song.
+        try:
+            logger.info("SCRAPER: %s", exists_err)
+        except Exception:
+            pass
+        return None
     except Exception as scrape_err:
         scraped_dir = None
         logger.error("SCRAPER: exception during online scraping: %s", scrape_err)
@@ -1208,7 +1251,7 @@ def scrape_music(
             "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s'",
             title,
             instrument,
-            key,
+            SCRAPE_METADATA.get('key') or key,
         )
         logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
         return original_dir_final
@@ -1260,7 +1303,7 @@ def scrape_music(
                 "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s' to '%s'",
                 title,
                 instrument,
-                key,
+                SCRAPE_METADATA.get('key') or key,
                 scraped_dir,
             )
             logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
@@ -1333,7 +1376,7 @@ def scrape_music(
             "SCRAPER: scraped sheet music online for title='%s' instrument='%s' key='%s' to '%s'",
             title,
             instrument,
-            key,
+            SCRAPE_METADATA.get('key') or key,
             scraped_dir,
         )
         logger.info("SCRAPER completed in %.3fs", time.perf_counter() - start)
@@ -1396,6 +1439,19 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
     # punctuation do not produce divergent names.
     safe_title = sanitize_title(title)
     norm_key = normalize_key(key)
+    # Helper: infer the actual key from an image filename pattern like
+    #   <slug>_<Instrument>_<Key>_001.png  -> captures <Key>
+    # Returns a normalised key label (e.g. 'Ab', 'F#') or None.
+    def _key_from_filename(fname: str) -> Optional[str]:
+        try:
+            import re as _re
+            m = _re.search(r"_([A-G](?:b|#)?)_\d+\.(?:png|jpg|jpeg|tif|tiff)$", fname, flags=_re.I)
+            if not m:
+                return None
+            # Normalise using the shared helper for consistency everywhere
+            return normalize_key(m.group(1)) or None
+        except Exception:
+            return None
     # Create a temporary directory for this scraping run.  We place
     # temporary directories under the log directory so that they are
     # easy to clean up later.  Use tempfile to avoid collisions.
@@ -1414,6 +1470,8 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
     # Use the unified sanitiser for the key when constructing the output
     # directory.  Without sanitising the key, names like 'Bb' could
     # propagate punctuation inconsistently into folder names.
+    # Start with the requested key; we may later detect the actual key
+    # from the downloaded filenames and record it in metadata for naming.
     out_dir = os.path.join(root_dir, sanitize_title(norm_key))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -2102,6 +2160,89 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
         )
         # Pause briefly after closing the parts menu
         time.sleep(random.uniform(0.3, 0.8))
+        # Re-open the key menu and re-select the desired/closest key now that the
+        # instrument is chosen. Some sites reset the key when the instrument changes.
+        try:
+            if SeleniumHelper.click_element(driver, XPATHS['key_button'], timeout=5, log_func=logger.debug):
+                time.sleep(random.uniform(0.2, 0.6))
+                key_parent_el2 = SeleniumHelper.find_element(
+                    driver, XPATHS['key_parent'], timeout=5, log_func=logger.debug
+                )
+                if key_parent_el2:
+                    key_buttons2 = key_parent_el2.find_elements(By.TAG_NAME, 'button')
+                    # If we already picked a key earlier, try to pick that exact label again
+                    desired_label = selected_key or normalize_key(key)
+                    chosen_again = None
+                    for btn in key_buttons2:
+                        try:
+                            bt = (btn.text or '').strip()
+                        except Exception:
+                            continue
+                        if not bt:
+                            continue
+                        if bt.lower() == (desired_label or '').lower():
+                            try:
+                                btn.click()
+                                chosen_again = bt
+                            except Exception:
+                                chosen_again = bt  # even if click fails, record label
+                            break
+                    # If not found by exact label, choose nearest like before
+                    if not chosen_again and key_buttons2:
+                        try:
+                            from watermark_remover.utils.transposition_utils import KEY_TO_SEMITONE as _K2S
+                        except Exception:
+                            _K2S = {}
+                        target_norm = normalize_key(key)
+                        target_semi = _K2S.get(target_norm)
+                        if target_semi is not None:
+                            closest = None
+                            for btn in key_buttons2:
+                                try:
+                                    bt = (btn.text or '').strip()
+                                except Exception:
+                                    continue
+                                if not bt:
+                                    continue
+                                name_parts = [normalize_key(part) for part in bt.split('/')]
+                                vals = [_K2S.get(p) for p in name_parts if p in _K2S]
+                                if not vals:
+                                    continue
+                                semi = vals[0]
+                                diff = (semi - target_semi) % 12
+                                if diff > 6:
+                                    diff -= 12
+                                candidate = (abs(diff), 0 if diff > 0 else 1, diff, bt, btn)
+                                if closest is None or candidate < closest:
+                                    closest = candidate
+                            if closest:
+                                _, _, _, sel_text2, sel_btn2 = closest
+                                try:
+                                    sel_btn2.click()
+                                except Exception:
+                                    pass
+                                chosen_again = sel_text2
+                    # Update selected_key to whatever we ended up with after instrument selection
+                    if chosen_again:
+                        selected_key = chosen_again
+                        try:
+                            logger.info(
+                                "SCRAPER: final selected key after instrument '%s': %s",
+                                selected_instrument or instrument,
+                                selected_key,
+                            )
+                        except Exception:
+                            pass
+                # Close key menu again
+                SeleniumHelper.click_element(
+                    driver, XPATHS['key_button'], timeout=5, log_func=logger.debug
+                )
+                time.sleep(random.uniform(0.2, 0.5))
+        except Exception as _rekey_err:
+            try:
+                logger.debug("SCRAPER: re-select key after instrument failed: %s", _rekey_err)
+            except Exception:
+                pass
         if available_instruments:
             try:
                 logger.info(
@@ -2127,10 +2268,61 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     pass
             except Exception:
                 pass
-        # Now on the product page with the chosen key and instrument.  Locate the image element and next button
+        # Now on the product page with the chosen key and instrument (after re-selecting key if needed).  Before downloading,
+        # check if the final PDF already exists for this title/artist/key/instrument combination.
+        try:
+            chosen_title = selected.get('title', title) if selected else title
+            chosen_artist = (artist_name or (selected.get('artist', '') if selected else '')) or ''
+            chosen_key = selected_key or normalize_key(key)
+            chosen_instrument = selected_instrument or instrument
+            # Mirror assemble_pdf's naming and structure
+            title_dir = sanitize_title(chosen_title)
+            artist_dir = sanitize_title(chosen_artist)
+            key_dir = sanitize_title(chosen_key)
+            instrument_part = sanitize_title(chosen_instrument)
+            file_title = sanitize_title((chosen_title or '').lower()) if chosen_title else 'output'
+            filename = f"{file_title}_{instrument_part}_{key_dir}.pdf"
+            final_dir = os.path.join(os.getcwd(), 'output', 'music', title_dir, artist_dir, key_dir)
+            final_pdf_path = os.path.join(final_dir, filename)
+            if os.path.isfile(final_pdf_path):
+                try:
+                    logger.info(
+                        "SCRAPER: skipping existing output for '%s' by %s (%s, %s): %s",
+                        chosen_title,
+                        chosen_artist or 'unknown',
+                        chosen_instrument,
+                        chosen_key,
+                        final_pdf_path,
+                    )
+                except Exception:
+                    pass
+                # Close the product tab and switch back to search results
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+                try:
+                    driver.switch_to.window(original_window)
+                except Exception:
+                    pass
+                raise AlreadyExistsError(
+                    f"Already exists: {chosen_title} by {chosen_artist} [{chosen_instrument}, {chosen_key}]"
+                )
+        except AlreadyExistsError:
+            # Bubble up this sentinel to scrape_music for graceful skip
+            raise
+        except Exception as _exist_err:
+            # If the check fails for any reason, continue with normal download
+            try:
+                logger.debug("SCRAPER: existence check skipped due to: %s", _exist_err)
+            except Exception:
+                pass
+
+        # Locate the image element and next button and begin downloading if needed
         image_xpath = XPATHS['image_element']
         next_button_xpath = XPATHS['next_button']
         downloaded_urls: set[str] = set()
+        inferred_key_from_file: Optional[str] = None
         prev_page_num: Optional[str] = None
         # Loop through preview images.  Use a reasonable upper limit to avoid infinite loops.
         for _ in range(50):
@@ -2141,6 +2333,25 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             img_url = image_el.get_attribute('src')
             if not img_url:
                 break
+            # On the first seen image, try to infer the actual key from the filename
+            if inferred_key_from_file is None:
+                try:
+                    base_name_peek = os.path.basename(img_url)
+                except Exception:
+                    base_name_peek = ""
+                k_guess = _key_from_filename(base_name_peek)
+                if k_guess:
+                    inferred_key_from_file = k_guess
+                    # If UI selection did not yield a key, adopt the inferred key
+                    if not selected_key or normalize_key(selected_key) != k_guess:
+                        selected_key = k_guess
+                        try:
+                            logger.info(
+                                "SCRAPER: inferred actual key from filename: %s",
+                                selected_key,
+                            )
+                        except Exception:
+                            pass
             # Extract page number from the filename (e.g. _001.png).  If
             # the page number resets to 001 after the first iteration,
             # assume we've looped through all pages and exit.
@@ -2186,7 +2397,9 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                 SCRAPE_METADATA['title'] = cand.get('title', title)
                 SCRAPE_METADATA['artist'] = artist_name or ''
                 SCRAPE_METADATA['instrument'] = selected_instrument or ''
-                SCRAPE_METADATA['key'] = (selected_key or norm_key) or ''
+                # Prefer key inferred from downloaded file names, then any UI-selected key,
+                # and finally fall back to the requested key
+                SCRAPE_METADATA['key'] = (inferred_key_from_file or selected_key or norm_key) or ''
             except Exception:
                 pass
             # If we had to transpose (requested key not available) and the instrument is horn,
