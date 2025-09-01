@@ -1155,6 +1155,63 @@ except Exception:
     pass
 logger = logging.getLogger("wmra.tools")
 
+def init_pipeline_logging() -> None:
+    """Ensure file logging is configured under WMRA_LOG_DIR.
+
+    Safe to call multiple times; handlers are added once per process.
+    """
+    try:
+        # Recompute output_dir from RUN_TS/WMRA_LOG_DIR if necessary
+        run_ts = os.environ.get("RUN_TS")
+        base = os.environ.get("WMRA_LOG_DIR")
+        if not base:
+            if not run_ts:
+                import datetime as _dt
+                run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                os.environ.setdefault("RUN_TS", run_ts)
+            base = os.path.join(os.getcwd(), "output", "logs", os.environ["RUN_TS"])
+            os.environ["WMRA_LOG_DIR"] = base
+        os.makedirs(base, exist_ok=True)
+        # Remove existing file handlers pointing to a different base
+        existing_handlers = [h for h in logger.handlers if isinstance(h, logging.FileHandler)]
+        for h in list(existing_handlers):
+            bf = getattr(h, "baseFilename", "")
+            if not bf:
+                continue
+            # If handler does not target the current WMRA_LOG_DIR, detach it
+            if not bf.startswith(os.path.join(base, "")):
+                try:
+                    logger.removeHandler(h)
+                    h.close()
+                except Exception:
+                    pass
+        # Collect remaining file paths after cleanup
+        existing_files = [getattr(h, "baseFilename", "") for h in logger.handlers if isinstance(h, logging.FileHandler)]
+        pipeline_path = os.path.join(base, "pipeline.log")
+        csv_path = os.path.join(base, "pipeline.csv")
+        if not any(f == os.path.join(base, "pipeline.log") for f in existing_files):
+            fh = logging.FileHandler(pipeline_path)
+            fh.setLevel(getattr(logging, _log_level, logging.INFO))
+            fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+            logger.addHandler(fh)
+        if not any(f == os.path.join(base, "pipeline.csv") for f in existing_files):
+            class CsvFormatter(logging.Formatter):
+                def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
+                    for attr in ("button_text", "xpath", "url", "screenshot", "msg", "message"):
+                        if not hasattr(record, attr):
+                            setattr(record, attr, "")
+                        else:
+                            val = getattr(record, attr)
+                            if isinstance(val, str):
+                                setattr(record, attr, val.replace("\n", " ").replace("\r", " "))
+                    return super().format(record)
+            cf = logging.FileHandler(csv_path)
+            cf.setLevel(getattr(logging, _log_level, logging.INFO))
+            cf.setFormatter(CsvFormatter("%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,\"%(message)s\""))
+            logger.addHandler(cf)
+    except Exception:
+        pass
+
 # Global state used by the music scraping and assembly pipeline.  When
 # ``scrape_music`` runs, it records metadata about the selected song, artist,
 # instrument and key here.  Subsequent steps (e.g. PDF assembly) use this
@@ -3307,7 +3364,7 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
 
 
 @tool
-def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
+def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf", meta: Optional[dict] = None) -> str:
     """Assemble images from a directory into a single PDF file.
 
     Parameters
@@ -3357,7 +3414,9 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
     final_pdf_path: str
     debug_pdf_path: str
     try:
-        meta = SCRAPE_METADATA.copy()
+        # Prefer caller-provided meta to avoid global state when available.
+        meta_in = dict(meta) if isinstance(meta, dict) else {}
+        meta = (meta_in if meta_in else SCRAPE_METADATA.copy())
         # Retrieve run timestamp for logs
         run_ts = meta.get('run_ts') or os.environ.get('RUN_TS') or ''
         # Use sanitised components for file and directory names.  The
@@ -3384,7 +3443,18 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf") -> str:
         # structure.  If a run timestamp is available, construct the full
         # hierarchy; otherwise fall back to a directory adjacent to the
         # input images.  The instrument component comes from instrument_part.
-        if run_ts:
+        # Prefer WMRA_LOG_DIR for debug artifacts so order graph and tools share a root.
+        base_debug = os.environ.get("WMRA_LOG_DIR")
+        if base_debug:
+            debug_dir = os.path.join(
+                base_debug,
+                title_dir,
+                artist_dir,
+                key_dir,
+                instrument_part,
+                "4_final_pdf",
+            )
+        elif run_ts:
             debug_dir = os.path.join(
                 os.getcwd(),
                 "output",

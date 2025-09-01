@@ -684,15 +684,16 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     top_n: int = int(payload.get("top_n", 3) or 3)
     run_id: str = str(payload.get("run_id") or "run")
 
-    # Configure a per‑song RUN_TS and log directory to avoid cross‑talk.
+    # Configure a per‑song log directory nested under the order's debug root.
+    # This unifies all artifacts (graph + tools) under one location.
     run_ts = f"{run_id}_song{idx+1:02d}"
     _os.environ["RUN_TS"] = run_ts
-    log_root = _Path(_os.getcwd()) / "output" / "logs" / run_ts
-    log_root.mkdir(parents=True, exist_ok=True)
-    _os.environ["WMRA_LOG_DIR"] = str(log_root)
+    base_root = _Path(_os.getcwd()) / "output" / "debug" / "orders" / date_folder / run_id / "songs" / f"{per_song_prefix}_{safe_title}"
+    base_root.mkdir(parents=True, exist_ok=True)
+    _os.environ["WMRA_LOG_DIR"] = str(base_root)
     # Record start time for diagnostics
     try:
-        (_Path(str(log_root)) / "worker_times.json").write_text(_json.dumps({"start": _time.time()}), encoding="utf-8")
+        (base_root / "worker_times.json").write_text(_json.dumps({"start": _time.time()}), encoding="utf-8")
     except Exception:
         pass
 
@@ -706,6 +707,7 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             SCRAPE_METADATA as _META,
             TEMP_DIRS as _TEMPS,
             sanitize_title as _sanitize,
+            init_pipeline_logging as _init_logging,
         )
     except Exception as e:  # pragma: no cover - only in runtime, not tests
         errors.append(f"imports: {e}")
@@ -716,7 +718,15 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
     per_song_name = f"{per_song_prefix}_{safe_title}"
 
+    # Ensure pipeline log handlers (per-process)
+    try:
+        _init_logging()
+    except Exception:
+        pass
+
     # 1) Scrape
+    step_times: dict[str, float] = {}
+    _t0 = _time.time()
     downloads: list[dict] = []
     try:
         raw = _scrape.invoke({
@@ -748,6 +758,7 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             })
     except Exception as e:  # pragma: no cover
         errors.append(f"scrape: {e}\n{_tb.format_exc()}")
+    step_times["scrape"] = _time.time() - _t0
 
     # Early exit if nothing to process
     if not downloads:
@@ -759,14 +770,20 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not img_dir:
             continue
         try:
+            _t1 = _time.time()
             processed = _rm.invoke({"input_dir": img_dir})
+            step_times.setdefault("watermark", 0.0)
+            step_times["watermark"] += (_time.time() - _t1)
         except Exception as e:  # pragma: no cover
             errors.append(f"remove_watermark: {e}")
             processed = None
         if not processed:
             continue
         try:
+            _t2 = _time.time()
             upscaled = _up.invoke({"input_dir": processed})
+            step_times.setdefault("upscale", 0.0)
+            step_times["upscale"] += (_time.time() - _t2)
         except Exception as e:  # pragma: no cover
             errors.append(f"upscale: {e}")
             upscaled = None
@@ -800,7 +817,15 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
             try:
-                pdf_path = _asm.invoke({"image_dir": upscaled_dir, "output_pdf": filename})
+                _t3 = _time.time()
+                pdf_path = _asm.invoke({"image_dir": upscaled_dir, "output_pdf": filename, "meta": {
+                    "title": actual_title_for_name,
+                    "artist": m.get("artist", ""),
+                    "instrument": actual_instrument,
+                    "key": actual_key,
+                }})
+                step_times.setdefault("assemble", 0.0)
+                step_times["assemble"] += (_time.time() - _t3)
             except Exception as e:  # pragma: no cover
                 errors.append(f"assemble: {e}")
                 pdf_path = None
@@ -834,12 +859,13 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # Record end time
     try:
-        f = _Path(str(log_root)) / "worker_times.json"
+        f = base_root / "worker_times.json"
         try:
             data = _json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
         except Exception:
             data = {}
         data["end"] = _time.time()
+        data["steps"] = step_times
         f.write_text(_json.dumps(data), encoding="utf-8")
     except Exception:
         pass
@@ -1175,17 +1201,8 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
             # Process each downloaded match
             for match_idx, dl in enumerate(downloads, 1):
-                # Update global metadata for this match
-                try:
-                    m = dl.get("meta") or {}
-                    SCRAPE_METADATA.update({
-                        "title": m.get("title", song.get("title", "")),
-                        "artist": m.get("artist", song.get("artist", "")),
-                        "instrument": m.get("instrument", song.get("instrument", "")),
-                        "key": m.get("key", song.get("key", "")),
-                    })
-                except Exception:
-                    pass
+                # Use per-match metadata (avoid global state)
+                m = dl.get("meta") or {}
                 variant_suffix = f"_match{match_idx}"
 
                 # 2) REMOVE WATERMARK
@@ -1224,19 +1241,12 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     final_pdfs.append(None)
                     continue
 
-                # Derive naming components from current SCRAPE_METADATA
-                actual_key = SCRAPE_METADATA.get("key") or song.get("key", "")
-                actual_instrument = SCRAPE_METADATA.get("instrument") or song.get("instrument", "")
-                # Persist back for downstream
-                try:
-                    SCRAPE_METADATA["key"] = actual_key
-                    SCRAPE_METADATA["instrument"] = actual_instrument
-                except Exception:
-                    pass
-
+                # Derive naming components from per-match meta
+                actual_key = m.get("key") or song.get("key", "")
+                actual_instrument = m.get("instrument") or song.get("instrument", "")
                 safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
                 safe_key = sanitize_title(actual_key or "Unknown Key")
-                actual_title_for_name = SCRAPE_METADATA.get("title") or song.get("title", "Unknown Title")
+                actual_title_for_name = m.get("title") or song.get("title", "Unknown Title")
                 safe_title_for_name = sanitize_title(actual_title_for_name)
                 idx_str = str(idx + 1).zfill(2)
                 rank_str = str(match_idx).zfill(2)
@@ -1247,6 +1257,12 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     as_input = {
                         "image_dir": upscaled_dir,
                         "output_pdf": filename,
+                        "meta": {
+                            "title": actual_title_for_name,
+                            "artist": m.get("artist", ""),
+                            "instrument": actual_instrument,
+                            "key": actual_key,
+                        },
                     }
                     if _debug_enabled(new_state):
                         base = _debug_dir_for(new_state)
@@ -1362,6 +1378,17 @@ def scraper_node(state: Dict[str, Any]) -> Dict[str, Any]:
         base = _debug_dir_for(new_state)
         _ensure_file_handler(new_state, base)
         _logger.debug("scraper_node: begin")
+    # Ensure tools' pipeline logs are set up for sequential mode
+    try:
+        from watermark_remover.agent.tools import init_pipeline_logging as _init_tools_log  # type: ignore
+        # Set per-song WMRA_LOG_DIR for sequential runs to unify artifacts
+        idx, song, per_song_prefix, per_song_name = _per_song_labels(new_state)
+        base = _debug_dir_for(new_state)
+        import os as _os
+        _os.environ["WMRA_LOG_DIR"] = str((base / "songs" / per_song_name))
+        _init_tools_log()
+    except Exception:
+        pass
 
     idx, song, per_song_prefix, per_song_name = _per_song_labels(new_state)
     input_dir_override = new_state.get("input_dir", "data/samples")
@@ -1505,11 +1532,11 @@ def assembler_node(state: Dict[str, Any]) -> Dict[str, Any]:
         pdf_path: str | None = None
         if upscaled_dir:
             try:
-                # Use per-match meta for naming
+                # Use per-match meta for naming (avoid global state)
                 m = dl.get("meta") or {}
-                actual_key = m.get("key") or SCRAPE_METADATA.get("key") or song.get("key", "")
-                actual_instrument = m.get("instrument") or SCRAPE_METADATA.get("instrument") or song.get("instrument", "")
-                actual_title_for_name = m.get("title") or SCRAPE_METADATA.get("title") or song.get("title", "Unknown Title")
+                actual_key = m.get("key") or song.get("key", "")
+                actual_instrument = m.get("instrument") or song.get("instrument", "")
+                actual_title_for_name = m.get("title") or song.get("title", "Unknown Title")
                 safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
                 safe_key = sanitize_title(actual_key or "Unknown Key")
                 safe_title_for_name = sanitize_title(actual_title_for_name)
@@ -1517,17 +1544,12 @@ def assembler_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 rank_str = str(match_idx).zfill(2)
                 filename = f"{idx_str}_{rank_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
 
-                # Update global scrape metadata so assemble_pdf writes under the correct music/Title/Artist/Key
-                try:
-                    SCRAPE_METADATA.update({
-                        "title": actual_title_for_name,
-                        "artist": m.get("artist", "") or SCRAPE_METADATA.get("artist", ""),
-                        "instrument": actual_instrument,
-                        "key": actual_key,
-                    })
-                except Exception:
-                    pass
-                as_input = {"image_dir": upscaled_dir, "output_pdf": filename}
+                as_input = {"image_dir": upscaled_dir, "output_pdf": filename, "meta": {
+                    "title": actual_title_for_name,
+                    "artist": m.get("artist", ""),
+                    "instrument": actual_instrument,
+                    "key": actual_key,
+                }}
                 if _debug_enabled(new_state):
                     base = _debug_dir_for(new_state)
                     _write_json(base, f"{per_song_name}_match{rank_str}_assemble_input.json", as_input)
