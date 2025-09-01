@@ -206,3 +206,16 @@ reasoning and execution order:
 
 These logs provide insight into the agent’s internal decision‑making
 process and the concrete steps performed by each tool.
+
+## Order of Worship (Parallel per‑song)
+
+The `order-of-worship` LangGraph pipeline extracts songs from a service PDF and
+now processes each song in a separate process with its own Selenium browser. This
+keeps browser sessions and tool state fully isolated across songs.
+
+- Enable/disable parallel mode: set `ORDER_PARALLEL=1` (default) or `ORDER_PARALLEL=0`.
+- Control concurrency: set `ORDER_MAX_PROCS` (defaults to `min(#songs, cpu_count)`).
+
+Each worker process sets a unique `RUN_TS` and `WMRA_LOG_DIR` so logs and temp
+artifacts are kept separate, then copies assembled PDFs into `output/orders/<MM_DD_YYYY>/`
+with names like `01_01_Title_Instrument_Key.pdf`.

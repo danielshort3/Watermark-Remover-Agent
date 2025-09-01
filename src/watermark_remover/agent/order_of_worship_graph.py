@@ -50,6 +50,8 @@ except Exception:
     pass
 # -----------------------------------------------------------------------------
 from langgraph.graph import StateGraph, START, END
+import multiprocessing as _mp
+from concurrent.futures import ProcessPoolExecutor as _PPExecutor, as_completed as _as_completed
 
 # Import tools and utilities from your project
 from watermark_remover.agent.tools import sanitize_title, SCRAPE_METADATA, TEMP_DIRS
@@ -636,6 +638,213 @@ def _ensure_order_pdf_copied(state: Dict[str, Any]) -> None:
 
     except Exception as e:
         _record_error(state, "ensure_order_pdf_copied.exception", e)
+
+
+# ---------------------------------------------------------------------------
+# Parallel Per‑Song Worker (separate process + browser)
+# ---------------------------------------------------------------------------
+
+def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a single song pipeline in an isolated process.
+
+    This function is designed to be executed inside a child process. It
+    sets a per‑song RUN_TS/WMRA_LOG_DIR, invokes the scrape → watermark →
+    upscale → assemble steps, and copies the final PDF(s) into
+    output/orders/<date>/ using the index+rank naming convention.
+
+    Parameters
+    ----------
+    payload: Dict[str, Any]
+        A dict containing:
+        - idx: int (0‑based song index)
+        - song: {title, instrument, key, artist?}
+        - input_dir: str (library override)
+        - date_folder: str (orders/<date> folder)
+        - top_n: int (number of candidates to consider)
+        - run_id: str (base run id; used to derive per‑song RUN_TS)
+
+    Returns
+    -------
+    Dict[str, Any]
+        {"idx": int, "pdfs": list[str|None], "errors": list[str]}
+    """
+    # Imports inside the worker keep parent load light and avoid import‑time side‑effects.
+    import os as _os
+    import traceback as _tb
+    import json as _json
+    import time as _time
+    from pathlib import Path as _Path
+    from typing import Any as _Any, Dict as _Dict, List as _List
+
+    errors: _List[str] = []
+    idx: int = int(payload.get("idx", 0))
+    song: _Dict[str, _Any] = dict(payload.get("song") or {})
+    input_dir: str = str(payload.get("input_dir") or "data/samples")
+    date_folder: str = str(payload.get("date_folder") or "unknown_date")
+    top_n: int = int(payload.get("top_n", 3) or 3)
+    run_id: str = str(payload.get("run_id") or "run")
+
+    # Configure a per‑song RUN_TS and log directory to avoid cross‑talk.
+    run_ts = f"{run_id}_song{idx+1:02d}"
+    _os.environ["RUN_TS"] = run_ts
+    log_root = _Path(_os.getcwd()) / "output" / "logs" / run_ts
+    log_root.mkdir(parents=True, exist_ok=True)
+    _os.environ["WMRA_LOG_DIR"] = str(log_root)
+    # Record start time for diagnostics
+    try:
+        (_Path(str(log_root)) / "worker_times.json").write_text(_json.dumps({"start": _time.time()}), encoding="utf-8")
+    except Exception:
+        pass
+
+    # Lazy imports of tools to ensure they are resolved in child process.
+    try:
+        from watermark_remover.agent.tools import (
+            scrape_music as _scrape,
+            remove_watermark as _rm,
+            upscale_images as _up,
+            assemble_pdf as _asm,
+            SCRAPE_METADATA as _META,
+            TEMP_DIRS as _TEMPS,
+            sanitize_title as _sanitize,
+        )
+    except Exception as e:  # pragma: no cover - only in runtime, not tests
+        errors.append(f"imports: {e}")
+        return {"idx": idx, "pdfs": [], "errors": errors}
+
+    # Normalise a base name for debug artifacts.
+    safe_title = _sanitize(song.get("title", "Unknown Title"))
+    per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
+    per_song_name = f"{per_song_prefix}_{safe_title}"
+
+    # 1) Scrape
+    downloads: list[dict] = []
+    try:
+        raw = _scrape.invoke({
+            "title": song.get("title", ""),
+            "instrument": song.get("instrument", ""),
+            "key": song.get("key", ""),
+            "artist": song.get("artist", ""),
+            "input_dir": input_dir,
+            "top_n": top_n,
+        })
+        if isinstance(raw, list):
+            for it in raw:
+                if isinstance(it, dict):
+                    if it.get("image_dir") or it.get("existing_pdf"):
+                        downloads.append({
+                            "image_dir": it.get("image_dir"),
+                            "existing_pdf": it.get("existing_pdf"),
+                            "meta": it.get("meta", {}),
+                        })
+        elif isinstance(raw, str):
+            downloads.append({
+                "image_dir": raw,
+                "meta": {
+                    "title": _META.get("title", song.get("title", "")),
+                    "artist": _META.get("artist", song.get("artist", "")),
+                    "instrument": _META.get("instrument", song.get("instrument", "")),
+                    "key": _META.get("key", song.get("key", "")),
+                },
+            })
+    except Exception as e:  # pragma: no cover
+        errors.append(f"scrape: {e}\n{_tb.format_exc()}")
+
+    # Early exit if nothing to process
+    if not downloads:
+        return {"idx": idx, "pdfs": [], "errors": errors}
+
+    # 2) Remove watermark, 3) Upscale
+    for dl in downloads:
+        img_dir = dl.get("image_dir")
+        if not img_dir:
+            continue
+        try:
+            processed = _rm.invoke({"input_dir": img_dir})
+        except Exception as e:  # pragma: no cover
+            errors.append(f"remove_watermark: {e}")
+            processed = None
+        if not processed:
+            continue
+        try:
+            upscaled = _up.invoke({"input_dir": processed})
+        except Exception as e:  # pragma: no cover
+            errors.append(f"upscale: {e}")
+            upscaled = None
+        dl["upscaled_dir"] = upscaled
+
+    # 4) Assemble and copy into orders/<date>
+    pdfs: list[str | None] = []
+    for rank, dl in enumerate(downloads, 1):
+        pdf_path: str | None = None
+        upscaled_dir = dl.get("upscaled_dir")
+        existing_pdf = dl.get("existing_pdf")
+        if upscaled_dir:
+            m = dict(dl.get("meta") or {})
+            actual_key = m.get("key") or _META.get("key") or song.get("key", "")
+            actual_instrument = m.get("instrument") or _META.get("instrument") or song.get("instrument", "")
+            actual_title_for_name = m.get("title") or _META.get("title") or song.get("title", "Unknown Title")
+            safe_instrument = _sanitize(actual_instrument or "Unknown Instrument")
+            safe_key = _sanitize(actual_key or "Unknown Key")
+            safe_title_for_name = _sanitize(actual_title_for_name)
+            idx_str = str(idx + 1).zfill(2)
+            rank_str = str(rank).zfill(2)
+            filename = f"{idx_str}_{rank_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
+            try:
+                # Keep metadata coherent for assemble step
+                _META.update({
+                    "title": actual_title_for_name,
+                    "artist": m.get("artist", "") or _META.get("artist", ""),
+                    "instrument": actual_instrument,
+                    "key": actual_key,
+                })
+            except Exception:
+                pass
+            try:
+                pdf_path = _asm.invoke({"image_dir": upscaled_dir, "output_pdf": filename})
+            except Exception as e:  # pragma: no cover
+                errors.append(f"assemble: {e}")
+                pdf_path = None
+            # Copy to orders folder
+            if pdf_path and isinstance(pdf_path, str):
+                try:
+                    orders_root = _Path(_os.getcwd()) / "output" / "orders" / date_folder
+                    orders_root.mkdir(parents=True, exist_ok=True)
+                    target_path = orders_root / filename
+                    import shutil as _shutil
+                    _shutil.copyfile(pdf_path, str(target_path))
+                    pdf_path = str(target_path)
+                except Exception as e:  # pragma: no cover
+                    errors.append(f"copy: {e}")
+        elif existing_pdf:
+            # If scraping produced an existing PDF reference, relay it (rare)
+            pdf_path = str(existing_pdf)
+        pdfs.append(pdf_path if isinstance(pdf_path, str) else None)
+
+    # Best‑effort temp cleanup for this process
+    try:  # pragma: no cover
+        import shutil as _shutil
+        for t in list(_TEMPS):
+            try:
+                _shutil.rmtree(t, ignore_errors=True)
+            except Exception:
+                pass
+        _TEMPS.clear()
+    except Exception:
+        pass
+
+    # Record end time
+    try:
+        f = _Path(str(log_root)) / "worker_times.json"
+        try:
+            data = _json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        except Exception:
+            data = {}
+        data["end"] = _time.time()
+        f.write_text(_json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {"idx": idx, "pdfs": pdfs, "errors": errors}
 
 # Prompts moved to centralized module: watermark_remover.agent.prompts
 
@@ -1389,38 +1598,154 @@ def should_continue(state: Dict[str, Any]) -> str:
         return "end"
 
 
+def process_songs_parallel_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Process all songs concurrently using separate processes and browsers.
+
+    Each song is handled by a child process via ``_song_worker``. This provides
+    full isolation of Selenium sessions and mutable tool state.
+    """
+    _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
+    start = _start_timer()
+    new_state: Dict[str, Any] = dict(state)
+
+    songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
+    if not songs:
+        new_state["final_pdfs"] = []
+        _record_timing(new_state, "process_songs_parallel_node", _stop_timer(start))
+        return new_state
+
+    # Prepare payloads
+    run_id = _get_run_id(new_state)
+    date_folder = _get_order_folder(new_state)
+    input_dir = new_state.get("input_dir", "data/samples")
+    top_n = int(new_state.get("top_n", 3) or 3)
+
+    # Ensure 00_ Order Of Worship file is copied alongside song outputs
+    try:
+        _ensure_order_pdf_copied(new_state)
+    except Exception as e:
+        _record_error(new_state, "process_songs_parallel_node.ensure_order_pdf_copied_exception", e)
+
+    tasks: list[dict] = []
+    for idx in sorted(songs.keys()):
+        tasks.append({
+            "idx": int(idx),
+            "song": songs[idx],
+            "input_dir": input_dir,
+            "date_folder": date_folder,
+            "top_n": top_n,
+            "run_id": run_id,
+        })
+
+    # Max workers controlled by env; default to min(#songs, cpu_count or 2)
+    # Determine concurrency: default to start ALL songs at once.
+    val = os.getenv("ORDER_MAX_PROCS", "")
+    try:
+        max_workers = int(val) if val.strip() else -1
+    except Exception:
+        max_workers = -1
+    if max_workers <= 0:
+        max_workers = len(tasks)
+    else:
+        max_workers = max(1, min(max_workers, len(tasks)))
+
+    # Launch worker processes
+    results: dict[int, list[str | None]] = {}
+    errors_all: list[dict[str, Any]] = []
+    # Use 'spawn' for cross‑platform safety (Chrome + Selenium friendly)
+    ctx = _mp.get_context("spawn")
+    with _PPExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+        futures = {ex.submit(_song_worker, t): t["idx"] for t in tasks}
+        for fut in _as_completed(futures):
+            idx = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:  # pragma: no cover
+                errors_all.append({"idx": idx, "error": str(e)})
+                results[idx] = []
+                continue
+            # Normalize
+            if isinstance(res, dict):
+                results[idx] = list(res.get("pdfs") or [])
+                if res.get("errors"):
+                    errors_all.append({"idx": idx, "errors": res.get("errors")})
+            else:
+                results[idx] = []
+
+    # Collate in song index order
+    final_pdfs: list[str | None] = []
+    summary: dict[str, Any] = {"per_song": {}, "date_folder": date_folder, "run_id": run_id}
+    for idx in sorted(songs.keys()):
+        # If multiple matches, append each; otherwise ensure alignment
+        vals = results.get(idx, [])
+        summary["per_song"][str(idx)] = {
+            "title": (songs[idx] or {}).get("title", ""),
+            "matches": len([v for v in vals if v]),
+            "pdfs": [v for v in vals if v],
+        }
+        if not vals:
+            final_pdfs.append(None)
+        else:
+            final_pdfs.extend(vals)
+
+    new_state["final_pdfs"] = final_pdfs
+    if errors_all:
+        # Merge into state's error log for visibility
+        errs: list[dict[str, Any]] = list(new_state.get("errors", []) or [])
+        errs.extend(errors_all)
+        new_state["errors"] = errs
+
+    # Persist a summary to the debug directory for quick inspection
+    try:
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_json(base, "parallel_summary.json", summary)
+    except Exception:
+        pass
+
+    _record_timing(new_state, "process_songs_parallel_node", _stop_timer(start))
+    return new_state
+
+
 def compile_graph() -> Any:
-    """Construct and compile the order-of-worship graph with per-song loop over four steps."""
+    """Construct and compile the order-of-worship graph.
+
+    By default, songs are processed in parallel using separate processes
+    and Selenium browsers (ORDER_PARALLEL truthy). Set ORDER_PARALLEL=0 to
+    fall back to the original sequential per-song loop.
+    """
     graph = StateGraph(dict)
-    # Parse instruction and extract songs (unchanged)
+    # Shared prefix
     graph.add_node("parser", parser_node)
     graph.add_node("extractor", extract_songs_node)
-
-    # New: four explicit per-song steps + init
-    graph.add_node("init", init_loop_node)
-    graph.add_node("scraper", scraper_node)
-    graph.add_node("watermark", watermark_node)
-    graph.add_node("upscaler", upscaler_node)
-    graph.add_node("assembler", assembler_node)
-
-    # Wiring
     graph.add_edge(START, "parser")
     graph.add_edge("parser", "extractor")
-    graph.add_edge("extractor", "init")
-    graph.add_edge("init", "scraper")
-    graph.add_edge("scraper", "watermark")
-    graph.add_edge("watermark", "upscaler")
-    graph.add_edge("upscaler", "assembler")
 
-    # Loop: after assembling, either continue with next song or end
-    graph.add_conditional_edges(
-        "assembler",
-        should_continue,
-        {
-            "continue": "scraper",
-            "end": END,
-        },
-    )
+    use_parallel = _env_truthy(os.getenv("ORDER_PARALLEL", "1"))
+    if use_parallel:
+        graph.add_node("process_parallel", process_songs_parallel_node)
+        graph.add_edge("extractor", "process_parallel")
+        graph.add_edge("process_parallel", END)
+    else:
+        # Sequential per‑song loop
+        graph.add_node("init", init_loop_node)
+        graph.add_node("scraper", scraper_node)
+        graph.add_node("watermark", watermark_node)
+        graph.add_node("upscaler", upscaler_node)
+        graph.add_node("assembler", assembler_node)
+        graph.add_edge("extractor", "init")
+        graph.add_edge("init", "scraper")
+        graph.add_edge("scraper", "watermark")
+        graph.add_edge("watermark", "upscaler")
+        graph.add_edge("upscaler", "assembler")
+        graph.add_conditional_edges(
+            "assembler",
+            should_continue,
+            {
+                "continue": "scraper",
+                "end": END,
+            },
+        )
 
     return graph.compile()
 

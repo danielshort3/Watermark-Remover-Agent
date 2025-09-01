@@ -1865,43 +1865,111 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
 
     # Configure headless Chrome
     options = webdriver.ChromeOptions()
-    options.add_argument('--headless')
+    # Prefer the modern headless mode; fall back silently if unsupported.
+    try:
+        options.add_argument('--headless=new')
+    except Exception:
+        options.add_argument('--headless')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    # Set a larger window size to capture more of the page.  A larger viewport
-    # (1920x1080) improves screenshot annotations and ensures UI elements
-    # appear at predictable coordinates.
+    options.add_argument('--disable-gpu')
+    # Set a larger window size to capture more of the page.
     options.add_argument('--window-size=1920,1080')
-    # If a system-installed Chromium binary exists, use it; this is
-    # necessary when running inside a container where Chrome is installed
-    # under /usr/bin.
-    for candidate in ('/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'):
-        if os.path.isfile(candidate):
-            options.binary_location = candidate
+    # Allow env overrides for the browser binary; common in server/WSL setups.
+    for env_name in ('SELENIUM_BINARY', 'CHROME_BINARY', 'GOOGLE_CHROME_SHIM'):
+        bin_override = os.environ.get(env_name)
+        if bin_override and os.path.isfile(bin_override):
+            options.binary_location = bin_override
             break
-    # Start the WebDriver.  First attempt to use a system‑installed
-    # chromedriver (e.g. installed via the ``chromium-driver`` package).
-    # Fall back to webdriver_manager only if no local driver is found.
+    # If a system-installed Chromium binary exists, prefer it.
+    if not getattr(options, 'binary_location', None):
+        for candidate in (
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser',
+        ):
+            if os.path.isfile(candidate):
+                options.binary_location = candidate
+                break
+
+    # Helper: acquire a simple inter-process lock for webdriver-manager
+    def _acquire_wdm_lock(timeout: float = 120.0) -> str | None:
+        try:
+            locks_dir = os.path.join(os.getcwd(), 'output', 'locks')
+            os.makedirs(locks_dir, exist_ok=True)
+            lock_path = os.path.join(locks_dir, 'webdriver_manager.lock')
+            import time as _t
+            deadline = _t.time() + timeout
+            while True:
+                try:
+                    # atomic create
+                    fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    with os.fdopen(fd, 'w') as fh:
+                        fh.write(f"pid={os.getpid()}\n")
+                    return lock_path
+                except FileExistsError:
+                    if _t.time() >= deadline:
+                        return None
+                    _t.sleep(0.3)
+        except Exception:
+            return None
+
+    def _release_wdm_lock(path: str | None) -> None:
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    # Start the WebDriver:
+    # 1) Try Selenium Manager (no Service) which auto-resolves a matching driver.
     driver = None
     try:
-        driver_path_candidates = [
-            '/usr/bin/chromedriver',
-            '/usr/lib/chromium-browser/chromedriver',
-            '/usr/lib/chromium/chromedriver',
-        ]
-        for candidate_path in driver_path_candidates:
-            if os.path.isfile(candidate_path):
-                try:
-                    service = Service(candidate_path)
-                    driver = webdriver.Chrome(service=service, options=options)
-                    break
-                except Exception:
-                    continue
-        if driver is None:
-            # Fall back to webdriver_manager: this will download a driver if necessary
-            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    except Exception as err:
-        logger.error("SCRAPER: failed to start Chrome WebDriver: %s", err)
+        driver = webdriver.Chrome(options=options)
+    except Exception:
+        driver = None
+
+    # 2) Try system chromedriver paths.
+    if driver is None:
+        try:
+            driver_path_candidates = [
+                '/usr/bin/chromedriver',
+                '/usr/lib/chromium-browser/chromedriver',
+                '/usr/lib/chromium/chromedriver',
+            ]
+            for candidate_path in driver_path_candidates:
+                if os.path.isfile(candidate_path):
+                    try:
+                        service = Service(candidate_path)
+                        driver = webdriver.Chrome(service=service, options=options)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            driver = None
+
+    # 3) Fall back to webdriver_manager, protected by a simple lock to avoid races.
+    if driver is None:
+        drv_path: str | None = None
+        lock = _acquire_wdm_lock()
+        try:
+            try:
+                drv_path = ChromeDriverManager().install()
+            except Exception as _wdm_err:
+                logger.error("SCRAPER: failed to resolve chromedriver (wdm): %s", _wdm_err)
+                drv_path = None
+        finally:
+            _release_wdm_lock(lock)
+        if drv_path:
+            try:
+                driver = webdriver.Chrome(service=Service(drv_path), options=options)
+            except Exception as _drv_err:
+                logger.error("SCRAPER: failed to start Chrome WebDriver (wdm service): %s", _drv_err)
+                driver = None
+
+    if driver is None:
+        logger.error("SCRAPER: failed to start Chrome WebDriver: no viable driver found")
         return None
 
     try:
