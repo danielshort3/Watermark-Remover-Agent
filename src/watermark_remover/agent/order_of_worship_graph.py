@@ -684,19 +684,6 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     top_n: int = int(payload.get("top_n", 3) or 3)
     run_id: str = str(payload.get("run_id") or "run")
 
-    # Configure a per‑song log directory nested under the order's debug root.
-    # This unifies all artifacts (graph + tools) under one location.
-    run_ts = f"{run_id}_song{idx+1:02d}"
-    _os.environ["RUN_TS"] = run_ts
-    base_root = _Path(_os.getcwd()) / "output" / "debug" / "orders" / date_folder / run_id / "songs" / f"{per_song_prefix}_{safe_title}"
-    base_root.mkdir(parents=True, exist_ok=True)
-    _os.environ["WMRA_LOG_DIR"] = str(base_root)
-    # Record start time for diagnostics
-    try:
-        (base_root / "worker_times.json").write_text(_json.dumps({"start": _time.time()}), encoding="utf-8")
-    except Exception:
-        pass
-
     # Lazy imports of tools to ensure they are resolved in child process.
     try:
         from watermark_remover.agent.tools import (
@@ -717,6 +704,19 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     safe_title = _sanitize(song.get("title", "Unknown Title"))
     per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
     per_song_name = f"{per_song_prefix}_{safe_title}"
+
+    # Configure a per‑song log directory nested under the order's debug root.
+    # This unifies all artifacts (graph + tools) under one location.
+    run_ts = f"{run_id}_song{idx+1:02d}"
+    _os.environ["RUN_TS"] = run_ts
+    base_root = _Path(_os.getcwd()) / "output" / "debug" / "orders" / date_folder / run_id / "songs" / per_song_name
+    base_root.mkdir(parents=True, exist_ok=True)
+    _os.environ["WMRA_LOG_DIR"] = str(base_root)
+    # Record start time for diagnostics
+    try:
+        (base_root / "worker_times.json").write_text(_json.dumps({"start": _time.time()}), encoding="utf-8")
+    except Exception:
+        pass
 
     # Ensure pipeline log handlers (per-process)
     try:
@@ -1717,11 +1717,13 @@ def process_songs_parallel_node(state: Dict[str, Any]) -> Dict[str, Any]:
         errs.extend(errors_all)
         new_state["errors"] = errs
 
-    # Persist a summary to the debug directory for quick inspection
+    # Persist a summary (and any parallel errors) to the debug directory for quick inspection
     try:
         if _debug_enabled(new_state):
             base = _debug_dir_for(new_state)
             _write_json(base, "parallel_summary.json", summary)
+            if errors_all:
+                _write_json(base, "parallel_errors.json", errors_all)
     except Exception:
         pass
 
