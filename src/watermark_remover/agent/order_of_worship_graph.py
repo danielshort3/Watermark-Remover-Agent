@@ -1050,6 +1050,9 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if build_song_extractor_prompt:
             prompt = build_song_extractor_prompt(pdf_text, user_req)
         else:
+            # Strengthen detection hints so the LLM includes entries like
+            # "4:56 Praise [ Elevation Worship in E ]" which are easy to
+            # mistake for section headers, but are actual songs.
             rules = (
                 "\n\nSELECTION RULES (apply strictly if present):\n"
                 "- Respect user instructions like 'do not download <title>' or 'only download the fourth song'.\n"
@@ -1058,10 +1061,23 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "- Exclusions first, then inclusions.\n"
                 "- Never fabricate songs; only pick from RAW TEXT.\n"
             )
+            hints = (
+                "\n\nSONG DETECTION HINTS:\n"
+                "- Treat any line of the form '<Title> [ <Artist> in <Key> ]' as a SONG entry.\n"
+                "- Allow a leading timestamp (e.g., '3:25' or '4:56') before the title; still a SONG.\n"
+                "- Include titles even if they look like generic labels (e.g., 'Praise', 'Response'):\n"
+                "  if they appear with '[ <Artist> in <Key> ]', they are SONGS.\n"
+                "- Ignore obvious non-songs without '[ Artist in Key ]' like 'Pre Service', 'Announcements',\n"
+                "  'Offering Prayer', 'Sermon', 'Scripture', 'Rehearsal Times', or 'Length in mins'.\n"
+                "- Keep duplicate titles if they appear in different keys or at different times.\n"
+                "- Accept 'Default Arrangement' as a valid artist.\n"
+                "- Example: '4:56 Praise [ Elevation Worship in E ]' -> title='Praise', artist='Elevation Worship', key='E'.\n"
+            )
             ui = ("\n\nUSER REQUESTS:\n" + user_req) if user_req else ""
             prompt = (
                 "You are a precise parser for 'order of worship' text. Return strict JSON mapping indices to {title, artist, key}."
                 + rules
+                + hints
                 + ui
                 + f"\n\nRAW ORDER OF WORSHIP TEXT:\n{pdf_text}\n\nReturn ONLY the JSON object."
             )

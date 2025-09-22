@@ -206,6 +206,26 @@ def build_song_extractor_prompt(pdf_text: str, user_instruction: str | None = No
         "If details cannot be found for a field, use an empty string. Do not fabricate songs not present in the text. "
         "Return only JSON, no extra commentary."
     )
+
+    # NEW: pattern-first guidance for bracketed lines and robust filtering
+    pattern_hints = (
+        "\n\nDETECTION HINTS (use these rules in order):\n"
+        "1) Treat any line that contains a left bracket '[' and a right bracket ']' with the form:\n"
+        "   <Title> [ <ArtistOrTag> in <Key> ]\n"
+        "   as a STRONG song candidate. The <Title> is everything before the ' ['; trim leading timecodes like '4:56 ' or '1:00 '.\n"
+        "   Inside the brackets, split on the last occurrence of ' in ' (case-insensitive) to get <ArtistOrTag> and <Key>.\n"
+        "   - If <ArtistOrTag> equals or contains phrases like 'Default Arrangement', 'Arrangement', or 'Default', set artist=\"\".\n"
+        "   - Normalize <Key> to a concise musical key token (A–G with optional #/b and optional 'm' for minor).\n"
+        "     Examples: A, Bb, F#, Dm. If the key cannot be deduced, use an empty string.\n"
+        "2) Ignore non-song operational rows: lines containing words like 'Scripture', 'Sermon', 'Announcements', 'Offering', "
+        "'Prayer', 'Welcome', 'Length', 'Rehearsal', or section headings/tracks of song form (e.g., 'Intro, V1, C1, B×2').\n"
+        "3) Titles may include parentheses and punctuation—keep them verbatim (e.g., 'Firm Foundation (He Won't)').\n"
+        "4) If a song appears more than once, keep each occurrence in appearance order (they may have different keys).\n"
+        "5) Only extract songs you can anchor to the bracket pattern; do not infer songs from adjacent lines.\n"
+        "6) Keys may be written with Unicode flats/sharps. Prefer ASCII forms: 'B♭'→'Bb', 'E♭'→'Eb', 'F♯'→'F#'.\n"
+    )
+
+    # Keep your strict selection logic, unchanged, but mention order mapping to the detected list
     rules = (
         "\n\nSELECTION RULES (apply strictly if present):\n"
         "- If the user requests to exclude songs by title (e.g., 'do not download Amazing Grace'), omit those titles.\n"
@@ -215,9 +235,28 @@ def build_song_extractor_prompt(pdf_text: str, user_instruction: str | None = No
         "- If constraints produce zero songs, return an empty JSON object.\n"
         "- Never fabricate songs; only pick from titles present in RAW TEXT.\n"
     )
+
+    # Tiny examples to nudge the model toward correct slicing
+    examples = (
+        "\n\nEXAMPLES (pattern application):\n"
+        "Line: '4:56 Praise [ Elevation Worship in E ]' → {\"title\":\"Praise\",\"artist\":\"Elevation Worship\",\"key\":\"E\"}\n"
+        "Line: '3:25 Because He Lives (Amen) [ Matt Maher in A ]' → {\"title\":\"Because He Lives (Amen)\",\"artist\":\"Matt Maher\",\"key\":\"A\"}\n"
+        "Line: '4:00 Firm Foundation (He Won't) [ Default Arrangement in D ]' → {\"title\":\"Firm Foundation (He Won't)\",\"artist\":\"\",\"key\":\"D\"}\n"
+    )
+
     ui = (user_instruction or "").strip()
     ui_block = ("\n\nUSER REQUESTS:\n" + ui) if ui else ""
-    return song_extract_system + rules + ui_block + "\n\nRAW ORDER OF WORSHIP TEXT:\n" + pdf_text + "\n\nReturn ONLY the JSON object."
+
+    return (
+        song_extract_system
+        + pattern_hints
+        + rules
+        + examples
+        + ui_block
+        + "\n\nRAW ORDER OF WORSHIP TEXT:\n"
+        + pdf_text
+        + "\n\nReturn ONLY the JSON object."
+    )
 
 
 def build_single_song_parser_prompt(instruction: str) -> str:
