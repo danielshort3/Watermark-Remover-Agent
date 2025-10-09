@@ -1,12 +1,15 @@
 /watermark_remover/agent/__pycache__
 /watermark_remover/__pycache__
 /watermark_remover/inference/__pycache__
-/models
-/data
 /.vs
-/output
 *.pyc
-*.pyc
-*.pyc
-*.pyc
-/input
+
+# Keep top-level data directories while ignoring their contents
+/models/*
+!/models/.gitkeep
+/data/*
+!/data/.gitkeep
+/input/*
+!/input/.gitkeep
+/output/*
+!/output/.gitkeep
