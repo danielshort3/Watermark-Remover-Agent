@@ -45,6 +45,8 @@ docker run --gpus all --rm \
   -e OLLAMA_KEEP_ALIVE=30m \
   -v "$(pwd)/models:/app/models" \
   -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/input:/app/input" \
+  -v "$(pwd)/output:/app/output" \
   watermark-remover-agent
 ```
 
