@@ -100,6 +100,13 @@ except Exception:
 
 LOGGER_NAME = "order_of_worship"
 _logger = logging.getLogger(LOGGER_NAME)
+_PDFMINER_LOGGERS = (
+    "pdfminer",
+    "pdfminer.psparser",
+    "pdfminer.pdfinterp",
+    "pdfminer.pdfdevice",
+    "pdfminer.pdfpage",
+)
 
 def _env_truthy(v: str | None) -> bool:
     if v is None:
@@ -120,6 +127,10 @@ def _ensure_logger_configured(level: int) -> None:
         fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
         ch.setFormatter(fmt)
         _logger.addHandler(ch)
+    # pdfminer can emit extremely verbose debug logs; clamp them to WARNING.
+    for name in _PDFMINER_LOGGERS:
+        plogger = logging.getLogger(name)
+        plogger.setLevel(logging.WARNING)
 
 def _get_run_id(state: Dict[str, Any]) -> str:
     rid = state.get("run_id")
@@ -165,7 +176,8 @@ def _get_order_folder(state: Dict[str, Any]) -> str:
 
 def _debug_dir_for(state: Dict[str, Any]) -> Path:
     run_id = _get_run_id(state)
-    order_folder = _get_order_folder(state)
+    hook = state.get("_debug_order_folder")
+    order_folder = hook if isinstance(hook, str) and hook else _get_order_folder(state)
     base = Path(os.getcwd()) / "output" / "debug" / "orders" / order_folder / run_id
     base.mkdir(parents=True, exist_ok=True)
     return base
@@ -348,49 +360,43 @@ def _run_llm_strict_json(
 # ---------------------------------------------------------------------------
 
 try:
-    import pdfplumber  # type: ignore
-except Exception:
-    pdfplumber = None  # type: ignore
-
-try:
-    from PyPDF2 import PdfReader  # type: ignore
-except Exception:
-    PdfReader = None  # type: ignore
-
-try:
     from pdfminer.high_level import extract_text as pdfminer_extract_text  # type: ignore
+    from pdfminer.pdfpage import PDFPage  # type: ignore
 except Exception:
     pdfminer_extract_text = None  # type: ignore
+    PDFPage = None  # type: ignore
 
 def _read_pdf_text(pdf_path: str) -> str:
-    """Extract raw text from a PDF using one of several fallback libraries."""
-    if pdfplumber is not None:
-        try:
-            chunks: List[str] = []
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    chunks.append(page.extract_text() or "")
-            return "\n".join(chunks)
-        except Exception:
-            pass
-    if PdfReader is not None:
-        try:
-            reader = PdfReader(pdf_path)  # type: ignore[call-arg]
-            chunks: List[str] = []
-            for page in reader.pages:
-                chunks.append(page.extract_text() or "")
-            return "\n".join(chunks)
-        except Exception:
-            pass
-    if pdfminer_extract_text is not None:
-        try:
-            txt = pdfminer_extract_text(pdf_path)  # type: ignore[call-arg]
-            return txt or ""
-        except Exception:
-            pass
-    raise RuntimeError(
-        "Could not read PDF text. Please install pdfplumber, PyPDF2, or pdfminer.six."
-    )
+    """Extract raw text from a PDF using pdfminer.six with verbose tracing."""
+    _logger.info("Attempting to extract text from PDF via pdfminer: %s", pdf_path)
+    if pdfminer_extract_text is None or PDFPage is None:
+        msg = "pdfminer.six is unavailable. Install pdfminer.six to enable PDF parsing."
+        _logger.error(msg)
+        raise RuntimeError(msg)
+
+    if not os.path.exists(pdf_path):
+        msg = f"PDF path not found: {pdf_path}"
+        _logger.error(msg)
+        raise RuntimeError(msg)
+
+    try:
+        page_count = 0
+        with open(pdf_path, "rb") as fh:
+            for page_count, _ in enumerate(PDFPage.get_pages(fh), start=1):
+                _logger.info("Detected PDF page %d", page_count)
+        _logger.info("pdfminer detected %d total pages", page_count)
+        if page_count == 0:
+            _logger.warning("pdfminer did not detect any pages in %s", pdf_path)
+
+        _logger.info("Running pdfminer text extraction.")
+        text = pdfminer_extract_text(pdf_path) or ""
+        _logger.info("Completed pdfminer extraction; text length: %d characters", len(text))
+        if not text.strip():
+            _logger.warning("pdfminer returned empty text for %s", pdf_path)
+        return text
+    except Exception as exc:
+        _logger.exception("pdfminer failed during PDF processing: %s", pdf_path)
+        raise RuntimeError("pdfminer could not read the PDF.") from exc
 
 
 
@@ -550,27 +556,41 @@ def _extract_service_date_with_llm(state: Dict[str, Any], pdf_text: str) -> str 
 
 def _determine_order_folder_from_pdf(state: Dict[str, Any], pdf_path: str) -> str:
     """Read PDF text, then use LLM (preferred) or heuristics to produce MM_DD_YYYY, else 'unknown'."""
+    _logger.info("Determining order folder from PDF: %s", pdf_path)
     try:
         raw = _read_pdf_text(pdf_path)
     except Exception as e:
+        _logger.exception("Failed to read PDF text for date extraction: %s", pdf_path)
         _record_error(state, "date_extractor.read_pdf_exception", e)
         raw = ""
 
     if _debug_enabled(state):
+        state["_debug_order_folder"] = state.get("order_folder") or "unknown"
         base = _debug_dir_for(state)
         _write_text(base, "pdf_text.txt", raw)
 
+    if raw:
+        _logger.info("PDF text extracted; length=%d. Proceeding to date extraction.", len(raw))
+    else:
+        _logger.warning("No text available from PDF; LLM/heuristic date extraction may fail.")
+
     # First try LLM
+    _logger.info("Invoking LLM-based date extractor.")
     date = _extract_service_date_with_llm(state, raw)
     # Fallback to heuristics
     if not date:
+        _logger.info("LLM date extractor returned empty result; falling back to heuristics.")
         date = _extract_service_date_heuristic(raw)
 
     if not date:
+        _logger.warning("Unable to extract service date; defaulting to 'unknown'.")
         date = "unknown"
+    else:
+        _logger.info("Extracted service date candidate: %s", date)
 
     # Persist decision for debugging
     if _debug_enabled(state):
+        state["_debug_order_folder"] = state.get("order_folder") or date
         base = _debug_dir_for(state)
         _write_text(base, "date_of_service.txt", date)
 

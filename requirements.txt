@@ -1,7 +1,10 @@
 # Core dependencies for the Watermark Remover Agent with full model support.
 # PyTorch and CUDA are provided by the base Docker image.
 langchain
-langchain-ollama
+langchain-ollama>=0.1.3
+ollama>=0.2.1
+httpx>=0.27.2
+pydantic>=2.8.2
 reportlab
 Pillow
 torchvision
@@ -14,7 +17,7 @@ pytest
 numpy
 
 # PDF parsing dependency for the order-of-worship graph
-PyPDF2
+pdfminer.six
 
 # Additional packages required for LangGraph support.  The ``langgraph`` package
 # provides the core graph abstractions while ``langgraph-cli`` installs the
