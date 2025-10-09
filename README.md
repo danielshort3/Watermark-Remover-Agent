@@ -52,6 +52,12 @@ When the container starts you can either run an interactive REPL via
 `python -m watermark_remover.agent.ollama_agent` or execute a single
 instruction with the convenience function described below.
 
+Example user input (JSON payload):
+
+```json
+{"user_input": "Download the songs in 'October 12, 2025.pdf' for the French Horn."}
+```
+
 ## Using the agent
 
 You can create a reusable agent object by calling
