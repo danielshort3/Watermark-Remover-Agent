@@ -1,19 +1,31 @@
 """
-Helpers for invoking the Ollama‑powered chat agent.
+Helpers for invoking the Ollama-powered chat agent.
 
-This module provides a direct interface to execute natural‑language
-instructions using a single ChatOllama LLM (no LangChain AgentExecutor).
-It avoids deprecated Agent APIs and keeps calls lightweight for our
-classification/ranking prompts.
+This module exposes a convenience wrapper that now prefers running the
+LangChain-based agent (constructed via :func:`get_ollama_agent`) so the LLM can
+plan and execute tools autonomously.  If the agent cannot be constructed (for
+example, when optional dependencies are missing) the helper falls back to a
+direct ChatOllama invocation, matching the previous behaviour.
 """
 
 from __future__ import annotations
 
-import os
+import logging
 import json
+import os
 import urllib.request
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from config.settings import DEFAULT_OLLAMA_URL, DEFAULT_OLLAMA_MODEL
+
+
+def _candidate_ollama_urls(base_url: str) -> list[str]:
+    urls = [base_url]
+    norm = base_url.replace("127.0.0.1", "localhost")
+    if "localhost" in norm:
+        alt = norm.replace("localhost", "host.docker.internal")
+        if alt not in urls:
+            urls.append(alt)
+    return urls
 
 
 def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
@@ -26,22 +38,27 @@ def _ping_ollama(base_url: str, model: str) -> Dict[str, Any]:
     along with the original ``base_url`` and ``model`` values.  On
     failure it sets ``ok=False`` and includes an ``error`` string.
     """
-    out: Dict[str, Any] = {"ok": True, "base_url": base_url, "model": model}
-    try:
-        with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/version", timeout=5) as resp:
-            out["version"] = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
-        out.update(ok=False, error=f"Failed to reach {base_url}/api/version: {exc}")
+    errors: list[str] = []
+    for candidate in _candidate_ollama_urls(base_url):
+        out: Dict[str, Any] = {"ok": True, "base_url": candidate, "model": model}
+        try:
+            with urllib.request.urlopen(f"{candidate.rstrip('/')}/api/version", timeout=5) as resp:
+                out["version"] = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            errors.append(f"Failed to reach {candidate}/api/version: {exc}")
+            continue
+        try:
+            with urllib.request.urlopen(f"{candidate.rstrip('/')}/api/tags", timeout=5) as resp:
+                tags = json.loads(resp.read().decode("utf-8")).get("models", [])
+                names = [m.get("name") or m.get("model") for m in tags]
+                out["models"] = names
+                out["has_model"] = model in names
+        except Exception as exc:
+            errors.append(f"Failed to query tags at {candidate}: {exc}")
+            continue
         return out
-    try:
-        with urllib.request.urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=5) as resp:
-            tags = json.loads(resp.read().decode("utf-8")).get("models", [])
-            names = [m.get("name") or m.get("model") for m in tags]
-            out["models"] = names
-            out["has_model"] = model in names
-    except Exception as exc:
-        out.update(ok=False, error=f"Failed to query tags: {exc}")
-    return out
+    # Exhausted all candidates
+    return {"ok": False, "base_url": base_url, "model": model, "error": "; ".join(errors)}
 
 
 try:
@@ -49,18 +66,74 @@ try:
 except Exception:
     ChatOllama = None  # type: ignore
 
+try:
+    from watermark_remover.agent.ollama_agent import get_ollama_agent  # type: ignore
+    _AGENT_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - import-time diagnostics
+    get_ollama_agent = None  # type: ignore
+    _AGENT_IMPORT_ERROR = exc
+
 _LLM: Any = None
+_LLM_MODEL: Optional[str] = None
+_LLM_BASE_URL: Optional[str] = None
+_AGENT: Any = None
+_AGENT_MODEL: Optional[str] = None
+_AGENT_BASE_URL: Optional[str] = None
+
+_logger = logging.getLogger(__name__)
 
 
-def _get_llm() -> Any:
-    base_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
-    model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+def _get_llm(base_url: str, model: str) -> Any:
     if ChatOllama is None:
         raise ImportError("ChatOllama is not available; install langchain-ollama.")
-    global _LLM
-    if _LLM is None:
-        _LLM = ChatOllama(model=model, base_url=base_url, temperature=0.0, keep_alive=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"))
+    global _LLM, _LLM_MODEL, _LLM_BASE_URL
+    if _LLM is not None and _LLM_MODEL == model and _LLM_BASE_URL == base_url:
+        return _LLM
+    _LLM = ChatOllama(
+        model=model,
+        base_url=base_url,
+        temperature=0.0,
+        keep_alive=os.environ.get("OLLAMA_KEEP_ALIVE", "30m"),
+    )
+    _LLM_MODEL = model
+    _LLM_BASE_URL = base_url
     return _LLM
+
+
+def _get_agent(base_url: str, model: str) -> Any:
+    """Return or construct a cached LangChain agent for the given endpoint."""
+    if get_ollama_agent is None:
+        raise ImportError(
+            "The LangChain agent dependencies are not installed; install "
+            "langchain, langchain-community, and langchain-ollama to enable "
+            "agent execution."
+            + (
+                f" (import error: {_AGENT_IMPORT_ERROR})"
+                if _AGENT_IMPORT_ERROR is not None
+                else ""
+            )
+        )
+    global _AGENT, _AGENT_MODEL, _AGENT_BASE_URL
+    if _AGENT is not None and _AGENT_MODEL == model and _AGENT_BASE_URL == base_url:
+        return _AGENT
+    agent = get_ollama_agent(model_name=model, base_url=base_url)
+    _AGENT = agent
+    _AGENT_MODEL = model
+    _AGENT_BASE_URL = base_url
+    return agent
+
+
+def _extract_agent_output(result: Any) -> str:
+    """Normalise the agent response into a printable string."""
+    if isinstance(result, dict):
+        for key in ("output", "result", "text", "content"):
+            value = result.get(key)
+            if value is not None:
+                return str(value)
+        return str(result)
+    if hasattr(result, "content"):
+        return str(result.content)  # type: ignore[attr-defined]
+    return str(result)
 
 
 def run_instruction(instruction: str) -> str:
@@ -85,39 +158,77 @@ def run_instruction(instruction: str) -> str:
     str
         The agent's response or an error message.
     """
-    prompt = (instruction or "").strip()
-    if not prompt:
+    user_prompt = (instruction or "").strip()
+    if not user_prompt:
         return (
             "No instruction provided. Please supply a natural‑language task "
             "for the agent to perform."
         )
-    base_url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
+    prompt = user_prompt
+    lowered = user_prompt.lower()
+    if ".pdf" in lowered and ("order of worship" in lowered or "order" in lowered):
+        prompt = (
+            user_prompt
+            + "\n\nReminder: When processing an order-of-worship PDF you MUST call the "
+              "ensure_order_pdf tool to copy the source PDF into the output/orders/<date>/ "
+              "directory using a '00_' prefix (e.g. '00_October_12_2025_Order_Of_Worship.pdf')."
+        )
+    elif ".pdf" not in lowered and any(
+        keyword in lowered for keyword in ("download", "find", "locate", "fetch")
+    ):
+        prompt = (
+            user_prompt
+            + "\n\nReminder: When the user requests a specific song (not an order PDF), "
+              "use the scrape_music tool with the requested title/instrument/key, then run "
+              "remove_watermark, upscale_images, and assemble_pdf for that song only."
+        )
+    base_url_env = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
-    diag = _ping_ollama(base_url, model)
+    diag = _ping_ollama(base_url_env, model)
     if not diag.get("ok", False):
-        return f"Cannot reach Ollama at {base_url}: {diag.get('error', 'Unknown error')}"
+        return f"Cannot reach Ollama at {base_url_env}: {diag.get('error', 'Unknown error')}"
+    resolved_base_url = str(diag.get("base_url") or base_url_env)
     if not diag.get("has_model", False):
         return (
             f"Model '{model}' not found on Ollama server. Available models: "
             f"{diag.get('models')}"
         )
-    # Use a single ChatOllama instance and call invoke directly.
+
+    agent: Any | None = None
+    agent_error: Optional[Exception] = None
     try:
-        llm = _get_llm()
-        response = llm.invoke(prompt)  # type: ignore
-        answer = response.content if hasattr(response, "content") else str(response)
-    except Exception as exc:
-        return f"Error executing instruction: {exc}"
-    # Fallback: if the answer looks like a plan (contains an action and action_input)
-    # but the agent did not execute the tool, parse and run the tool manually.
-    # No tool-execution plan handling is needed for our classification prompts.
-    # Persist the thought process and steps to a log file under the
-    # output directory.  Each invocation appends to the log with the
-    # instruction and the model's full response.  This allows users to
-    # inspect how the agent reasoned about the task and which tools were
-    # invoked.  If the file cannot be written, we silently ignore
-    # errors.
+        agent = _get_agent(resolved_base_url, model)
+    except Exception as exc:  # noqa: BLE001 - Return message downstream
+        agent_error = exc
+
+    answer: str
+    if agent is not None and agent_error is None:
+        try:
+            result = agent.invoke({"input": prompt})
+            answer = _extract_agent_output(result)
+        except Exception as exc:  # noqa: BLE001
+            agent_error = exc
+        else:
+            agent_error = None
+
+    if agent_error is not None or agent is None:
+        # Fall back to the direct model call when the agent is unavailable.
+        if agent_error is not None:
+            _logger.warning(
+                "Falling back to direct LLM call because the agent is unavailable: %s",
+                agent_error,
+            )
+        try:
+            llm = _get_llm(resolved_base_url, model)
+            response = llm.invoke(prompt)  # type: ignore
+            answer = (
+                response.content if hasattr(response, "content") else str(response)
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"Error executing instruction: {exc}"
+
     try:
+        # Persist the thought process and steps to a log file under the output directory.
         # Persist the thought process to a log file under the run‑specific
         # logs directory.  Use the WMRA_LOG_DIR environment variable if set.
         log_root = os.environ.get("WMRA_LOG_DIR") or os.path.join(os.getcwd(), "logs")

@@ -3,7 +3,7 @@ and LLM-only natural-language handling (no heuristic NLP).
 
 Key changes:
 - Adds robust debugging (run IDs, per-node timings, structured errors, persisted artifacts).
-- Uses ONLY the LLM (run_instruction) to parse user instructions and extract song metadata.
+- Delegates parsing to run_instruction (agent-backed, with direct-LLM fallback) to extract song metadata.
 - Removes all regex/rule-based NLP parsing for instructions and songs.
 
 Debug artifacts are written to:

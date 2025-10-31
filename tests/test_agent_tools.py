@@ -31,6 +31,7 @@ from watermark_remover.agent.tools import (
     upscale_images,
     assemble_pdf,
     scrape_music,
+    ensure_order_pdf,
 )
 from watermark_remover.agent.graph_ollama import run_instruction
 
@@ -155,6 +156,27 @@ def test_scrape_music_found_and_missing_key() -> None:
             os.rmdir(os.path.join(data_samples, "FurElise"))
         except Exception:
             pass
+
+
+def test_ensure_order_pdf_creates_zero_index_file() -> None:
+    """ensure_order_pdf should copy the source PDF into a 00_-prefixed file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_pdf = os.path.join(tmpdir, "October 12, 2025.pdf")
+        with open(source_pdf, "wb") as fh:
+            fh.write(b"%PDF-1.4\n% test content\n")
+        output_root = os.path.join(tmpdir, "orders")
+        result = ensure_order_pdf.invoke(
+            {
+                "pdf_name": source_pdf,
+                "order_folder": "October 12, 2025",
+                "output_root": output_root,
+            }
+        )
+        assert os.path.isfile(result)
+        assert result.endswith("00_October_12_2025_Order_Of_Worship.pdf")
+        # Ensure the file lives under the expected folder
+        expected_dir = os.path.join(output_root, "10_12_2025")
+        assert os.path.commonpath([result, expected_dir]) == expected_dir
 
 
 def test_run_instruction_returns_string() -> None:

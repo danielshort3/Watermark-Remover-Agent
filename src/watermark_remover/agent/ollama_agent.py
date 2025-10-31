@@ -46,6 +46,7 @@ from watermark_remover.agent.tools import (
     remove_watermark,
     upscale_images,
     assemble_pdf,
+    ensure_order_pdf,
 )
 
 
@@ -98,11 +99,12 @@ def get_ollama_agent(
         )
     try:
         from langchain.agents import AgentType, initialize_agent  # type: ignore[import]
+        _legacy_agent_available = True
     except Exception:
-        raise ImportError(
-            "The langchain package is not installed. "
-            "Install it to enable agent construction."
-        )
+        AgentType = None  # type: ignore[assignment]
+        initialize_agent = None  # type: ignore[assignment]
+        _legacy_agent_available = False
+
     # Instantiate the chat model.  We explicitly set ``keep_alive`` so the
     # model stays resident in the Ollama server between successive tool
     # invocations; this avoids the overhead of unloading and reloading the
@@ -116,19 +118,90 @@ def get_ollama_agent(
     )
     # Use the @tool‑decorated callables directly.  The LangChain agent will
     # inspect their signatures and docstrings to construct the tool schemas.
-    tools = [scrape_music, remove_watermark, upscale_images, assemble_pdf]
-    # Construct a structured chat agent that uses function‑calling style
-    # reasoning (ReAct).  This agent reads the tool descriptions and
-    # determines when to call them based on the user's input.  Structured
-    # chat helps ensure that complex arguments (like JSON structures) are
-    # passed correctly to the tools.
-    agent_executor = initialize_agent(
-        tools=tools,
-        llm=llm,
-        agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-        verbose=verbose,
+    tools = [scrape_music, remove_watermark, upscale_images, assemble_pdf, ensure_order_pdf]
+
+    if _legacy_agent_available and initialize_agent is not None and AgentType is not None:
+        # Construct a structured chat agent that uses the legacy initialize_agent API.
+        return initialize_agent(
+            tools=tools,
+            llm=llm,
+            agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+            verbose=verbose,
+        )
+
+    # Fall back to the modern tool-calling agent available in LangChain >= 0.2.
+    try:
+        from langchain.agents import create_agent  # type: ignore[import]
+        from langchain_core.messages import (
+            AIMessage,
+            BaseMessage,
+            HumanMessage,
+        )  # type: ignore[import]
+    except Exception as exc:
+        raise ImportError(
+            "LangChain agent interfaces are unavailable. Install both "
+            "langchain and langchain-community to enable agent construction."
+        ) from exc
+
+    system_msg = (
+        "You are the Watermark Remover agent. Decide which tools to call based on "
+        "the user's request. Always call ensure_order_pdf before processing an "
+        "order of worship PDF so the source file is copied into output/orders."
     )
-    return agent_executor
+    graph = create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_msg,
+        debug=verbose,
+    )
+
+    class _GraphAgentWrapper:
+        """Adapter that exposes an invoke() signature similar to AgentExecutor."""
+
+        def __init__(self, compiled_graph):
+            self._graph = compiled_graph
+
+        def invoke(self, inputs: object) -> str:
+            prompt: str | None = None
+            messages: list[BaseMessage] | None = None
+            if isinstance(inputs, dict):
+                prompt = inputs.get("input") or inputs.get("prompt")  # type: ignore[arg-type]
+                raw_messages = inputs.get("messages")
+                if isinstance(raw_messages, list):
+                    tmp: list[BaseMessage] = []
+                    for item in raw_messages:
+                        if isinstance(item, BaseMessage):
+                            tmp.append(item)
+                        elif isinstance(item, dict):
+                            role = str(item.get("role") or "user").lower()
+                            content = item.get("content", "")
+                            if role in {"user", "human"}:
+                                tmp.append(HumanMessage(content=str(content)))
+                            else:
+                                tmp.append(AIMessage(content=str(content)))
+                        else:
+                            tmp.append(HumanMessage(content=str(item)))
+                    messages = tmp
+            elif isinstance(inputs, str):
+                prompt = inputs
+            if messages is None:
+                if not prompt:
+                    raise ValueError("Expected an 'input' string when invoking the agent.")
+                messages = [HumanMessage(content=str(prompt))]
+            if not messages:
+                raise ValueError("Expected an 'input' string when invoking the agent.")
+            result = self._graph.invoke({"messages": messages})
+            messages = result.get("messages") if isinstance(result, dict) else None
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    if isinstance(message, AIMessage):
+                        return message.content
+                if messages:
+                    return str(messages[-1])
+                return ""
+            return str(result)
+
+    return _GraphAgentWrapper(graph)
 
 
 def _ping(base_url: str, path: str) -> dict:

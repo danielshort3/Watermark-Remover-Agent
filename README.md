@@ -81,7 +81,9 @@ print(response)
 ```
 
 If you don't need to reuse the agent, use the convenience wrapper
-`run_instruction` to perform a single task:
+`run_instruction` to perform a single task. It now builds the LangChain agent
+on demand (falling back to a raw model call only when agent dependencies are
+missing), so tooling behaviour is consistent either way:
 
 ```python
 from watermark_remover.agent.graph_ollama import run_instruction
@@ -227,3 +229,8 @@ keeps browser sessions and tool state fully isolated across songs.
 Each worker process sets a unique `RUN_TS` and `WMRA_LOG_DIR` so logs and temp
 artifacts are kept separate, then copies assembled PDFs into `output/orders/<MM_DD_YYYY>/`
 with names like `01_01_Title_Instrument_Key.pdf`.
+- The agent now mirrors this behaviour: it calls the `ensure_order_pdf` tool to copy the
+  source service PDF into `output/orders/<MM_DD_YYYY>/00_<Month>_<DD>_<YYYY>_Order_Of_Worship.pdf`
+  whenever an order-of-worship instruction is processed.
+- For single-song requests (e.g., “Download ‘Fur Elise’ for French Horn”), the agent is prompted
+  to use `scrape_music` plus the watermark removal, upscaling, and PDF assembly tools for just that song.

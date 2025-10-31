@@ -31,14 +31,16 @@ with their own trained checkpoints to achieve meaningful results.
 
 from __future__ import annotations
 
+import calendar
 import glob
 import datetime
 import shutil
 import logging
 import os
+import re
 import time
-from typing import Optional, Any
 import random
+from typing import Optional, Any, Callable
 
 import requests  # used for downloading images during online scraping
 
@@ -65,11 +67,26 @@ from utils.transposition_utils import (
 from utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 from PIL import Image
 
-# Optional LLM ranking support (uses local Ollama-backed agent if available)
-try:
-    from watermark_remover.agent.graph_ollama import run_instruction as _llm_run_instruction  # type: ignore
-except Exception:
-    _llm_run_instruction = None  # type: ignore
+# Optional LLM ranking support (uses local Ollama-backed agent if available).
+# The import is deferred to avoid circular dependencies with graph_ollama.
+_llm_run_instruction: Callable[[str], Any] | None = None
+_llm_import_error: Exception | None = None
+
+
+def _get_llm_run_instruction() -> Callable[[str], Any] | None:
+    """Return the cached LangChain-aware runner, importing lazily to avoid cycles."""
+    global _llm_run_instruction, _llm_import_error
+    if _llm_run_instruction is not None or _llm_import_error is not None:
+        return _llm_run_instruction
+    try:
+        from watermark_remover.agent.graph_ollama import run_instruction as runner  # type: ignore
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        _llm_import_error = exc
+        runner = None
+    _llm_run_instruction = runner
+    return runner
+
+
 try:
     from watermark_remover.agent.prompts import (
         build_candidate_selection_prompt,
@@ -181,7 +198,8 @@ def _variant_rank(requested: str, candidate: str) -> tuple[int, int]:
     return (3, len(desc))
 
 def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], candidates: list[dict]) -> int | None:
-    if _llm_run_instruction is None:
+    runner = _get_llm_run_instruction()
+    if runner is None:
         return None
     try:
         # Build a compact list of candidates
@@ -216,7 +234,7 @@ def _choose_best_candidate_index_with_llm(title: str, artist: Optional[str], can
             log_prompt("candidate_selection", prompt)
         except Exception:
             pass
-        raw = _llm_run_instruction(prompt)  # type: ignore
+        raw = runner(prompt)  # type: ignore[arg-type]
         s = str(raw).strip()
         # Try to extract JSON block
         import json as _json, re as _re
@@ -325,7 +343,8 @@ def _llm_error_doctor(context: dict) -> dict | None:
     Expects a small context dict. Returns a dict like:
     {"action": "wait_longer|scroll_to_key_button|refresh_page|open_parts_then_key|back_to_results|scroll_to_orchestration|click_chords_then_orchestration|scroll_to_image|scroll_to_next_button|reopen_orchestration", "why": "..."}
     """
-    if _llm_run_instruction is None:
+    runner = _get_llm_run_instruction()
+    if runner is None:
         return None
     try:
         import json as _json
@@ -340,7 +359,7 @@ def _llm_error_doctor(context: dict) -> dict | None:
             log_prompt("error_doctor", prompt)
         except Exception:
             pass
-        raw = _llm_run_instruction(prompt)  # type: ignore
+        raw = runner(prompt)  # type: ignore[arg-type]
         try:
             log_llm_response("instrument_selection", raw)
         except Exception:
@@ -410,7 +429,8 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
     - Prefers sectioned labels (e.g., "French Horn 1/2", "Horn 1 & 2").
     - Returns EXACTLY one of the provided labels or an index into the list.
     """
-    if _llm_run_instruction is None or not available:
+    runner = _get_llm_run_instruction()
+    if runner is None or not available:
         return None
     try:
         # Build an index-mapped option list and include a canonical form for clarity
@@ -490,7 +510,7 @@ def _choose_best_instrument_with_llm(requested_instrument: str, available: list[
         except Exception:
             pass
 
-        raw = _llm_run_instruction(prompt)  # type: ignore
+        raw = runner(prompt)  # type: ignore[arg-type]
         try:
             log_llm_response("key_choice", raw)
         except Exception:
@@ -578,7 +598,8 @@ def _choose_best_key_with_llm(requested_key: str, available_labels: list[str]) -
       - Treat enharmonics as equal; labels may contain slashes such as 'A#/Bb'.
       - Return EXACTLY one of the provided labels verbatim (no new text).
     """
-    if _llm_run_instruction is None or not available_labels:
+    runner = _get_llm_run_instruction()
+    if runner is None or not available_labels:
         return None
     try:
         # Mapping for clarity in the prompt; enharmonics share the same value
@@ -602,7 +623,7 @@ def _choose_best_key_with_llm(requested_key: str, available_labels: list[str]) -
             log_prompt("key_choice", prompt)
         except Exception:
             pass
-        raw = _llm_run_instruction(prompt)  # type: ignore
+        raw = runner(prompt)  # type: ignore[arg-type]
         try:
             log_llm_response("alternate_readings_ranking", raw)
         except Exception:
@@ -659,7 +680,8 @@ def _rank_alternate_readings_with_llm(candidates: list[dict]) -> list[dict]:
     Preference: BRASS first, then SAX. Return STRICT JSON: {"order": [indices...]}
     On failure or if LLM unavailable, return the input list unchanged.
     """
-    if _llm_run_instruction is None or not candidates:
+    runner = _get_llm_run_instruction()
+    if runner is None or not candidates:
         return candidates
     try:
         items = [
@@ -676,7 +698,7 @@ def _rank_alternate_readings_with_llm(candidates: list[dict]) -> list[dict]:
             log_prompt("alternate_readings_ranking", prompt)
         except Exception:
             pass
-        raw = _llm_run_instruction(prompt)  # type: ignore
+        raw = runner(prompt)  # type: ignore[arg-type]
         if not raw:
             return candidates
         s = str(raw).strip()
@@ -3498,3 +3520,166 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf", meta: Op
     # preserved under the run directory for future debugging and
     # reproducibility.  Return the path to the assembled PDF.
     return final_pdf_path
+
+
+def _parse_order_date_tokens(raw: str) -> tuple[int, int, int] | None:
+    """Best-effort parse for service dates from strings like 'October 12, 2025' or '10_12_2025'."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    # Normalise separators for numeric formats
+    simple = re.sub(r"[^\d]", " ", text)
+    simple = re.sub(r"\s+", " ", simple).strip()
+    if simple:
+        parts = simple.split()
+        if len(parts) == 3:
+            first, second, third = parts
+            try:
+                a, b, c = int(first), int(second), int(third)
+            except ValueError:
+                a = b = c = 0
+            else:
+                # Distinguish MM DD YYYY vs YYYY MM DD
+                if 1 <= a <= 12 and 1 <= b <= 31 and 1000 <= c <= 9999:
+                    return a, b, c
+                if 1000 <= a <= 9999 and 1 <= b <= 12 and 1 <= c <= 31:
+                    return b, c, a
+                if 1 <= a <= 31 and 1 <= b <= 12 and 1000 <= c <= 9999:
+                    return b, a, c
+    # Handle month name formats
+    text_norm = re.sub(r"[_\-]", " ", text)
+    month_match = re.search(
+        r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{2,4}))?",
+        text_norm,
+    )
+    if month_match:
+        month_token = month_match.group(1)
+        day_token = month_match.group(2)
+        year_token = month_match.group(3)
+        month_index = None
+        if month_token:
+            token = month_token.strip().lower()
+            month_index = next(
+                (
+                    idx
+                    for idx, name in enumerate(calendar.month_name)
+                    if name and name.lower() == token
+                ),
+                None,
+            )
+            if month_index is None:
+                month_index = next(
+                    (
+                        idx
+                        for idx, name in enumerate(calendar.month_abbr)
+                        if name and name.lower() == token
+                    ),
+                    None,
+                )
+        if month_index and day_token and year_token:
+            try:
+                day_val = int(day_token)
+                year_val = int(year_token)
+                if year_val < 100:
+                    year_val += 2000
+            except ValueError:
+                return None
+            if 1 <= day_val <= 31:
+                return month_index, day_val, year_val
+    return None
+
+
+def _normalise_order_folder(order_folder: Optional[str], pdf_path: str) -> tuple[str, str]:
+    """Return (folder_name, pretty_label) for the order output directory."""
+    guess_sources = [
+        order_folder or "",
+        os.path.splitext(os.path.basename(pdf_path))[0],
+    ]
+    for source in guess_sources:
+        parsed = _parse_order_date_tokens(source)
+        if parsed:
+            mm, dd, yyyy = parsed
+            if 1 <= mm <= 12 and 1 <= dd <= 31:
+                canonical = f"{mm:02d}_{dd:02d}_{yyyy:04d}"
+                pretty = f"{calendar.month_name[mm]}_{dd:02d}_{yyyy:04d}"
+                return canonical, pretty
+    # Fall back to sanitised strings
+    fallback = sanitize_title(order_folder or os.path.splitext(os.path.basename(pdf_path))[0] or "Unknown")
+    if not fallback:
+        fallback = "unknown_date"
+    return fallback, fallback
+
+
+def _resolve_pdf_path(pdf_name: str) -> str:
+    """Resolve a PDF path relative to the repository structure."""
+    if not pdf_name:
+        raise ValueError("pdf_name must be provided.")
+    if os.path.isabs(pdf_name) and os.path.exists(pdf_name):
+        return pdf_name
+    candidates = [
+        os.path.join(os.getcwd(), pdf_name),
+        os.path.join(os.getcwd(), "input", pdf_name),
+        os.path.join(os.getcwd(), "data", pdf_name),
+        os.path.join(os.getcwd(), "data", "orders", pdf_name),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"Could not locate order PDF: {pdf_name}")
+
+
+@tool
+def ensure_order_pdf(
+    pdf_name: str,
+    order_folder: Optional[str] = None,
+    output_root: Optional[str] = None,
+) -> str:
+    """Copy an order-of-worship PDF into the canonical orders directory with a ``00_`` prefix.
+
+    Use this tool whenever a task involves processing an order-of-worship PDF. It ensures the
+    source PDF is copied into ``output/orders/<MM_DD_YYYY>/00_<Month>_<DD>_<YYYY>_Order_Of_Worship.pdf``.
+
+    Parameters
+    ----------
+    pdf_name : str
+        Path or filename of the source order-of-worship PDF. Relative paths are resolved against
+        the repository root and ``input/`` directory.
+    order_folder : str, optional
+        Desired subfolder under ``output/orders``. Accepts formats like ``10_12_2025`` or
+        ``October 12, 2025``. When omitted the folder is inferred from the filename.
+    output_root : str, optional
+        Base directory for the ``orders`` tree. Defaults to ``output/orders``; primarily useful
+        for tests.
+
+    Returns
+    -------
+    str
+        Full path to the copied PDF.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the source PDF cannot be located.
+    ValueError
+        If the inputs are insufficient to determine a destination.
+    """
+    pdf_path = _resolve_pdf_path(pdf_name)
+    folder_name, pretty_label = _normalise_order_folder(order_folder, pdf_path)
+    root = output_root or os.path.join(os.getcwd(), "output", "orders")
+    destination_dir = os.path.join(root, folder_name)
+    os.makedirs(destination_dir, exist_ok=True)
+    target_name = f"00_{pretty_label}_Order_Of_Worship.pdf"
+    destination_path = os.path.join(destination_dir, target_name)
+    shutil.copyfile(pdf_path, destination_path)
+    try:
+        logger.info(
+            "ORDER_PDF: copied %s -> %s",
+            pdf_path,
+            destination_path,
+            extra={"button_text": "", "xpath": "", "url": "", "screenshot": ""},
+        )
+    except Exception:
+        logger.info("ORDER_PDF: copied %s -> %s", pdf_path, destination_path)
+    return destination_path
