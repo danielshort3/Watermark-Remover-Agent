@@ -7,7 +7,7 @@ Key changes:
 - Removes all regex/rule-based NLP parsing for instructions and songs.
 
 Debug artifacts are written to:
-  output/debug/orders/<order_folder or 'unknown_date'>/<run_id>/
+  output/logs/<RUN_TS>/orders/<order_folder or 'unknown_date'>/<run_id>/
 including:
   - run.log (full run-level logging)
   - parser_prompt.txt / parser_raw_output.txt / parser_output.json
@@ -33,7 +33,7 @@ import time
 import uuid
 import traceback
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
 
@@ -77,6 +77,10 @@ from watermark_remover.agent.tools import (
     upscale_images,
     assemble_pdf,
     SCRAPE_METADATA,
+    remove_watermark_batch,
+    upscale_images_batch,
+    get_log_root,
+    apply_concise_debug_filter,
 )
 try:
     from watermark_remover.agent.prompts import (
@@ -126,7 +130,11 @@ def _ensure_logger_configured(level: int) -> None:
         ch.setLevel(level)
         fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
         ch.setFormatter(fmt)
+        apply_concise_debug_filter(ch)
         _logger.addHandler(ch)
+    else:
+        for handler in _logger.handlers:
+            apply_concise_debug_filter(handler)
     # pdfminer can emit extremely verbose debug logs; clamp them to WARNING.
     for name in _PDFMINER_LOGGERS:
         plogger = logging.getLogger(name)
@@ -178,7 +186,8 @@ def _debug_dir_for(state: Dict[str, Any]) -> Path:
     run_id = _get_run_id(state)
     hook = state.get("_debug_order_folder")
     order_folder = hook if isinstance(hook, str) and hook else _get_order_folder(state)
-    base = Path(os.getcwd()) / "output" / "debug" / "orders" / order_folder / run_id
+    log_root = Path(get_log_root(create=True))
+    base = log_root / "orders" / order_folder / run_id
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -729,7 +738,7 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     # This unifies all artifacts (graph + tools) under one location.
     run_ts = f"{run_id}_song{idx+1:02d}"
     _os.environ["RUN_TS"] = run_ts
-    base_root = _Path(_os.getcwd()) / "output" / "debug" / "orders" / date_folder / run_id / "songs" / per_song_name
+    base_root = _Path(get_log_root(create=True)) / "orders" / date_folder / run_id / "songs" / per_song_name
     base_root.mkdir(parents=True, exist_ok=True)
     _os.environ["WMRA_LOG_DIR"] = str(base_root)
     # Record start time for diagnostics
@@ -1167,23 +1176,22 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
     start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
 
-    if _debug_enabled(new_state):
-        base = _debug_dir_for(new_state)
-        _ensure_file_handler(new_state, base)
+    debug_enabled = _debug_enabled(new_state)
+    debug_base = _debug_dir_for(new_state) if debug_enabled else None
+    if debug_enabled and debug_base is not None:
+        _ensure_file_handler(new_state, debug_base)
         _logger.debug("process_songs_node: begin")
 
     songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
     final_pdfs: List[str | None] = []
+    jobs: List[Dict[str, Any]] = []
     input_dir_override = new_state.get("input_dir", "data/samples")
 
-    # We only use LLM-provided order_folder (if any); otherwise keep 'unknown_date'
     date_folder = _get_order_folder(new_state)
-    # (Legacy path) Ensure order PDF is present as 00_ file
     try:
         _ensure_order_pdf_copied(new_state)
     except Exception as e:
         _record_error(new_state, "process_songs_node.ensure_order_pdf_copied_exception", e)
-
 
     for idx in sorted(songs.keys()):
         song = songs[idx]
@@ -1192,7 +1200,6 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         per_song_name = f"{per_song_prefix}_{safe_title}"
 
         try:
-            # 1) SCRAPE
             scrape_input = {
                 "title": song.get("title", ""),
                 "instrument": song.get("instrument", ""),
@@ -1201,9 +1208,8 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "artist": song.get("artist", ""),
                 "top_n": int(new_state.get("top_n", 3) or 3),
             }
-            if _debug_enabled(new_state):
-                base = _debug_dir_for(new_state)
-                _write_json(base, f"{per_song_name}_scrape_input.json", scrape_input)
+            if debug_enabled and debug_base is not None:
+                _write_json(debug_base, f"{per_song_name}_scrape_input.json", scrape_input)
 
             try:
                 download_dir = scrape_music.invoke(scrape_input)
@@ -1211,150 +1217,228 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 download_dir = None
                 _record_error(new_state, f"{per_song_name}_scrape_exception", e)
 
-            if _debug_enabled(new_state):
-                base = _debug_dir_for(new_state)
-                _write_text(base, f"{per_song_name}_scrape_output.txt", str(download_dir))
+            if debug_enabled and debug_base is not None:
+                _write_text(debug_base, f"{per_song_name}_scrape_output.txt", str(download_dir))
 
-            # Normalize download results into a list of {image_dir:str, meta:dict}
             downloads: List[Dict[str, Any]] = []
             if isinstance(download_dir, list):
                 for it in download_dir:
-                    if isinstance(it, dict) and it.get("image_dir"):
-                        downloads.append({"image_dir": it.get("image_dir"), "meta": it.get("meta", {})})
+                    if not isinstance(it, dict):
+                        continue
+                    if it.get("image_dir") or it.get("existing_pdf"):
+                        downloads.append(
+                            {
+                                "image_dir": it.get("image_dir"),
+                                "existing_pdf": it.get("existing_pdf"),
+                                "meta": it.get("meta", {}),
+                            }
+                        )
             elif isinstance(download_dir, str):
-                downloads.append({"image_dir": download_dir, "meta": {
-                    "title": SCRAPE_METADATA.get("title", song.get("title", "")),
-                    "artist": SCRAPE_METADATA.get("artist", song.get("artist", "")),
-                    "instrument": SCRAPE_METADATA.get("instrument", song.get("instrument", "")),
-                    "key": SCRAPE_METADATA.get("key", song.get("key", "")),
-                }})
-            else:
-                downloads = []
+                downloads.append(
+                    {
+                        "image_dir": download_dir,
+                        "meta": {
+                            "title": SCRAPE_METADATA.get("title", song.get("title", "")),
+                            "artist": SCRAPE_METADATA.get("artist", song.get("artist", "")),
+                            "instrument": SCRAPE_METADATA.get("instrument", song.get("instrument", "")),
+                            "key": SCRAPE_METADATA.get("key", song.get("key", "")),
+                        },
+                    }
+                )
 
             if not downloads:
                 final_pdfs.append(None)
                 continue
 
-            # Process each downloaded match
             for match_idx, dl in enumerate(downloads, 1):
-                # Use per-match metadata (avoid global state)
-                m = dl.get("meta") or {}
+                image_dir = dl.get("image_dir")
+                existing_pdf = dl.get("existing_pdf")
+                if not image_dir and not existing_pdf:
+                    final_pdfs.append(None)
+                    continue
+
                 variant_suffix = f"_match{match_idx}"
+                result_index = len(final_pdfs)
+                final_pdfs.append(None)
 
-                # 2) REMOVE WATERMARK
-                try:
-                    rm_input = {"input_dir": dl.get("image_dir")}
-                    if _debug_enabled(new_state):
-                        base = _debug_dir_for(new_state)
-                        _write_json(base, f"{per_song_name}{variant_suffix}_remove_watermark_input.json", rm_input)
-                    processed_dir = remove_watermark.invoke(rm_input)
-                    if _debug_enabled(new_state):
-                        base = _debug_dir_for(new_state)
-                        _write_text(base, f"{per_song_name}{variant_suffix}_remove_watermark_output.txt", str(processed_dir))
-                except Exception as e:
-                    processed_dir = None
-                    _record_error(new_state, f"{per_song_name}{variant_suffix}_remove_watermark_exception", e)
-
-                if not processed_dir:
-                    final_pdfs.append(None)
-                    continue
-
-                # 3) UPSCALE
-                try:
-                    up_input = {"input_dir": processed_dir}
-                    if _debug_enabled(new_state):
-                        base = _debug_dir_for(new_state)
-                        _write_json(base, f"{per_song_name}{variant_suffix}_upscale_input.json", up_input)
-                    upscaled_dir = upscale_images.invoke(up_input)
-                    if _debug_enabled(new_state):
-                        base = _debug_dir_for(new_state)
-                        _write_text(base, f"{per_song_name}{variant_suffix}_upscale_output.txt", str(upscaled_dir))
-                except Exception as e:
-                    upscaled_dir = None
-                    _record_error(new_state, f"{per_song_name}{variant_suffix}_upscale_exception", e)
-
-                if not upscaled_dir:
-                    final_pdfs.append(None)
-                    continue
-
-                # Derive naming components from per-match meta
-                actual_key = m.get("key") or song.get("key", "")
-                actual_instrument = m.get("instrument") or song.get("instrument", "")
+                meta = dl.get("meta") or {}
+                actual_key = meta.get("key") or song.get("key", "")
+                actual_instrument = meta.get("instrument") or song.get("instrument", "")
+                actual_title_for_name = meta.get("title") or song.get("title", "Unknown Title")
                 safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
                 safe_key = sanitize_title(actual_key or "Unknown Key")
-                actual_title_for_name = m.get("title") or song.get("title", "Unknown Title")
                 safe_title_for_name = sanitize_title(actual_title_for_name)
                 idx_str = str(idx + 1).zfill(2)
                 rank_str = str(match_idx).zfill(2)
                 filename = f"{idx_str}_{rank_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
 
-                # 4) ASSEMBLE PDF
-                try:
-                    as_input = {
-                        "image_dir": upscaled_dir,
-                        "output_pdf": filename,
-                        "meta": {
-                            "title": actual_title_for_name,
-                            "artist": m.get("artist", ""),
-                            "instrument": actual_instrument,
-                            "key": actual_key,
-                        },
-                    }
-                    if _debug_enabled(new_state):
-                        base = _debug_dir_for(new_state)
-                        _write_json(base, f"{per_song_name}{variant_suffix}_assemble_input.json", as_input)
-                    pdf_path = assemble_pdf.invoke(as_input)
-                    if _debug_enabled(new_state):
-                        base = _debug_dir_for(new_state)
-                        _write_text(base, f"{per_song_name}{variant_suffix}_assemble_output.txt", str(pdf_path))
-                except Exception as e:
-                    pdf_path = None
-                    _record_error(new_state, f"{per_song_name}{variant_suffix}_assemble_exception", e)
+                job: Dict[str, Any] = {
+                    "song_index": idx,
+                    "song": song,
+                    "meta": meta,
+                    "result_index": result_index,
+                    "per_song_name": per_song_name,
+                    "variant_suffix": variant_suffix,
+                    "filename": filename,
+                    "assembly_meta": {
+                        "title": actual_title_for_name,
+                        "artist": meta.get("artist", ""),
+                        "instrument": actual_instrument,
+                        "key": actual_key,
+                    },
+                    "existing_pdf": existing_pdf,
+                    "download_dir": image_dir,
+                    "abs_download_dir": os.path.abspath(image_dir) if image_dir else None,
+                    "rank_str": rank_str,
+                }
+                jobs.append(job)
 
-                # Copy final PDF into output/orders/<date_folder>
-                if pdf_path and isinstance(pdf_path, str):
-                    try:
-                        orders_root = Path(os.getcwd()) / "output" / "orders" / date_folder
-                        orders_root.mkdir(parents=True, exist_ok=True)
-                        target_path = orders_root / filename
-
-                        import shutil
-                        shutil.copyfile(pdf_path, str(target_path))
-
-                        if _debug_enabled(new_state):
-                            base = _debug_dir_for(new_state)
-                            _write_text(base, f"{per_song_name}{variant_suffix}_final_target.txt", str(target_path))
-                    except Exception as e:
-                        _record_error(new_state, f"{per_song_name}{variant_suffix}_copy_exception", e)
-
-                final_pdfs.append(pdf_path if isinstance(pdf_path, str) else None)
-
-            # Cleanup temps
-            try:
-                import shutil
-                for tmp_dir in _iter_temp_dirs():
-                    try:
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-                TEMP_DIRS.clear()
-                if _debug_enabled(new_state):
-                    base = _debug_dir_for(new_state)
-                    _write_text(base, f"{per_song_name}_temp_cleanup.txt", "TEMP_DIRS cleared.")
-            except Exception as e:
-                _record_error(new_state, f"{per_song_name}_temp_cleanup_exception", e)
+                if debug_enabled and debug_base is not None and image_dir:
+                    rm_input = {"input_dir": image_dir}
+                    _write_json(debug_base, f"{per_song_name}{variant_suffix}_remove_watermark_input.json", rm_input)
 
         except Exception as e:
             _record_error(new_state, f"{per_song_name}_outer_exception", e)
             final_pdfs.append(None)
 
+    # Batch watermark removal
+    wm_jobs = [job for job in jobs if job.get("abs_download_dir")]
+    if wm_jobs:
+        abs_dirs = [job["abs_download_dir"] for job in wm_jobs if job.get("abs_download_dir")]
+        wm_results, wm_errors = remove_watermark_batch(abs_dirs)
+        for job in wm_jobs:
+            abs_dir = job.get("abs_download_dir")
+            processed_dir = wm_results.get(abs_dir) if abs_dir else None
+            job["processed_dir"] = processed_dir
+            if processed_dir:
+                job["abs_processed_dir"] = os.path.abspath(processed_dir)
+            if debug_enabled and debug_base is not None:
+                _write_text(
+                    debug_base,
+                    f"{job['per_song_name']}{job['variant_suffix']}_remove_watermark_output.txt",
+                    str(processed_dir),
+                )
+            error = wm_errors.get(abs_dir) if abs_dir else None
+            if error is not None:
+                _record_error(new_state, f"{job['per_song_name']}{job['variant_suffix']}_remove_watermark_exception", error)
+            elif abs_dir and processed_dir is None:
+                _record_error(
+                    new_state,
+                    f"{job['per_song_name']}{job['variant_suffix']}_remove_watermark_exception",
+                    RuntimeError("remove_watermark returned no output"),
+                )
+
+    # Batch upscaling
+    up_jobs = [job for job in jobs if job.get("abs_processed_dir")]
+    if up_jobs:
+        processed_dirs = [job["abs_processed_dir"] for job in up_jobs if job.get("abs_processed_dir")]
+        up_results, up_errors = upscale_images_batch(processed_dirs)
+        for job in up_jobs:
+            abs_processed = job.get("abs_processed_dir")
+            upscaled_dir = up_results.get(abs_processed) if abs_processed else None
+            job["upscaled_dir"] = upscaled_dir
+            if debug_enabled and debug_base is not None and abs_processed:
+                _write_json(
+                    debug_base,
+                    f"{job['per_song_name']}{job['variant_suffix']}_upscale_input.json",
+                    {"input_dir": job["processed_dir"]},
+                )
+                _write_text(
+                    debug_base,
+                    f"{job['per_song_name']}{job['variant_suffix']}_upscale_output.txt",
+                    str(upscaled_dir),
+                )
+            error = up_errors.get(abs_processed) if abs_processed else None
+            if error is not None:
+                _record_error(new_state, f"{job['per_song_name']}{job['variant_suffix']}_upscale_exception", error)
+            elif abs_processed and upscaled_dir is None:
+                _record_error(
+                    new_state,
+                    f"{job['per_song_name']}{job['variant_suffix']}_upscale_exception",
+                    RuntimeError("upscale_images returned no output"),
+                )
+
+    # Assemble sequentially to honour user-facing order
+    for job in jobs:
+        result_index = job["result_index"]
+        pdf_path: Optional[str] = None
+        upscaled_dir = job.get("upscaled_dir")
+        existing_pdf = job.get("existing_pdf")
+        if upscaled_dir:
+            as_input = {
+                "image_dir": upscaled_dir,
+                "output_pdf": job["filename"],
+                "meta": job["assembly_meta"],
+            }
+            if debug_enabled and debug_base is not None:
+                _write_json(
+                    debug_base,
+                    f"{job['per_song_name']}{job['variant_suffix']}_assemble_input.json",
+                    as_input,
+                )
+            try:
+                pdf_path = assemble_pdf.invoke(as_input)
+            except Exception as e:
+                _record_error(new_state, f"{job['per_song_name']}{job['variant_suffix']}_assemble_exception", e)
+                pdf_path = None
+            else:
+                if debug_enabled and debug_base is not None:
+                    _write_text(
+                        debug_base,
+                        f"{job['per_song_name']}{job['variant_suffix']}_assemble_output.txt",
+                        str(pdf_path),
+                    )
+            if pdf_path:
+                try:
+                    import shutil
+
+                    orders_root = Path(os.getcwd()) / "output" / "orders" / date_folder
+                    orders_root.mkdir(parents=True, exist_ok=True)
+                    target_path = orders_root / job["filename"]
+                    shutil.copyfile(pdf_path, str(target_path))
+                    pdf_path = str(target_path)
+                    if debug_enabled and debug_base is not None:
+                        _write_text(
+                            debug_base,
+                            f"{job['per_song_name']}{job['variant_suffix']}_final_target.txt",
+                            str(target_path),
+                        )
+                except Exception as e:
+                    _record_error(new_state, f"{job['per_song_name']}{job['variant_suffix']}_copy_exception", e)
+        elif existing_pdf:
+            pdf_path = str(existing_pdf)
+
+        final_pdfs[result_index] = pdf_path if isinstance(pdf_path, str) else None
+
+    # Cleanup temporary directories once after all processing completes
+    try:
+        import shutil
+
+        removed: List[str] = []
+        for tmp_dir in _iter_temp_dirs():
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                removed.append(tmp_dir)
+            except Exception:
+                pass
+        TEMP_DIRS.clear()
+        if debug_enabled and debug_base is not None:
+            _write_text(
+                debug_base,
+                "temp_cleanup.txt",
+                f"Removed {len(removed)} temporary directories.",
+            )
+    except Exception as e:
+        _record_error(new_state, "process_songs_node.temp_cleanup_exception", e)
+
     new_state["final_pdfs"] = final_pdfs
 
-    if _debug_enabled(new_state):
-        base = _debug_dir_for(new_state)
-        _write_json(base, "final_state.json", {
-            k: v for k, v in new_state.items() if k not in ("songs",)  # songs can be large; already saved
-        })
+    if debug_enabled and debug_base is not None:
+        _write_json(
+            debug_base,
+            "final_state.json",
+            {k: v for k, v in new_state.items() if k not in ("songs",)},
+        )
 
     _record_timing(new_state, "process_songs_node", _stop_timer(start))
     return new_state

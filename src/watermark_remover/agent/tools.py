@@ -40,7 +40,7 @@ import os
 import re
 import time
 import random
-from typing import Optional, Any, Callable
+from typing import Optional, Any, Callable, Iterable, Sequence
 
 import requests  # used for downloading images during online scraping
 
@@ -1164,7 +1164,12 @@ else:
 # LOG_LEVEL environment variable (e.g. export LOG_LEVEL=DEBUG).  If not set,
 # INFO is used by default.  Only configure the basicConfig once to avoid
 # interfering with parent application logging configuration.
-from config.settings import DEFAULT_LOG_LEVEL
+from config.settings import (
+    DEFAULT_LOG_LEVEL,
+    LOG_DIR_ENV_VAR,
+    CONCISE_DEBUG_ENV_VAR,
+    DEFAULT_CONCISE_DEBUG,
+)
 
 _log_level = os.environ.get("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
 try:
@@ -1177,6 +1182,82 @@ except Exception:
     pass
 logger = logging.getLogger("wmra.tools")
 
+
+def _env_truthy(value: Optional[str]) -> bool:
+    """Return True if the environment string represents a truthy value."""
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_concise_debug_enabled() -> bool:
+    """Flag indicating whether concise debug logging is enabled."""
+    env_value = os.environ.get(CONCISE_DEBUG_ENV_VAR)
+    if env_value is None:
+        return DEFAULT_CONCISE_DEBUG
+    return _env_truthy(env_value)
+
+
+class _ConciseDebugFilter(logging.Filter):
+    """Filter that suppresses verbose debug chatter when concise mode is on."""
+
+    _drop_prefixes = ("[DEBUG]",)
+
+    def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+        if record.levelno != logging.DEBUG:
+            return True
+        message = record.getMessage()
+        for prefix in self._drop_prefixes:
+            if message.startswith(prefix):
+                return False
+        return True
+
+
+_CONCISE_DEBUG_FILTER = _ConciseDebugFilter()
+
+
+def apply_concise_debug_filter(handler: logging.Handler) -> None:
+    """Attach the concise debug filter to non-file handlers when enabled."""
+    if not is_concise_debug_enabled():
+        return
+    if isinstance(handler, logging.FileHandler):
+        return
+    for existing in handler.filters:
+        if isinstance(existing, _ConciseDebugFilter):
+            return
+    handler.addFilter(_CONCISE_DEBUG_FILTER)
+
+
+def ensure_concise_filters(logger_obj: Optional[logging.Logger] = None) -> None:
+    """Ensure all handlers on the given logger honour the concise debug flag."""
+    if not is_concise_debug_enabled():
+        return
+    target = logger_obj or logging.getLogger()
+    for handler in list(target.handlers):
+        apply_concise_debug_filter(handler)
+
+
+ensure_concise_filters()
+ensure_concise_filters(logger)
+
+
+def get_log_root(create: bool = True) -> str:
+    """Return the root directory for run logs and debug artefacts."""
+    log_dir = os.environ.get(LOG_DIR_ENV_VAR)
+    if log_dir:
+        if create:
+            os.makedirs(log_dir, exist_ok=True)
+        return log_dir
+    run_ts = os.environ.get("RUN_TS")
+    if not run_ts:
+        run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.environ.setdefault("RUN_TS", run_ts)
+    log_dir = os.path.join(os.getcwd(), "output", "logs", run_ts)
+    if create:
+        os.makedirs(log_dir, exist_ok=True)
+    os.environ[LOG_DIR_ENV_VAR] = log_dir
+    return log_dir
+
 def init_pipeline_logging() -> None:
     """Ensure file logging is configured under WMRA_LOG_DIR.
 
@@ -1184,16 +1265,7 @@ def init_pipeline_logging() -> None:
     """
     try:
         # Recompute output_dir from RUN_TS/WMRA_LOG_DIR if necessary
-        run_ts = os.environ.get("RUN_TS")
-        base = os.environ.get("WMRA_LOG_DIR")
-        if not base:
-            if not run_ts:
-                import datetime as _dt
-                run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                os.environ.setdefault("RUN_TS", run_ts)
-            base = os.path.join(os.getcwd(), "output", "logs", os.environ["RUN_TS"])
-            os.environ["WMRA_LOG_DIR"] = base
-        os.makedirs(base, exist_ok=True)
+        base = get_log_root(create=True)
         # Remove existing file handlers pointing to a different base
         existing_handlers = [h for h in logger.handlers if isinstance(h, logging.FileHandler)]
         for h in list(existing_handlers):
@@ -1231,6 +1303,7 @@ def init_pipeline_logging() -> None:
             cf.setLevel(getattr(logging, _log_level, logging.INFO))
             cf.setFormatter(CsvFormatter("%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,\"%(message)s\""))
             logger.addHandler(cf)
+        ensure_concise_filters(logger)
     except Exception:
         pass
 
@@ -1263,20 +1336,8 @@ try:
     # writing logs into a top‑level ``logs`` folder, store them under
     # ``output/logs`` so that all artefacts live inside the output
     # hierarchy.  Each run gets its own unique timestamped subfolder.
-    _run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Persist the run timestamp so subsequent tools (e.g. scrape_music)
-    # can reuse it when organising their own output.  If another value is
-    # already present in the environment then leave it unchanged – this
-    # allows callers to override the timestamp (e.g. for testing).  The
-    # environment variable is read by scrape_music to locate the run
-    # directory for image backups.
-    os.environ.setdefault("RUN_TS", _run_ts)
-    # Build the log directory under ``output/logs``.  Using ``os.getcwd()``
-    # ensures the path is relative to the project root regardless of
-    # where the container mounts the code.  Create the directory up front.
-    output_dir = os.path.join(os.getcwd(), "output", "logs", os.environ["RUN_TS"])
-    os.makedirs(output_dir, exist_ok=True)
-    os.environ["WMRA_LOG_DIR"] = output_dir
+    # Ensure a timestamped run directory exists under output/logs and expose it via WMRA_LOG_DIR.
+    output_dir = get_log_root(create=True)
     # Configure a plain‑text file handler for the pipeline log
     file_handler = logging.FileHandler(os.path.join(output_dir, "pipeline.log"))
     file_handler.setLevel(getattr(logging, _log_level, logging.INFO))
@@ -1924,7 +1985,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
     # temporary directories under the log directory so that they are
     # easy to clean up later.  Use tempfile to avoid collisions.
     import tempfile
-    log_root = os.environ.get("WMRA_LOG_DIR", os.getcwd())
+    log_root = get_log_root(create=True)
     try:
         root_dir = tempfile.mkdtemp(prefix=f"{safe_title}_", dir=log_root)
     except Exception:
@@ -1974,7 +2035,7 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
     # Helper: acquire a simple inter-process lock for webdriver-manager
     def _acquire_wdm_lock(timeout: float = 120.0) -> str | None:
         try:
-            locks_dir = os.path.join(os.getcwd(), 'output', 'locks')
+            locks_dir = os.path.join(get_log_root(create=True), 'locks')
             os.makedirs(locks_dir, exist_ok=True)
             lock_path = os.path.join(locks_dir, 'webdriver_manager.lock')
             import time as _t
@@ -3161,6 +3222,117 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             pass
 
 
+def remove_watermark_batch(
+    input_dirs: Sequence[str],
+    model_dir: str = "models/Watermark_Removal",
+    output_dir: str = "processed",
+) -> tuple[dict[str, Optional[str]], dict[str, Exception]]:
+    """Process one or more directories through the watermark removal model.
+
+    Returns a tuple ``(results, errors)`` mapping each input directory to its
+    processed output path (or ``None`` on failure) and any raised exceptions.
+    """
+    if _import_error is not None:
+        raise ImportError(
+            f"Cannot import UNet and related utilities: {_import_error}. "
+            "Ensure torch and watermark_remover dependencies are installed."
+        )
+    unique_dirs: list[str] = []
+    seen: set[str] = set()
+    for path in input_dirs or []:
+        if not isinstance(path, str):
+            raise TypeError(f"Input directory must be a string, received {type(path)!r}")
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        unique_dirs.append(norm)
+    if not unique_dirs:
+        return {}, {}
+    for directory in unique_dirs:
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f"Input directory {directory} does not exist.")
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
+    if output_dir not in ("", None, "processed") and len(unique_dirs) > 1:
+        raise ValueError("output_dir can only be customised when processing a single directory.")
+    device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
+    model = UNet().to(device)
+    try:
+        try:
+            load_best_model(model, model_dir)  # type: ignore[misc]
+        except Exception:
+            logger.warning(
+                "WMR: failed to load checkpoints from %s; using random weights",
+                model_dir,
+            )
+        model.eval()
+        results: dict[str, Optional[str]] = {}
+        errors: dict[str, Exception] = {}
+        batch_start = time.perf_counter()
+        for directory in unique_dirs:
+            dir_start = time.perf_counter()
+            try:
+                processed_dir = output_dir
+                if not processed_dir or processed_dir == "processed":
+                    parent_dir = os.path.dirname(directory.rstrip(os.sep))
+                    processed_dir = os.path.join(parent_dir, "2_watermark_removed")
+                os.makedirs(processed_dir, exist_ok=True)
+                images = [
+                    fname
+                    for fname in os.listdir(directory)
+                    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+                ]
+                if not images:
+                    raise RuntimeError(f"WMR: no images found in {directory}")
+                for fname in images:
+                    inp_path = os.path.join(directory, fname)
+                    out_path = os.path.join(processed_dir, fname)
+                    with torch.no_grad():
+                        tensor = PIL_to_tensor(inp_path)
+                        if tensor.dim() == 3 and tensor.shape[0] != 1:
+                            try:
+                                im = Image.open(inp_path).convert("L")
+                                tmp_path = inp_path + ".gray.tmp"
+                                im.save(tmp_path)
+                                tensor = PIL_to_tensor(tmp_path)
+                                os.remove(tmp_path)
+                            except Exception:
+                                tensor = tensor.mean(dim=0, keepdim=True)
+                        tensor = tensor.unsqueeze(0).to(device)
+                        output = model(tensor)
+                        img = tensor_to_PIL(output.squeeze(0).cpu())
+                    os.makedirs(processed_dir, exist_ok=True)
+                    img.save(out_path)
+                    logger.info("WMR: processed %s -> %s", inp_path, out_path)
+                elapsed = time.perf_counter() - dir_start
+                logger.info("WMR: completed %s in %.3fs", directory, elapsed)
+                results[directory] = processed_dir
+            except Exception as exc:  # noqa: BLE001
+                results[directory] = None
+                errors[directory] = exc
+                logger.exception("WMR: failed to process %s", directory)
+        total_elapsed = time.perf_counter() - batch_start
+        success_count = sum(1 for path, out in results.items() if out)
+        logger.info(
+            "WMR: batch processed %d/%d directories in %.3fs",
+            success_count,
+            len(unique_dirs),
+            total_elapsed,
+        )
+        return results, errors
+    finally:
+        try:
+            del model
+        except Exception:  # pragma: no cover - defensive cleanup
+            pass
+        if torch and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+
+
 @tool
 def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal", output_dir: str = "processed") -> str:
     """Remove watermarks from all images in ``input_dir`` using a UNet model.
@@ -3189,73 +3361,18 @@ def remove_watermark(input_dir: str, model_dir: str = "models/Watermark_Removal"
     allows the pipeline to run end‑to‑end without bundling large model
     weights in the repository.
     """
-    start = time.perf_counter()
-    if _import_error is not None:
-        raise ImportError(
-            f"Cannot import UNet and related utilities: {_import_error}. "
-            "Ensure torch and watermark_remover dependencies are installed."
-        )
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
-    # Determine the output directory.  If the caller provides a value
-    # other than the default, honour it.  Otherwise, derive a
-    # ``2_watermark_removed`` sibling inside the same run directory as
-    # the input.  This ensures that all intermediate artefacts live
-    # alongside the original images for this run.
-    if output_dir == "processed" or not output_dir:
-        parent_dir = os.path.dirname(input_dir.rstrip(os.sep))
-        output_dir = os.path.join(parent_dir, "2_watermark_removed")
-    os.makedirs(output_dir, exist_ok=True)
-    # List images to process
-    images = [f for f in os.listdir(input_dir) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
-    if not images:
-        raise RuntimeError(f"WMR: no images found in {input_dir}")
-    device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
-    model = UNet().to(device)
-    # Load the best checkpoint if available.  If loading fails, the model
-    # will continue with random weights so the pipeline still runs.
-    try:
-        load_best_model(model, model_dir)  # type: ignore[misc]
-    except Exception:
-        logger.warning("WMR: failed to load checkpoints from %s; using random weights", model_dir)
-    model.eval()
-    processed_dir = output_dir
-    for fname in images:
-        inp_path = os.path.join(input_dir, fname)
-        out_path = os.path.join(processed_dir, fname)
-        with torch.no_grad():
-            # Load and convert the image to a tensor.  If the tensor has three
-            # channels, explicitly convert the image to grayscale first to
-            # satisfy the UNet input shape (1 channel).  Some downloaded
-            # previews are RGB even when PIL_to_tensor normally converts
-            # images to grayscale.  Converting here ensures the network
-            # receives a 1×H×W tensor and avoids "expected 1 channel but got 3"
-            # runtime errors.
-            tensor = PIL_to_tensor(inp_path)
-            # tensor shape is (C, H, W)
-            if tensor.dim() == 3 and tensor.shape[0] != 1:
-                try:
-                    im = Image.open(inp_path).convert("L")
-                    # save temporary grayscale image
-                    tmp_path = inp_path + ".gray.tmp"
-                    im.save(tmp_path)
-                    tensor = PIL_to_tensor(tmp_path)
-                    os.remove(tmp_path)
-                except Exception:
-                    # fallback: average channels
-                    tensor = tensor.mean(dim=0, keepdim=True)
-            tensor = tensor.unsqueeze(0).to(device)
-            output = model(tensor)
-            img = tensor_to_PIL(output.squeeze(0).cpu())
-        os.makedirs(processed_dir, exist_ok=True)
-        img.save(out_path)
-        logger.info("WMR: processed %s -> %s", inp_path, out_path)
-    logger.info("WMR completed in %.3fs", time.perf_counter() - start)
-    # Do not track the processed directory for cleanup.  We intentionally
-    # preserve each intermediate stage under its timestamped run
-    # directory for debugging and reproducibility.
+    abs_input = os.path.abspath(input_dir)
+    results, errors = remove_watermark_batch(
+        [abs_input],
+        model_dir=model_dir,
+        output_dir=output_dir,
+    )
+    error = errors.get(abs_input)
+    if error is not None:
+        raise error
+    processed_dir = results.get(abs_input)
+    if not processed_dir:
+        raise RuntimeError(f"WMR: failed to process {input_dir}")
     return processed_dir
 
 
@@ -3293,96 +3410,19 @@ def upscale_images(input_dir: str, model_dir: str = "models/VDSR", output_dir: s
     allows the pipeline to run end‑to‑end without bundling large model
     weights in the repository.
     """
-    start = time.perf_counter()
-    if _import_error is not None:
-        raise ImportError(
-            f"Cannot import VDSR and related utilities: {_import_error}. "
-            "Ensure torch and watermark_remover dependencies are installed."
-        )
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Input directory {input_dir} does not exist.")
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
-    # Determine the output directory.  If the caller provides a value
-    # other than the default, honour it.  Otherwise, derive a
-    # ``3_upscaled`` sibling inside the same run directory as the input.
-    if output_dir == "upscaled" or not output_dir:
-        parent_dir = os.path.dirname(input_dir.rstrip(os.sep))
-        output_dir = os.path.join(parent_dir, "3_upscaled")
-    os.makedirs(output_dir, exist_ok=True)
-    images = [
-        f
-        for f in os.listdir(input_dir)
-        if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
-    ]
-    if not images:
-        raise RuntimeError(f"UPSCALE: no images found in {input_dir}")
-    device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
-    # Instantiate the VDSR model and load the best checkpoint if available.
-    us_model = VDSR().to(device)
-    try:
-        load_best_model(us_model, model_dir)  # type: ignore[misc]
-    except Exception:
-        logger.warning("VDSR: failed to load checkpoints from %s; using random weights", model_dir)
-    us_model.eval()
-    # Define upsample operation to enlarge each image to the canonical size.
-    image_base_width, image_base_height = 1700, 2200
-    upsample = torch.nn.Upsample(size=(image_base_height, image_base_width), mode="nearest")
-    # Patch parameters matching the original implementation
-    padding_size = 16
-    patch_height = 550
-    patch_width = 850
-    # Process each image
-    for fname in images:
-        inp_path = os.path.join(input_dir, fname)
-        out_path = os.path.join(output_dir, fname)
-        # Convert image to tensor and move to device
-        with torch.no_grad():
-            tensor = PIL_to_tensor(inp_path)
-            tensor = tensor.unsqueeze(0).to(device)
-            # Upsample to target size
-            wm_output_upscaled = upsample(tensor)
-            # Pad so patches at the edges can be processed uniformly
-            padding = (padding_size, padding_size, padding_size, padding_size)
-            wm_output_upscaled_padded = torch.nn.functional.pad(
-                wm_output_upscaled, padding, value=1.0
-            )
-            # Prepare an output tensor
-            us_output = torch.zeros_like(wm_output_upscaled)
-            # Slide window over the upscaled image
-            for i in range(0, wm_output_upscaled.shape[-2], patch_height):
-                for j in range(0, wm_output_upscaled.shape[-1], patch_width):
-                    patch = wm_output_upscaled_padded[
-                        :,
-                        :,
-                        i : i + patch_height + padding_size * 2,
-                        j : j + patch_width + padding_size * 2,
-                    ]
-                    # Run VDSR on the patch
-                    us_patch = us_model(patch)
-                    # Remove padding from the output patch
-                    us_patch = us_patch[
-                        :,
-                        :,
-                        padding_size : -padding_size,
-                        padding_size : -padding_size,
-                    ]
-                    # Place the processed patch back into the output tensor
-                    us_output[
-                        :,
-                        :,
-                        i : i + patch_height,
-                        j : j + patch_width,
-                    ] = us_patch
-            # Convert the output tensor back to a PIL image and save
-            img = tensor_to_PIL(us_output.squeeze(0).cpu())
-            os.makedirs(output_dir, exist_ok=True)
-            img.save(out_path)
-            logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
-    logger.info("UPSCALE completed in %.3fs", time.perf_counter() - start)
-    # Do not track the upscaled directory for cleanup.  We preserve
-    # intermediate stages for debugging and reproducibility.
-    return output_dir
+    abs_input = os.path.abspath(input_dir)
+    results, errors = upscale_images_batch(
+        [abs_input],
+        model_dir=model_dir,
+        output_dir=output_dir,
+    )
+    error = errors.get(abs_input)
+    if error is not None:
+        raise error
+    upscaled_dir = results.get(abs_input)
+    if not upscaled_dir:
+        raise RuntimeError(f"UPSCALE: failed to process {input_dir}")
+    return upscaled_dir
 
 
 @tool
@@ -3466,7 +3506,7 @@ def assemble_pdf(image_dir: str, output_pdf: str = "output/output.pdf", meta: Op
         # hierarchy; otherwise fall back to a directory adjacent to the
         # input images.  The instrument component comes from instrument_part.
         # Prefer WMRA_LOG_DIR for debug artifacts so order graph and tools share a root.
-        base_debug = os.environ.get("WMRA_LOG_DIR")
+        base_debug = get_log_root(create=True)
         if base_debug:
             debug_dir = os.path.join(
                 base_debug,
@@ -3683,3 +3723,131 @@ def ensure_order_pdf(
     except Exception:
         logger.info("ORDER_PDF: copied %s -> %s", pdf_path, destination_path)
     return destination_path
+def upscale_images_batch(
+    input_dirs: Sequence[str],
+    model_dir: str = "models/VDSR",
+    output_dir: str = "upscaled",
+) -> tuple[dict[str, Optional[str]], dict[str, Exception]]:
+    """Process one or more directories through the upscaling model."""
+    if _import_error is not None:
+        raise ImportError(
+            f"Cannot import VDSR and related utilities: {_import_error}. "
+            "Ensure torch and watermark_remover dependencies are installed."
+        )
+    unique_dirs: list[str] = []
+    seen: set[str] = set()
+    for path in input_dirs or []:
+        if not isinstance(path, str):
+            raise TypeError(f"Input directory must be a string, received {type(path)!r}")
+        norm = os.path.abspath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        unique_dirs.append(norm)
+    if not unique_dirs:
+        return {}, {}
+    for directory in unique_dirs:
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(f"Input directory {directory} does not exist.")
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Model directory {model_dir} does not exist.")
+    if output_dir not in ("", None, "upscaled") and len(unique_dirs) > 1:
+        raise ValueError("output_dir can only be customised when processing a single directory.")
+    device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
+    model = VDSR().to(device)
+    try:
+        try:
+            load_best_model(model, model_dir)  # type: ignore[misc]
+        except Exception:
+            logger.warning(
+                "VDSR: failed to load checkpoints from %s; using random weights",
+                model_dir,
+            )
+        model.eval()
+        upsample = torch.nn.Upsample(size=(2200, 1700), mode="nearest")
+        padding_size = 16
+        patch_height = 550
+        patch_width = 850
+        results: dict[str, Optional[str]] = {}
+        errors: dict[str, Exception] = {}
+        batch_start = time.perf_counter()
+        for directory in unique_dirs:
+            dir_start = time.perf_counter()
+            try:
+                target_dir = output_dir
+                if not target_dir or target_dir == "upscaled":
+                    parent_dir = os.path.dirname(directory.rstrip(os.sep))
+                    target_dir = os.path.join(parent_dir, "3_upscaled")
+                os.makedirs(target_dir, exist_ok=True)
+                images = [
+                    fname
+                    for fname in os.listdir(directory)
+                    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+                ]
+                if not images:
+                    raise RuntimeError(f"UPSCALE: no images found in {directory}")
+                for fname in images:
+                    inp_path = os.path.join(directory, fname)
+                    out_path = os.path.join(target_dir, fname)
+                    with torch.no_grad():
+                        tensor = PIL_to_tensor(inp_path)
+                        tensor = tensor.unsqueeze(0).to(device)
+                        wm_output_upscaled = upsample(tensor)
+                        padding = (padding_size, padding_size, padding_size, padding_size)
+                        wm_output_upscaled_padded = torch.nn.functional.pad(
+                            wm_output_upscaled,
+                            padding,
+                            value=1.0,
+                        )
+                        us_output = torch.zeros_like(wm_output_upscaled)
+                        for i in range(0, wm_output_upscaled.shape[-2], patch_height):
+                            for j in range(0, wm_output_upscaled.shape[-1], patch_width):
+                                patch = wm_output_upscaled_padded[
+                                    :,
+                                    :,
+                                    i : i + patch_height + padding_size * 2,
+                                    j : j + patch_width + padding_size * 2,
+                                ]
+                                us_patch = model(patch)
+                                us_patch = us_patch[
+                                    :,
+                                    :,
+                                    padding_size : -padding_size,
+                                    padding_size : -padding_size,
+                                ]
+                                us_output[
+                                    :,
+                                    :,
+                                    i : i + patch_height,
+                                    j : j + patch_width,
+                                ] = us_patch
+                        img = tensor_to_PIL(us_output.squeeze(0).cpu())
+                    os.makedirs(target_dir, exist_ok=True)
+                    img.save(out_path)
+                    logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
+                elapsed = time.perf_counter() - dir_start
+                logger.info("UPSCALE: completed %s in %.3fs", directory, elapsed)
+                results[directory] = target_dir
+            except Exception as exc:  # noqa: BLE001
+                results[directory] = None
+                errors[directory] = exc
+                logger.exception("UPSCALE: failed to process %s", directory)
+        total_elapsed = time.perf_counter() - batch_start
+        success_count = sum(1 for path, out in results.items() if out)
+        logger.info(
+            "UPSCALE: batch processed %d/%d directories in %.3fs",
+            success_count,
+            len(unique_dirs),
+            total_elapsed,
+        )
+        return results, errors
+    finally:
+        try:
+            del model
+        except Exception:  # pragma: no cover - defensive cleanup
+            pass
+        if torch and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
