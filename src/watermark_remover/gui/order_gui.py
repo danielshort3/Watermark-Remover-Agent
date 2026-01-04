@@ -1782,12 +1782,20 @@ def build_app() -> gr.Blocks:
                 save_errors_only,
                 preview_enabled,
             ],
-            outputs=[progress_log, output_zip, preview_gallery],
+            outputs=[
+                progress_log,
+                output_zip,
+                preview_gallery,
+            ],
         )
 
         cancel_btn.click(
             cancel_order_processing,
-            outputs=[progress_log, output_zip, preview_gallery],
+            outputs=[
+                progress_log,
+                output_zip,
+                preview_gallery,
+            ],
         )
 
         preview_enabled.change(
