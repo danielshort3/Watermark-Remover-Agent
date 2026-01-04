@@ -110,7 +110,11 @@ def _capture_artifacts(
     if not save_screens and not save_html:
         return screenshot_path, html_path
     try:
-        base_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "output"))
+        base_dir = (
+            os.environ.get("WMRA_PREVIEW_DIR")
+            or os.environ.get("WMRA_LOG_DIR")
+            or os.path.join(os.getcwd(), "output")
+        )
         ts = int(time.time() * 1000)
         safe_label = "".join(c if c.isalnum() else "_" for c in (label or xpath or "element"))[:30]
         tag = f"{ts}_{safe_label}"

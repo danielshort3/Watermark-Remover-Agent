@@ -23,7 +23,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Launch the Order of Worship GUI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument("--share", action="store_true")
+    share_group = parser.add_mutually_exclusive_group()
+    share_group.add_argument("--share", dest="share", action="store_true")
+    share_group.add_argument("--no-share", dest="share", action="store_false")
+    parser.set_defaults(share=True)
     args = parser.parse_args()
     launch(host=args.host, port=args.port, share=args.share)
     return 0

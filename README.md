@@ -104,12 +104,17 @@ review detected songs, and run the full pipeline with progress updates.
 python scripts/run_gui.py --host 127.0.0.1 --port 7860
 ```
 
+Windows shortcut:
+- Double-click `scripts/launch_gui_wsl.bat` to open WSL, activate the venv, and launch the GUI.
+- Optional env overrides: `WMRA_GUI_HOST`, `WMRA_GUI_PORT`, `WMRA_GUI_SHARE` (true/false).
+
 Workflow:
 - The GUI auto-starts Ollama on load and populates the model dropdown when available.
 - Upload the PDF and add any instruction text (used for extraction filters).
 - Confirm the Ollama URL/model and click "Check Ollama" if you want a fresh health check.
 - If you run Ollama inside WSL, set `OLLAMA_HOST`/`OLLAMA_MODELS` and use "Start Ollama (WSL)" if needed.
 - Use the capture toggles to save Selenium screenshots/HTML (optionally only on errors).
+  Enable "Show Selenium preview (snapshots)" to display per-worker previews while scraping.
   `OLLAMA_MODELS` should be a WSL path to your Windows models directory
   (for example `/mnt/c/Users/<you>/AppData/Local/Ollama/models`).
   The GUI now auto-detects common Windows model paths under `/mnt/c/Users/*/`.

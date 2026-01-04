@@ -1066,6 +1066,7 @@ def _scrape_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     top_n: int = int(payload.get("top_n", 3) or 3)
     log_dir: str = str(payload.get("log_dir") or "")
     run_ts: str = str(payload.get("run_ts") or "")
+    preview_root: str = str(payload.get("preview_root") or "")
 
     try:
         from watermark_remover.agent.tools import (
@@ -1081,6 +1082,13 @@ def _scrape_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         _os.environ["RUN_TS"] = run_ts
     if log_dir:
         _os.environ["WMRA_LOG_DIR"] = log_dir
+    if preview_root:
+        try:
+            preview_dir = _os.path.join(preview_root, f"worker_{_os.getpid()}")
+            _os.makedirs(preview_dir, exist_ok=True)
+            _os.environ["WMRA_PREVIEW_DIR"] = preview_dir
+        except Exception:
+            _os.environ.pop("WMRA_PREVIEW_DIR", None)
     try:
         _init_logging()
     except Exception:
@@ -1638,8 +1646,13 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
 def process_songs_node(
     state: Dict[str, Any],
     progress_cb: Callable[[str, int, int], None] | None = None,
+    event_cb: Callable[[Dict[str, Any]], None] | None = None,
 ) -> Dict[str, Any]:
-    """Scrape all songs first (optionally in parallel), then batch process images."""
+    """Scrape all songs first (optionally in parallel), then batch process images.
+
+    ``progress_cb`` receives stage progress, while ``event_cb`` can receive
+    per-song status updates for UI streaming.
+    """
     _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
     start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
@@ -1657,9 +1670,21 @@ def process_songs_node(
         return new_state
 
     songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
+    song_timings: Dict[int, Dict[str, float]] = {
+        idx: {"scrape": 0.0, "watermark": 0.0, "upscale": 0.0} for idx in songs
+    }
+    song_status: Dict[int, str] = {idx: "queued" for idx in songs}
+    failed_songs: set[int] = set()
+    scrape_starts: Dict[int, float] = {}
     final_pdfs: List[str | None] = []
     jobs: List[Dict[str, Any]] = []
     input_dir_override = new_state.get("input_dir", "data/samples")
+    preview_root = str(new_state.get("preview_root") or "")
+    if preview_root:
+        try:
+            os.makedirs(preview_root, exist_ok=True)
+        except Exception:
+            pass
     cancelled = False
 
     date_folder = _get_order_folder(new_state)
@@ -1675,6 +1700,31 @@ def process_songs_node(
             progress_cb(stage, done, total)
         except Exception:
             pass
+
+    def _emit_event(payload: Dict[str, Any]) -> None:
+        if not event_cb:
+            return
+        try:
+            event_cb(payload)
+        except Exception:
+            pass
+
+    def _emit_song_update(idx: int, status: str | None = None) -> None:
+        if idx not in song_timings:
+            return
+        if status:
+            song_status[idx] = status
+        _emit_event(
+            {
+                "type": "song_update",
+                "idx": idx,
+                "status": song_status.get(idx, ""),
+                "timings": dict(song_timings.get(idx, {})),
+            }
+        )
+
+    for idx in sorted(songs.keys()):
+        _emit_song_update(idx, "queued")
 
     parallel_flag = new_state.get("parallel_scrape")
     if isinstance(parallel_flag, bool):
@@ -1699,6 +1749,8 @@ def process_songs_node(
             per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
             per_song_name = f"{per_song_prefix}_{safe_title}"
             per_song_names[idx] = per_song_name
+            scrape_starts[idx] = _start_timer()
+            _emit_song_update(idx, "scraping")
             scrape_input = {
                 "title": song.get("title", ""),
                 "instrument": song.get("instrument", ""),
@@ -1718,6 +1770,7 @@ def process_songs_node(
                 "input_dir": input_dir_override,
                 "top_n": int(new_state.get("top_n", 3) or 3),
                 "log_dir": log_dir,
+                "preview_root": preview_root,
                 "run_ts": run_ts,
             })
         if not cancelled:
@@ -1748,6 +1801,7 @@ def process_songs_node(
                         _terminate_executor_processes(ex)
                         break
                     idx = futures[fut]
+                    downloads: List[Dict[str, Any]] = []
                     try:
                         res = fut.result()
                     except Exception as e:
@@ -1765,6 +1819,13 @@ def process_songs_node(
                                 errors_all.append({"label": f"parallel_scrape_{idx + 1}.error", "message": msg})
                         else:
                             results[idx] = []
+                    elapsed = _stop_timer(scrape_starts.get(idx, _start_timer()))
+                    song_timings[idx]["scrape"] = elapsed
+                    if downloads:
+                        _emit_song_update(idx, "downloaded")
+                    else:
+                        failed_songs.add(idx)
+                        _emit_song_update(idx, "failed")
                     completed += 1
                     _report_progress("scrape", completed, total_scrapes)
             finally:
@@ -1811,8 +1872,20 @@ def process_songs_node(
             safe_title = sanitize_title(song.get("title", "Unknown Title"))
             per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
             per_song_name = f"{per_song_prefix}_{safe_title}"
+            scrape_start = _start_timer()
+            scrape_starts[idx] = scrape_start
+            _emit_song_update(idx, "scraping")
 
             try:
+                if preview_root:
+                    preview_dir = os.path.join(preview_root, f"song_{str(idx + 1).zfill(2)}")
+                    try:
+                        os.makedirs(preview_dir, exist_ok=True)
+                        os.environ["WMRA_PREVIEW_DIR"] = preview_dir
+                    except Exception:
+                        os.environ.pop("WMRA_PREVIEW_DIR", None)
+                else:
+                    os.environ.pop("WMRA_PREVIEW_DIR", None)
                 scrape_input = {
                     "title": song.get("title", ""),
                     "instrument": song.get("instrument", ""),
@@ -1867,6 +1940,12 @@ def process_songs_node(
                         }
                     )
 
+                song_timings[idx]["scrape"] = _stop_timer(scrape_start)
+                if downloads:
+                    _emit_song_update(idx, "downloaded")
+                else:
+                    failed_songs.add(idx)
+                    _emit_song_update(idx, "failed")
                 _add_jobs_from_downloads(
                     new_state,
                     jobs,
@@ -1880,6 +1959,9 @@ def process_songs_node(
                 )
 
             except Exception as e:
+                song_timings[idx]["scrape"] = _stop_timer(scrape_start)
+                failed_songs.add(idx)
+                _emit_song_update(idx, "failed")
                 _record_error(new_state, f"{per_song_name}_outer_exception", e)
                 final_pdfs.append(None)
             completed += 1
@@ -1896,15 +1978,59 @@ def process_songs_node(
         _record_timing(new_state, "process_songs_node", _stop_timer(start))
         return new_state
 
+    jobs_by_song: Dict[int, int] = {}
+    for job in jobs:
+        try:
+            song_idx = int(job.get("song_index", -1))
+        except Exception:
+            continue
+        if song_idx < 0:
+            continue
+        jobs_by_song[song_idx] = jobs_by_song.get(song_idx, 0) + 1
+    assemble_remaining: Dict[int, int] = dict(jobs_by_song)
+    song_success: Dict[int, bool] = {idx: False for idx in jobs_by_song}
+
     # Batch watermark removal
     wm_jobs = [job for job in jobs if job.get("abs_download_dir")]
     if wm_jobs:
         abs_dirs = [job["abs_download_dir"] for job in wm_jobs if job.get("abs_download_dir")]
+        wm_dir_to_song: Dict[str, int] = {}
+        for job in wm_jobs:
+            abs_dir = job.get("abs_download_dir")
+            if not abs_dir:
+                continue
+            try:
+                wm_dir_to_song[os.path.abspath(abs_dir)] = int(job.get("song_index", -1))
+            except Exception:
+                continue
+        wm_started: set[int] = set()
+        def wm_item_cb(
+            phase: str,
+            directory: str,
+            _idx: int,
+            _total: int,
+            elapsed: float | None,
+            _success: bool | None,
+        ) -> None:
+            song_idx = wm_dir_to_song.get(os.path.abspath(directory))
+            if song_idx is None or song_idx < 0:
+                return
+            if song_idx in failed_songs:
+                return
+            if phase == "start":
+                if song_idx not in wm_started:
+                    wm_started.add(song_idx)
+                    _emit_song_update(song_idx, "watermark")
+                return
+            if elapsed is not None:
+                song_timings[song_idx]["watermark"] += float(elapsed)
+            _emit_song_update(song_idx)
         total_wm = len(abs_dirs)
         _report_progress("watermark", 0, total_wm)
         wm_results, wm_errors = remove_watermark_batch(
             abs_dirs,
             progress_cb=lambda done, total: _report_progress("watermark", done, total),
+            item_cb=wm_item_cb,
         )
         for job in wm_jobs:
             abs_dir = job.get("abs_download_dir")
@@ -1938,11 +2064,43 @@ def process_songs_node(
     up_jobs = [job for job in jobs if job.get("abs_processed_dir")]
     if up_jobs:
         processed_dirs = [job["abs_processed_dir"] for job in up_jobs if job.get("abs_processed_dir")]
+        up_dir_to_song: Dict[str, int] = {}
+        for job in up_jobs:
+            abs_dir = job.get("abs_processed_dir")
+            if not abs_dir:
+                continue
+            try:
+                up_dir_to_song[os.path.abspath(abs_dir)] = int(job.get("song_index", -1))
+            except Exception:
+                continue
+        up_started: set[int] = set()
+        def up_item_cb(
+            phase: str,
+            directory: str,
+            _idx: int,
+            _total: int,
+            elapsed: float | None,
+            _success: bool | None,
+        ) -> None:
+            song_idx = up_dir_to_song.get(os.path.abspath(directory))
+            if song_idx is None or song_idx < 0:
+                return
+            if song_idx in failed_songs:
+                return
+            if phase == "start":
+                if song_idx not in up_started:
+                    up_started.add(song_idx)
+                    _emit_song_update(song_idx, "upscale")
+                return
+            if elapsed is not None:
+                song_timings[song_idx]["upscale"] += float(elapsed)
+            _emit_song_update(song_idx)
         total_up = len(processed_dirs)
         _report_progress("upscale", 0, total_up)
         up_results, up_errors = upscale_images_batch(
             processed_dirs,
             progress_cb=lambda done, total: _report_progress("upscale", done, total),
+            item_cb=up_item_cb,
         )
         for job in up_jobs:
             abs_processed = job.get("abs_processed_dir")
@@ -2029,6 +2187,20 @@ def process_songs_node(
             pdf_path = str(existing_pdf)
 
         final_pdfs[result_index] = pdf_path if isinstance(pdf_path, str) else None
+        try:
+            song_idx = int(job.get("song_index", -1))
+        except Exception:
+            song_idx = -1
+        if song_idx >= 0:
+            if pdf_path:
+                song_success[song_idx] = True
+            if song_idx in assemble_remaining:
+                assemble_remaining[song_idx] -= 1
+                if assemble_remaining[song_idx] <= 0 and song_idx not in failed_songs:
+                    final_status = "done" if song_success.get(song_idx) else "failed"
+                    if final_status == "failed":
+                        failed_songs.add(song_idx)
+                    _emit_song_update(song_idx, final_status)
 
     # Cleanup temporary directories once after all processing completes
     try:
@@ -2363,13 +2535,14 @@ def should_continue(state: Dict[str, Any]) -> str:
 def process_songs_parallel_node(
     state: Dict[str, Any],
     progress_cb: Callable[[str, int, int], None] | None = None,
+    event_cb: Callable[[Dict[str, Any]], None] | None = None,
 ) -> Dict[str, Any]:
     """Scrape in parallel, then batch watermark removal/upscaling in order."""
     _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
     start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
     new_state["parallel_scrape"] = True
-    result = process_songs_node(new_state, progress_cb=progress_cb)
+    result = process_songs_node(new_state, progress_cb=progress_cb, event_cb=event_cb)
     _record_timing(result, "process_songs_parallel_node", _stop_timer(start))
     return result
 

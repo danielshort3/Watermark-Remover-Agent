@@ -2014,6 +2014,50 @@ def _scrape_with_selenium(
             return normalize_key(m.group(1)) or None
         except Exception:
             return None
+
+    def _key_from_label(label: str) -> Optional[str]:
+        if not label:
+            return None
+        try:
+            import re as _re
+            match = _re.search(r"([A-G](?:b|#)?(?:/[A-G](?:b|#)?)?)", label, flags=_re.I)
+            if not match:
+                return None
+            return normalize_key(match.group(1)) or None
+        except Exception:
+            return None
+
+    def _infer_selected_key_from_button(current: str | None) -> str | None:
+        try:
+            key_el = SeleniumHelper.find_element(driver, XPATHS['key_button'], timeout=2, log_func=None)
+        except Exception:
+            key_el = None
+        if not key_el:
+            return current
+        candidates: list[str] = []
+        try:
+            candidates.append((key_el.text or "").strip())
+        except Exception:
+            pass
+        for attr in ("innerText", "textContent", "aria-label"):
+            try:
+                val = (key_el.get_attribute(attr) or "").strip()
+                if val:
+                    candidates.append(val)
+            except Exception:
+                continue
+        for cand in candidates:
+            inferred = _key_from_label(cand)
+            if not inferred:
+                continue
+            if not current or normalize_key(current) != normalize_key(inferred):
+                try:
+                    logger.info("SCRAPER: inferred selected key from button label: %s", inferred)
+                except Exception:
+                    pass
+                return inferred
+            return current
+        return current
     # Create a temporary directory for this scraping run.  We place
     # temporary directories under the log directory so that they are
     # easy to clean up later.  Use tempfile to avoid collisions.
@@ -2807,6 +2851,7 @@ def _scrape_with_selenium(
         )
         # Pause briefly after closing the key menu
         time.sleep(random.uniform(0.3, 0.8))
+        selected_key = _infer_selected_key_from_button(selected_key)
         if available_keys:
             logger.info(
                 "SCRAPER: available keys for '%s': %s; selected key: %s",
@@ -3136,6 +3181,7 @@ def _scrape_with_selenium(
                 logger.debug("SCRAPER: re-select key after instrument failed: %s", _rekey_err)
             except Exception:
                 pass
+        selected_key = _infer_selected_key_from_button(selected_key)
         if available_instruments:
             try:
                 logger.info(
@@ -3375,12 +3421,14 @@ def remove_watermark_batch(
     model_dir: str = "models/Watermark_Removal",
     output_dir: str = "processed",
     progress_cb: Callable[[int, int], None] | None = None,
+    item_cb: Callable[[str, str, int, int, float | None, bool | None], None] | None = None,
 ) -> tuple[dict[str, Optional[str]], dict[str, Exception]]:
     """Process one or more directories through the watermark removal model.
 
     Returns a tuple ``(results, errors)`` mapping each input directory to its
     processed output path (or ``None`` on failure) and any raised exceptions.
     If provided, ``progress_cb`` receives ``(done, total)`` after each directory.
+    ``item_cb`` receives ``(phase, input_dir, index, total, elapsed_seconds, success)``.
     """
     if _import_error is not None:
         raise ImportError(
@@ -3428,6 +3476,11 @@ def remove_watermark_batch(
                 pass
         for idx, directory in enumerate(unique_dirs, start=1):
             dir_start = time.perf_counter()
+            if item_cb:
+                try:
+                    item_cb("start", directory, idx, total, None, None)
+                except Exception:
+                    pass
             try:
                 processed_dir = output_dir
                 if not processed_dir or processed_dir == "processed":
@@ -3462,11 +3515,22 @@ def remove_watermark_batch(
                     img.save(out_path)
                     logger.info("WMR: processed %s -> %s", inp_path, out_path)
                 elapsed = time.perf_counter() - dir_start
+                if item_cb:
+                    try:
+                        item_cb("end", directory, idx, total, elapsed, True)
+                    except Exception:
+                        pass
                 logger.info("WMR: completed %s in %.3fs", directory, elapsed)
                 results[directory] = processed_dir
             except Exception as exc:  # noqa: BLE001
                 results[directory] = None
                 errors[directory] = exc
+                elapsed = time.perf_counter() - dir_start
+                if item_cb:
+                    try:
+                        item_cb("end", directory, idx, total, elapsed, False)
+                    except Exception:
+                        pass
                 logger.exception("WMR: failed to process %s", directory)
             if progress_cb:
                 try:
@@ -3889,10 +3953,12 @@ def upscale_images_batch(
     model_dir: str = "models/VDSR",
     output_dir: str = "upscaled",
     progress_cb: Callable[[int, int], None] | None = None,
+    item_cb: Callable[[str, str, int, int, float | None, bool | None], None] | None = None,
 ) -> tuple[dict[str, Optional[str]], dict[str, Exception]]:
     """Process one or more directories through the upscaling model.
 
     If provided, ``progress_cb`` receives ``(done, total)`` after each directory.
+    ``item_cb`` receives ``(phase, input_dir, index, total, elapsed_seconds, success)``.
     """
     if _import_error is not None:
         raise ImportError(
@@ -3944,6 +4010,11 @@ def upscale_images_batch(
                 pass
         for idx, directory in enumerate(unique_dirs, start=1):
             dir_start = time.perf_counter()
+            if item_cb:
+                try:
+                    item_cb("start", directory, idx, total, None, None)
+                except Exception:
+                    pass
             try:
                 target_dir = output_dir
                 if not target_dir or target_dir == "upscaled":
@@ -3997,11 +4068,22 @@ def upscale_images_batch(
                     img.save(out_path)
                     logger.info("UPSCALE: processed %s -> %s", inp_path, out_path)
                 elapsed = time.perf_counter() - dir_start
+                if item_cb:
+                    try:
+                        item_cb("end", directory, idx, total, elapsed, True)
+                    except Exception:
+                        pass
                 logger.info("UPSCALE: completed %s in %.3fs", directory, elapsed)
                 results[directory] = target_dir
             except Exception as exc:  # noqa: BLE001
                 results[directory] = None
                 errors[directory] = exc
+                elapsed = time.perf_counter() - dir_start
+                if item_cb:
+                    try:
+                        item_cb("end", directory, idx, total, elapsed, False)
+                    except Exception:
+                        pass
                 logger.exception("UPSCALE: failed to process %s", directory)
             if progress_cb:
                 try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -11,6 +12,7 @@ import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -409,6 +411,38 @@ def _format_ollama_status(diag: Dict[str, Any]) -> str:
     return f"Ollama unreachable at {base_url}: {error}"
 
 
+def _collect_preview_images(preview_root: str) -> List[Tuple[str, str]]:
+    if not preview_root or not os.path.isdir(preview_root):
+        return []
+    items: List[Tuple[str, str]] = []
+    for entry in sorted(os.listdir(preview_root)):
+        worker_dir = os.path.join(preview_root, entry)
+        if not os.path.isdir(worker_dir):
+            continue
+        screenshots_dir = os.path.join(worker_dir, "screenshots")
+        if not os.path.isdir(screenshots_dir):
+            continue
+        latest_path = ""
+        latest_mtime = -1.0
+        try:
+            for fname in os.listdir(screenshots_dir):
+                if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
+                    continue
+                path = os.path.join(screenshots_dir, fname)
+                try:
+                    mtime = os.path.getmtime(path)
+                except Exception:
+                    continue
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                    latest_path = path
+        except Exception:
+            continue
+        if latest_path:
+            items.append((latest_path, entry))
+    return items
+
+
 def cancel_processing() -> Tuple[str, None]:
     event = _get_cancel_event()
     if event is None:
@@ -418,6 +452,13 @@ def cancel_processing() -> Tuple[str, None]:
     except Exception:
         return "Cancel requested, but the signal could not be sent.", None
     return "Cancel requested. Waiting for the current step to finish.", None
+
+
+def cancel_order_processing() -> Tuple[str, None, List[Tuple[str, str]]]:
+    message, _ = cancel_processing()
+    return message, None, []
+
+
 
 
 def check_ollama(
@@ -1003,30 +1044,34 @@ def run_processing(
     save_screens: bool,
     save_html: bool,
     save_errors_only: bool,
+    preview_enabled: bool,
     progress: gr.Progress = gr.Progress(),  # type: ignore[assignment]
-) -> Iterable[Tuple[str, str | None]]:
+) -> Iterable[Tuple[str, str | None, List[Tuple[str, str]]]]:
     """Process verified songs and stream progress updates."""
     log_lines: List[str] = []
+    preview_items: List[Tuple[str, str]] = []
     if not order_state or not order_state.get("pdf_name"):
         log_lines.append("No order loaded. Run analysis first.")
-        yield "\n".join(log_lines), None
+        yield "\n".join(log_lines), None, preview_items
         return
 
     default_instrument = _safe_str(order_state.get("default_instrument"))
     songs = _parse_song_rows(rows, default_instrument)
     if not songs:
         log_lines.append("No songs selected for processing.")
-        yield "\n".join(log_lines), None
+        yield "\n".join(log_lines), None, preview_items
         return
 
     cancel_event = _new_cancel_event(bool(parallel_processing))
     try:
         if _cancel_requested():
             log_lines.append("Cancelled by user.")
-            yield "\n".join(log_lines), None
+            yield "\n".join(log_lines), None, preview_items
             return
 
-        _apply_capture_env(save_screens, save_html, save_errors_only)
+        effective_save_screens = bool(save_screens or preview_enabled)
+        effective_errors_only = False if preview_enabled else bool(save_errors_only)
+        _apply_capture_env(effective_save_screens, save_html, effective_errors_only)
 
         url, model, _, _ = _apply_ollama_env(
             ollama_url,
@@ -1043,19 +1088,26 @@ def run_processing(
         diag = ping_ollama(url, model)
         if not diag.get("ok", False) or not diag.get("has_model", False):
             log_lines.append(f"WARNING: {_format_ollama_status(diag)}")
-            yield "\n".join(log_lines), None
+            yield "\n".join(log_lines), None, preview_items
         elif ollama_debug:
             log_lines.append("Ollama debug enabled; click Check Ollama for details.")
-            yield "\n".join(log_lines), None
+            yield "\n".join(log_lines), None, preview_items
 
         run_id = _safe_str(order_state.get("run_id")) or uuid.uuid4().hex[:10]
         order_folder = _safe_str(order_state.get("order_folder")) or "unknown_date"
+        preview_root = ""
+        if preview_enabled:
+            preview_root = os.path.join(os.getcwd(), "output", "previews", order_folder, run_id)
+            try:
+                os.makedirs(preview_root, exist_ok=True)
+            except Exception:
+                preview_root = ""
         total = len(songs)
         log_lines.append(f"Processing {total} song(s).")
         progress(0.0, desc="Starting")
-        yield "\n".join(log_lines), None
+        yield "\n".join(log_lines), None, preview_items
 
-        def progress_cb(stage: str, done: int, total_steps: int) -> None:
+        def _apply_progress(stage: str, done: int, total_steps: int) -> None:
             if total_steps <= 0:
                 return
             ratio = max(0.0, min(1.0, done / total_steps))
@@ -1081,6 +1133,8 @@ def run_processing(
             "_cancel_event": cancel_event,
         }
         state["parallel_scrape"] = bool(parallel_processing)
+        if preview_root:
+            state["preview_root"] = preview_root
 
         if parallel_processing:
             max_procs_val = int(max_procs) if max_procs else 0
@@ -1092,41 +1146,83 @@ def run_processing(
                 f"Parallel scraping enabled (max_procs={max_procs_val or 'all'})."
             )
             progress(0.0, desc=f"Scraping (0/{total})")
-            yield "\n".join(log_lines), None
-            try:
-                state = order_graph.process_songs_parallel_node(state, progress_cb=progress_cb)
-            except Exception as exc:
-                LOGGER.exception("Parallel scraping failed")
-                log_lines.append(f"Parallel scraping failed: {exc}")
-                yield "\n".join(log_lines), None
-                return
-            if state.get("cancelled"):
-                log_lines.append("Cancelled by user.")
-                yield "\n".join(log_lines), None
-                return
-            _, new_errs = _summarize_errors(state, 0)
-            if new_errs:
-                log_lines.extend(new_errs)
-                yield "\n".join(log_lines), None
+            yield "\n".join(log_lines), None, preview_items
         else:
             progress(0.0, desc=f"Scraping (0/{total})")
             log_lines.append("Scraping all songs before processing.")
-            yield "\n".join(log_lines), None
+            yield "\n".join(log_lines), None, preview_items
+
+        def _run_process(progress_cb_fn):
+            if parallel_processing:
+                return order_graph.process_songs_parallel_node(state, progress_cb=progress_cb_fn)
+            return order_graph.process_songs_node(state, progress_cb=progress_cb_fn)
+
+        if preview_enabled:
+            event_queue: queue.Queue[Tuple[str, int, int]] = queue.Queue()
+
+            def progress_cb(stage: str, done: int, total_steps: int) -> None:
+                event_queue.put((stage, done, total_steps))
+
+            def _apply_events() -> bool:
+                changed = False
+                while True:
+                    try:
+                        stage, done, total_steps = event_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    _apply_progress(stage, done, total_steps)
+                    changed = True
+                return changed
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_process, progress_cb)
+                last_preview: List[Tuple[str, str]] = []
+                last_yield = 0.0
+                while True:
+                    progress_changed = _apply_events()
+                    preview_changed = False
+                    if preview_root:
+                        preview_items = _collect_preview_images(preview_root)
+                        if preview_items != last_preview:
+                            last_preview = list(preview_items)
+                            preview_changed = True
+                    now = time.time()
+                    if progress_changed or preview_changed or (now - last_yield) > 2.0:
+                        yield "\n".join(log_lines), None, preview_items
+                        last_yield = now
+                    if future.done():
+                        break
+                    time.sleep(0.2)
+                _apply_events()
+                if preview_root:
+                    preview_items = _collect_preview_images(preview_root)
+                try:
+                    state = future.result()
+                except Exception as exc:
+                    LOGGER.exception("Batch processing failed")
+                    log_lines.append(f"Batch processing failed: {exc}")
+                    yield "\n".join(log_lines), None, preview_items
+                    return
+        else:
+            def progress_cb(stage: str, done: int, total_steps: int) -> None:
+                _apply_progress(stage, done, total_steps)
+
             try:
-                state = order_graph.process_songs_node(state, progress_cb=progress_cb)
+                state = _run_process(progress_cb)
             except Exception as exc:
                 LOGGER.exception("Batch processing failed")
                 log_lines.append(f"Batch processing failed: {exc}")
-                yield "\n".join(log_lines), None
+                yield "\n".join(log_lines), None, preview_items
                 return
-            if state.get("cancelled"):
-                log_lines.append("Cancelled by user.")
-                yield "\n".join(log_lines), None
-                return
-            _, new_errs = _summarize_errors(state, 0)
-            if new_errs:
-                log_lines.extend(new_errs)
-                yield "\n".join(log_lines), None
+
+        if state.get("cancelled"):
+            log_lines.append("Cancelled by user.")
+            yield "\n".join(log_lines), None, preview_items
+            return
+        _, new_errs = _summarize_errors(state, 0)
+        if new_errs:
+            log_lines.extend(new_errs)
+            yield "\n".join(log_lines), None, preview_items
 
         final_pdfs = list(state.get("final_pdfs", []) or [])
         success_count = sum(1 for p in final_pdfs if p)
@@ -1141,7 +1237,7 @@ def run_processing(
             log_lines.append(f"Zip ready: {zip_path}")
         else:
             log_lines.append("Zip could not be created; no output files found.")
-        yield "\n".join(log_lines), zip_path
+        yield "\n".join(log_lines), zip_path, preview_items
     finally:
         _set_cancel_event(None)
 
@@ -1515,6 +1611,11 @@ def build_app() -> gr.Blocks:
                 save_screens = gr.Checkbox(label="Save screenshots", value=False)
                 save_html = gr.Checkbox(label="Save HTML", value=False)
                 save_errors_only = gr.Checkbox(label="Only save on errors", value=True)
+            with gr.Row():
+                preview_enabled = gr.Checkbox(
+                    label="Show Selenium preview (snapshots)",
+                    value=False,
+                )
 
         with gr.Tabs():
             with gr.TabItem("Order of Worship"):
@@ -1569,6 +1670,11 @@ def build_app() -> gr.Blocks:
                     label="Progress",
                     lines=12,
                     interactive=False,
+                )
+                preview_gallery = gr.Gallery(
+                    label="Selenium preview",
+                    columns=2,
+                    visible=False,
                 )
                 output_zip = gr.File(label="Download zip")
 
@@ -1674,13 +1780,20 @@ def build_app() -> gr.Blocks:
                 save_screens,
                 save_html,
                 save_errors_only,
+                preview_enabled,
             ],
-            outputs=[progress_log, output_zip],
+            outputs=[progress_log, output_zip, preview_gallery],
         )
 
         cancel_btn.click(
-            cancel_processing,
-            outputs=[progress_log, output_zip],
+            cancel_order_processing,
+            outputs=[progress_log, output_zip, preview_gallery],
+        )
+
+        preview_enabled.change(
+            lambda show: gr.update(visible=bool(show)),
+            inputs=[preview_enabled],
+            outputs=[preview_gallery],
         )
 
         check_btn.click(
@@ -1799,7 +1912,7 @@ def build_app() -> gr.Blocks:
     return demo
 
 
-def launch(host: str = "127.0.0.1", port: int = 7860, share: bool = False) -> None:
+def launch(host: str = "127.0.0.1", port: int = 7860, share: bool = True) -> None:
     """Launch the GUI server."""
     app = build_app()
     app.queue()
