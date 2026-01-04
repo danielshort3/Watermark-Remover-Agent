@@ -36,7 +36,7 @@
 - Update docs (`README.md`, this file) when adding tools/graphs or changing interfaces. Don’t commit large assets or secrets.
 
 ## Configuration & Agent Tips
-- Environment: `OLLAMA_URL` (default local), `OLLAMA_MODEL` (e.g., `qwen3:30b`), `LOG_LEVEL`, optional `WMRA_LOG_DIR`.
+- Environment: `OLLAMA_URL` (default local), `OLLAMA_MODEL` (e.g., `qwen3:8b`), `LOG_LEVEL`, optional `WMRA_LOG_DIR`.
 - Weights live under `models/`; sample sheets under `data/samples/`.
 - Add a tool: implement in `src/watermark_remover/agent/tools.py` (clear docstring), ensure it’s imported/used by the agent, and add tests.
 - Add a graph: create `src/watermark_remover/agent/<name>_graph.py` exposing `graph`, register in `langgraph.json`, and verify via `langgraph dev`.

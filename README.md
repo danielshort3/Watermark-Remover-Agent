@@ -6,7 +6,7 @@ pipeline.  The agent can scrape (stubbed in this example), remove
 watermarks, upscale images, and assemble the results into a PDF—all
 without manual intervention.  Instead of wiring these steps together via
 LangGraph, the project uses a **LangChain** agent backed by an Ollama
-model (e.g. `qwen3:30b`) to decide which tool to call and when.
+model (default `qwen3:8b`) to decide which tool to call and when.
 
 ## Prerequisites
 
@@ -19,7 +19,7 @@ model (e.g. `qwen3:30b`) to decide which tool to call and when.
 
   ```bash
   ollama serve &
-  ollama pull qwen3:30b
+  ollama pull qwen3:8b
   ```
 
 ## Building the image
@@ -41,7 +41,7 @@ docker run --gpus all --rm \
   --add-host=host.docker.internal:host-gateway \
   -e LOG_LEVEL=DEBUG \
   -e OLLAMA_URL=http://host.docker.internal:11434 \
-  -e OLLAMA_MODEL=qwen3:30b \
+  -e OLLAMA_MODEL=qwen3:8b \
   -e OLLAMA_KEEP_ALIVE=30m \
   -v "$(pwd)/models:/app/models" \
   -v "$(pwd)/data:/app/data" \
@@ -71,7 +71,7 @@ provided Dockerfile).  For example:
 from watermark_remover.agent.ollama_agent import get_ollama_agent
 
 # Create an agent bound to the Qwen3 model on the Ollama server
-agent = get_ollama_agent(model_name="qwen3:30b")
+agent = get_ollama_agent(model_name="qwen3:8b")
 
 # Ask the agent to download some sheet music, remove the watermark,
 # upscale it and assemble a PDF.  The agent will call the appropriate
@@ -94,6 +94,53 @@ print(result)
 
 Both methods return a string with the result or a diagnostic error if
 the Ollama server cannot be reached or the model is missing.
+
+## GUI (Order of Worship)
+
+You can run a lightweight Gradio GUI to upload an order-of-worship PDF,
+review detected songs, and run the full pipeline with progress updates.
+
+```bash
+python scripts/run_gui.py --host 127.0.0.1 --port 7860
+```
+
+Workflow:
+- The GUI auto-starts Ollama on load and populates the model dropdown when available.
+- Upload the PDF and add any instruction text (used for extraction filters).
+- Confirm the Ollama URL/model and click "Check Ollama" if you want a fresh health check.
+- If you run Ollama inside WSL, set `OLLAMA_HOST`/`OLLAMA_MODELS` and use "Start Ollama (WSL)" if needed.
+  `OLLAMA_MODELS` should be a WSL path to your Windows models directory
+  (for example `/mnt/c/Users/<you>/AppData/Local/Ollama/models`).
+  The GUI now auto-detects common Windows model paths under `/mnt/c/Users/*/`.
+- Toggle "Ollama debug" and click "Check Ollama" to view environment, manifest,
+  and `ollama list` diagnostics in the GUI.
+- With "Ollama debug" enabled, LLM trace events are recorded to
+  `output/logs/<run_ts>/llm_trace.jsonl` (with prompt previews) and a tail
+  is shown in the GUI.
+- Use "Force Restart (WSL)" if Ollama is running with the wrong `OLLAMA_MODELS`
+  path; it will stop any `ollama serve` process and relaunch with the GUI's env.
+- For concurrent scraping, enable "Parallel scraping (multi-process)" and
+  set "Max parallel processes" as needed.
+- To keep search results in the exact page order, set `WMRA_SCRAPER_PRESERVE_ORDER=1`.
+- The tabs split the workflow into Order of Worship, Single Song, and Manual Images.
+- Click "Analyze order" to extract songs.
+- Edit the detected songs list (including instrument/key overrides).
+- Click "Run pipeline" to generate outputs and download the zip.
+
+The zip is saved under `output/orders/<date>/` alongside the generated
+song PDFs and the `00_..._Order_Of_Worship.pdf` copy.
+
+## Browser action recorder
+
+When PraiseCharts changes its UI, you can record manual clicks/inputs to capture
+the exact XPath/CSS selectors that should be updated in `src/utils/selenium_utils.py`:
+
+```bash
+python scripts/record_browser.py --url https://www.praisecharts.com/search --start-maximized
+```
+
+The recorder writes `events.jsonl`, `events.txt`, and screenshots under
+`output/recordings/<timestamp>/`.
 
 ## Project Structure (src‑layout)
 
@@ -217,18 +264,18 @@ reasoning and execution order:
 These logs provide insight into the agent’s internal decision‑making
 process and the concrete steps performed by each tool.
 
-## Order of Worship (Parallel per‑song)
+## Order of Worship (Parallel scraping)
 
-The `order-of-worship` LangGraph pipeline extracts songs from a service PDF and
-now processes each song in a separate process with its own Selenium browser. This
-keeps browser sessions and tool state fully isolated across songs.
+The `order-of-worship` LangGraph pipeline extracts songs from a service PDF,
+scrapes all songs first (optionally in parallel Selenium processes), then runs
+batch watermark removal + upscaling before assembling PDFs in order.
 
-- Enable/disable parallel mode: set `ORDER_PARALLEL=1` (default) or `ORDER_PARALLEL=0`.
-- Control concurrency: set `ORDER_MAX_PROCS` (defaults to `min(#songs, cpu_count)`).
+- Enable/disable parallel scraping: set `ORDER_PARALLEL=1` (default) or `ORDER_PARALLEL=0`.
+- Control scraping concurrency: set `ORDER_MAX_PROCS` (defaults to `#songs`).
 
-Each worker process sets a unique `RUN_TS` and `WMRA_LOG_DIR` so logs and temp
-artifacts are kept separate, then copies assembled PDFs into `output/orders/<MM_DD_YYYY>/`
-with names like `01_01_Title_Instrument_Key.pdf`.
+Each scrape worker uses its own Selenium browser and log directory, then the
+batch processors copy assembled PDFs into `output/orders/<MM_DD_YYYY>/` with
+names like `01_01_Title_Instrument_Key.pdf`.
 - The agent now mirrors this behaviour: it calls the `ensure_order_pdf` tool to copy the
   source service PDF into `output/orders/<MM_DD_YYYY>/00_<Month>_<DD>_<YYYY>_Order_Of_Worship.pdf`
   whenever an order-of-worship instruction is processed.

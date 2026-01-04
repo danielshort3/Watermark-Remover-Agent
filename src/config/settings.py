@@ -6,7 +6,7 @@ Keep these values minimal to avoid side effects at import-time.
 
 # Ollama defaults
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "qwen3:30b"
+DEFAULT_OLLAMA_MODEL = "qwen3:8b"
 
 # Logging
 DEFAULT_LOG_LEVEL = "INFO"

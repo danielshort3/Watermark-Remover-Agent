@@ -191,7 +191,7 @@ def test_get_ollama_agent_construction() -> None:
         # Dependencies are missing; nothing to test
         return
     try:
-        agent = get_ollama_agent(model_name="qwen3:30b")
+        agent = get_ollama_agent(model_name="qwen3:8b")
     except ImportError:
         return
     # If construction succeeded, ensure the returned object has an invoke method

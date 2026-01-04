@@ -1,7 +1,7 @@
 """Agent orchestrator for the Watermark Remover using an Ollama‑backed LLM.
 
 This module exposes a simple function that constructs a LangChain agent
-powered by a local Ollama model (such as ``qwen3:30b``) and a set of tools
+powered by a local Ollama model (such as ``qwen3:8b``) and a set of tools
 defined in :mod:`watermark_remover.agent.tools`.  The agent can reason
 about user instructions in natural language and decide when to call
 individual tools like ``scrape_music``, ``remove_watermark``, ``upscale_images``
@@ -12,7 +12,7 @@ the LLM's reasoning capabilities to invoke the appropriate tools in
 sequence without the user having to know the implementation details.
 
 To use this agent, you need to have an Ollama server running and have
-downloaded the desired model (by default ``qwen3:30b``) via the
+downloaded the desired model (by default ``qwen3:8b``) via the
 ``ollama pull`` command.  The agent will connect to the server at
 ``http://localhost:11434`` by default; this can be customised via the
 ``OLLAMA_URL`` environment variable.  See the project README for
@@ -51,7 +51,7 @@ from watermark_remover.agent.tools import (
 
 
 def get_ollama_agent(
-    model_name: str = "qwen3:30b",
+    model_name: str = "qwen3:8b",
     *,
     base_url: Optional[str] = None,
     temperature: float = 0.0,
@@ -63,7 +63,7 @@ def get_ollama_agent(
     Parameters
     ----------
     model_name : str, optional
-        Name of the Ollama model to use (default is ``"qwen3:30b"``).  Make
+        Name of the Ollama model to use (default is ``"qwen3:8b"``).  Make
         sure this model has been pulled onto the Ollama server.
     base_url : str, optional
         Base URL of the Ollama server.  If not provided, the environment
@@ -213,7 +213,7 @@ def _ping(base_url: str, path: str) -> dict:
 def diag() -> None:
     """Diagnostic entry point to verify Ollama connectivity and model availability."""
     base = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
+    model = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
     out: dict[str, Any] = {"base_url": base, "model": model}
     try:
         out["version"] = _ping(base, "/api/version")

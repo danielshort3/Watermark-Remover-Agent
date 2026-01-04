@@ -13,18 +13,62 @@ from __future__ import annotations
 import logging
 import json
 import os
+import socket
+import struct
+import time
 import urllib.request
 from typing import Any, Dict, Optional
 from config.settings import DEFAULT_OLLAMA_URL, DEFAULT_OLLAMA_MODEL
 
 
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/sys/kernel/osrelease", "r", encoding="utf-8") as handle:
+            return "microsoft" in handle.read().lower()
+    except Exception:
+        return False
+
+
+def _get_wsl_gateway_ip() -> str | None:
+    """Return the WSL default gateway IP, if available."""
+    if not _is_wsl():
+        return None
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as handle:
+            for line in handle.readlines()[1:]:
+                fields = line.strip().split()
+                if len(fields) < 4:
+                    continue
+                destination, gateway, flags = fields[1], fields[2], fields[3]
+                if destination != "00000000":
+                    continue
+                if int(flags, 16) & 2 == 0:
+                    continue
+                ip = socket.inet_ntoa(struct.pack("<L", int(gateway, 16)))
+                if ip and ip != "0.0.0.0":
+                    return ip
+    except Exception:
+        return None
+    return None
+
+
 def _candidate_ollama_urls(base_url: str) -> list[str]:
     urls = [base_url]
-    norm = base_url.replace("127.0.0.1", "localhost")
+    norm = (
+        base_url.replace("127.0.0.1", "localhost")
+        .replace("0.0.0.0", "localhost")
+    )
     if "localhost" in norm:
         alt = norm.replace("localhost", "host.docker.internal")
         if alt not in urls:
             urls.append(alt)
+        wsl_gateway = _get_wsl_gateway_ip()
+        if wsl_gateway:
+            wsl_url = norm.replace("localhost", wsl_gateway)
+            if wsl_url not in urls:
+                urls.append(wsl_url)
     return urls
 
 
@@ -81,6 +125,55 @@ _AGENT_MODEL: Optional[str] = None
 _AGENT_BASE_URL: Optional[str] = None
 
 _logger = logging.getLogger(__name__)
+
+
+def _env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _llm_trace_enabled() -> bool:
+    return _env_truthy(os.environ.get("WMRA_LLM_TRACE"))
+
+
+def _llm_trace_verbose() -> bool:
+    return _env_truthy(os.environ.get("WMRA_LLM_TRACE_VERBOSE"))
+
+
+def _llm_trace_path() -> str:
+    path = os.environ.get("WMRA_LLM_TRACE_PATH")
+    if path:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        return path
+    base = os.environ.get("WMRA_LOG_DIR")
+    if not base:
+        run_ts = os.environ.get("RUN_TS")
+        if not run_ts:
+            run_ts = time.strftime("%Y%m%d_%H%M%S")
+            os.environ.setdefault("RUN_TS", run_ts)
+        base = os.path.join(os.getcwd(), "output", "logs", run_ts)
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "llm_trace.jsonl")
+
+
+def _trace_event(payload: Dict[str, Any]) -> None:
+    if not _llm_trace_enabled():
+        return
+    event = dict(payload)
+    event.setdefault("ts", time.time())
+    label = os.environ.get("WMRA_LLM_TRACE_LABEL")
+    if label and "label" not in event:
+        event["label"] = label
+    prompt_path = os.environ.get("WMRA_LLM_TRACE_PROMPT_PATH")
+    if prompt_path:
+        event.setdefault("prompt_path", prompt_path)
+    try:
+        path = _llm_trace_path()
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
 
 
 def _get_llm(base_url: str, model: str) -> Any:
@@ -143,7 +236,7 @@ def run_instruction(instruction: str) -> str:
     demand.  It first ensures a non‑empty prompt, then verifies that the
     Ollama server specified by the ``OLLAMA_URL`` environment variable
     (defaulting to ``http://localhost:11434``) is reachable and that
-    the model specified by ``OLLAMA_MODEL`` (defaulting to ``qwen3:30b``)
+    the model specified by ``OLLAMA_MODEL`` (defaulting to ``qwen3:8b``)
     is available.  It lazily imports the agent factory function
     :func:`get_ollama_agent` and returns the agent's response as a
     string.  Any error encountered is returned as a descriptive string.
@@ -160,6 +253,7 @@ def run_instruction(instruction: str) -> str:
     """
     user_prompt = (instruction or "").strip()
     if not user_prompt:
+        _trace_event({"event": "run_instruction_empty"})
         return (
             "No instruction provided. Please supply a natural‑language task "
             "for the agent to perform."
@@ -184,11 +278,46 @@ def run_instruction(instruction: str) -> str:
         )
     base_url_env = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+    start_ts = time.perf_counter()
+    trace_payload: Dict[str, Any] = {
+        "event": "run_instruction_start",
+        "prompt_chars": len(prompt),
+    }
+    if _llm_trace_verbose():
+        trace_payload["prompt_preview"] = prompt[:500]
+    _trace_event(trace_payload)
+
+    ping_start = time.perf_counter()
     diag = _ping_ollama(base_url_env, model)
+    _trace_event(
+        {
+            "event": "ollama_ping",
+            "duration_ms": round((time.perf_counter() - ping_start) * 1000, 2),
+            "ok": bool(diag.get("ok")),
+            "has_model": bool(diag.get("has_model")),
+            "base_url": diag.get("base_url"),
+            "model": diag.get("model"),
+        }
+    )
     if not diag.get("ok", False):
+        _trace_event(
+            {
+                "event": "run_instruction_end",
+                "duration_ms": round((time.perf_counter() - start_ts) * 1000, 2),
+                "error": "ollama_unreachable",
+            }
+        )
         return f"Cannot reach Ollama at {base_url_env}: {diag.get('error', 'Unknown error')}"
     resolved_base_url = str(diag.get("base_url") or base_url_env)
     if not diag.get("has_model", False):
+        _trace_event(
+            {
+                "event": "run_instruction_end",
+                "duration_ms": round((time.perf_counter() - start_ts) * 1000, 2),
+                "error": "model_not_found",
+                "model": model,
+            }
+        )
         return (
             f"Model '{model}' not found on Ollama server. Available models: "
             f"{diag.get('models')}"
@@ -200,14 +329,34 @@ def run_instruction(instruction: str) -> str:
         agent = _get_agent(resolved_base_url, model)
     except Exception as exc:  # noqa: BLE001 - Return message downstream
         agent_error = exc
+        _trace_event(
+            {
+                "event": "agent_unavailable",
+                "error": str(exc),
+            }
+        )
 
     answer: str
     if agent is not None and agent_error is None:
         try:
+            agent_start = time.perf_counter()
             result = agent.invoke({"input": prompt})
             answer = _extract_agent_output(result)
+            _trace_event(
+                {
+                    "event": "agent_invoke",
+                    "duration_ms": round((time.perf_counter() - agent_start) * 1000, 2),
+                    "answer_chars": len(answer),
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             agent_error = exc
+            _trace_event(
+                {
+                    "event": "agent_invoke_error",
+                    "error": str(exc),
+                }
+            )
         else:
             agent_error = None
 
@@ -219,12 +368,26 @@ def run_instruction(instruction: str) -> str:
                 agent_error,
             )
         try:
+            llm_start = time.perf_counter()
             llm = _get_llm(resolved_base_url, model)
             response = llm.invoke(prompt)  # type: ignore
             answer = (
                 response.content if hasattr(response, "content") else str(response)
             )
+            _trace_event(
+                {
+                    "event": "direct_llm_invoke",
+                    "duration_ms": round((time.perf_counter() - llm_start) * 1000, 2),
+                    "answer_chars": len(answer),
+                }
+            )
         except Exception as exc:  # noqa: BLE001
+            _trace_event(
+                {
+                    "event": "direct_llm_error",
+                    "error": str(exc),
+                }
+            )
             return f"Error executing instruction: {exc}"
 
     try:
@@ -252,4 +415,12 @@ def run_instruction(instruction: str) -> str:
         )
     except Exception:
         pass
+    _trace_event(
+        {
+            "event": "run_instruction_end",
+            "duration_ms": round((time.perf_counter() - start_ts) * 1000, 2),
+            "answer_chars": len(str(answer)),
+            "agent_used": agent is not None and agent_error is None,
+        }
+    )
     return str(answer)

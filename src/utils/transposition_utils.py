@@ -9,6 +9,7 @@ sheet music.  See the original project for full context.
 """
  # Moved to src/utils for better project structure.
 
+import re
 from typing import List, Dict, Tuple
 
 # Mapping from key names to semitone numbers (C == 0).  Enharmonic
@@ -89,6 +90,10 @@ def normalize_key(key: str) -> str:
     key = key.strip()
     if not key:
         return ""
+    # Handle modulations like "F-G" by taking the starting key.
+    mod_match = re.match(r"^([A-Ga-g](?:#|b)?)\s*-\s*([A-Ga-g](?:#|b)?)$", key)
+    if mod_match:
+        key = mod_match.group(1)
     # Split on whitespace and take the first token in case of
     # additional descriptors (e.g. "C major").
     key = key.split()[0]

@@ -20,6 +20,9 @@ numpy
 # PDF parsing dependency for the order-of-worship graph
 pdfminer.six
 
+# GUI (Order of Worship)
+gradio>=4.0
+
 # Additional packages required for LangGraph support.  The ``langgraph`` package
 # provides the core graph abstractions while ``langgraph-cli`` installs the
 # ``langgraph`` command line interface used to launch the local API server.  The

@@ -56,7 +56,7 @@ def test_get_ollama_agent_missing_dependencies():
     # Attempt to construct the agent.  Any ImportError or runtime
     # error should cause the test to pass.
     try:
-        _ = get_ollama_agent(model_name="qwen3:30b")
+        _ = get_ollama_agent(model_name="qwen3:8b")
     except ImportError:
         return
     except Exception:

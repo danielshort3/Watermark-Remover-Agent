@@ -33,7 +33,7 @@ import time
 import uuid
 import traceback
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from pathlib import Path
 
 
@@ -55,6 +55,7 @@ from concurrent.futures import ProcessPoolExecutor as _PPExecutor, as_completed 
 
 # Import tools and utilities from your project
 from watermark_remover.agent.tools import sanitize_title, SCRAPE_METADATA, TEMP_DIRS
+from utils.transposition_utils import normalize_key
 
 
 def _iter_temp_dirs():
@@ -122,6 +123,24 @@ def _debug_enabled(state: Dict[str, Any]) -> bool:
         return state["debug"]
     return _env_truthy(os.getenv("ORDER_DEBUG", "1"))
 
+
+def _cancel_requested(state: Dict[str, Any]) -> bool:
+    event = state.get("_cancel_event")
+    if event is None or not hasattr(event, "is_set"):
+        return False
+    try:
+        return bool(event.is_set())
+    except Exception:
+        return False
+
+
+def _mark_cancelled(state: Dict[str, Any], label: str) -> None:
+    state["cancelled"] = True
+    try:
+        _record_error(state, f"{label}.cancelled", RuntimeError("Cancelled by user."))
+    except Exception:
+        pass
+
 def _ensure_logger_configured(level: int) -> None:
     # Avoid duplicate handlers if module reloaded
     if not _logger.handlers:
@@ -139,6 +158,215 @@ def _ensure_logger_configured(level: int) -> None:
     for name in _PDFMINER_LOGGERS:
         plogger = logging.getLogger(name)
         plogger.setLevel(logging.WARNING)
+
+def _input_root(state: Dict[str, Any]) -> str:
+    """Return an absolute path to the input directory that stores order PDFs."""
+    root_dir = (state.get("pdf_root") or state.get("input_dir") or "input") or "input"
+    if not os.path.isabs(root_dir):
+        root_dir = os.path.join(os.getcwd(), root_dir)
+    return root_dir
+
+def _display_input_root(state: Dict[str, Any]) -> str:
+    """Return a human-friendly label for the input directory."""
+    try:
+        root = _input_root(state)
+    except Exception:
+        return "input"
+    try:
+        rel = os.path.relpath(root, os.getcwd())
+        if not rel.startswith(".."):
+            return rel
+    except Exception:
+        pass
+    return root
+
+def _tokenize_for_match(value: str) -> list[str]:
+    """Split a string into lowercase tokens (digits stripped of leading zeros)."""
+    tokens: list[str] = []
+    for part in re.split(r"[^A-Za-z0-9]+", value.lower()):
+        if not part:
+            continue
+        if part.isdigit():
+            try:
+                part = str(int(part))
+            except Exception:
+                part = part.lstrip("0") or "0"
+        tokens.append(part)
+    return tokens
+
+def _normalize_pdf_key(value: str) -> str:
+    """Return a simplified comparison key for filenames/instructions."""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _normalize_extracted_key(value: str) -> str:
+    """Normalize extracted keys, preferring the starting key in modulations."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"([A-Ga-g](?:#|b)?)\s*[-–—]\s*([A-Ga-g](?:#|b)?)", raw)
+    if match:
+        normalized = normalize_key(match.group(1))
+        return normalized or raw
+    return raw
+
+def _normalized_dates_from_string(value: str) -> set[str]:
+    """Extract normalized MM_DD_YYYY strings from arbitrary text."""
+    results: set[str] = set()
+    for _, _, y, m, d in _try_parse_date_fragment(value):
+        results.add(_normalize_date_mm_dd_yyyy(y, m, d))
+    return results
+
+def _list_pdf_candidates(state: Dict[str, Any]) -> list[dict[str, Any]]:
+    """Enumerate PDFs under the configured input directory with match metadata."""
+    try:
+        root = _input_root(state)
+    except Exception:
+        return []
+    root_path = Path(root)
+    if not root_path.exists():
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for entry in sorted(root_path.glob("*.pdf")):
+        name = entry.name
+        tokens = set(_tokenize_for_match(name))
+        candidates.append(
+            {
+                "path": str(entry),
+                "name": name,
+                "normalized": _normalize_pdf_key(name),
+                "tokens": tokens,
+                "dates": _normalized_dates_from_string(name),
+            }
+        )
+    return candidates
+
+def _format_available_pdfs_for_prompt(
+    candidates: list[dict[str, Any]],
+    root_label: str,
+) -> str:
+    """Return a human-readable list of available PDFs for LLM context."""
+    if not candidates:
+        return f"\n\nAvailable order PDFs under {root_label}:\n- (none found)"
+    max_list = 20
+    lines = [f"- {c['name']}" for c in candidates[:max_list]]
+    extra = len(candidates) - max_list
+    if extra > 0:
+        lines.append(f"- ... (+{extra} more)")
+    listing = "\n".join(lines)
+    return f"\n\nAvailable order PDFs under {root_label}:\n{listing}"
+
+def _build_pdf_query_info(text: str) -> dict[str, Any]:
+    tokens = set(_tokenize_for_match(text))
+    return {
+        "raw": text,
+        "tokens": tokens,
+        "normalized": _normalize_pdf_key(text),
+        "dates": _normalized_dates_from_string(text),
+    }
+
+def _score_candidate_against_queries(
+    candidate: dict[str, Any],
+    queries: list[dict[str, Any]],
+) -> tuple[float, dict[str, Any]]:
+    tokens: set[str] = candidate.get("tokens") or set()
+    dates: set[str] = candidate.get("dates") or set()
+    normalized = candidate.get("normalized") or ""
+    score = 0.0
+    matched_tokens: set[str] = set()
+    matched_dates: set[str] = set()
+    normalized_hit = False
+
+    for query in queries:
+        qt = query.get("tokens") or set()
+        intersection = tokens & qt
+        if intersection:
+            matched_tokens |= intersection
+            score += len(intersection)
+        qd = query.get("dates") or set()
+        date_overlap = dates & qd
+        if date_overlap:
+            matched_dates |= date_overlap
+            score += len(date_overlap) * 10
+        qn = query.get("normalized") or ""
+        if qn and qn == normalized:
+            score += 25
+            normalized_hit = True
+        elif qn and normalized and (qn in normalized or normalized in qn):
+            score += 5
+
+    detail = {
+        "matched_tokens": sorted(matched_tokens),
+        "matched_dates": sorted(matched_dates),
+        "normalized_hit": normalized_hit,
+    }
+    return score, detail
+
+def _resolve_pdf_from_instruction(
+    state: Dict[str, Any],
+    desired_pdf: str,
+    instruction: str,
+    candidates: list[dict[str, Any]] | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Map the instruction/desired name to an actual PDF path if possible."""
+    if candidates is None:
+        candidates = _list_pdf_candidates(state)
+    if not candidates:
+        return None, {"reason": "no_candidates"}
+
+    queries: list[dict[str, Any]] = []
+    desired_pdf = (desired_pdf or "").strip()
+    instruction = (instruction or "").strip()
+    if desired_pdf:
+        queries.append(_build_pdf_query_info(desired_pdf))
+    if instruction:
+        queries.append(_build_pdf_query_info(instruction))
+    if not queries:
+        return None, {"reason": "no_queries"}
+
+    combined_dates: set[str] = set()
+    for q in queries:
+        combined_dates |= q.get("dates") or set()
+
+    best_idx = -1
+    best_score = 0.0
+    best_detail: dict[str, Any] | None = None
+    for idx, cand in enumerate(candidates):
+        score, detail = _score_candidate_against_queries(cand, queries)
+        if score > best_score:
+            best_idx = idx
+            best_score = score
+            best_detail = detail
+
+    if best_score <= 0 and combined_dates:
+        for idx, cand in enumerate(candidates):
+            pdf_date = cand.get("pdf_date")
+            if pdf_date is None:
+                try:
+                    pdf_date = _determine_order_folder_from_pdf(state, cand["path"])
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    _record_error(state, "pdf_resolution.date_probe_exception", exc)
+                    pdf_date = None
+                cand["pdf_date"] = pdf_date
+            if pdf_date and pdf_date in combined_dates:
+                best_idx = idx
+                best_score = 100.0
+                best_detail = {"matched_pdf_date": pdf_date}
+                break
+
+    if best_idx == -1 or best_detail is None:
+        return None, {
+            "reason": "no_match",
+            "candidates": [c["name"] for c in candidates],
+        }
+
+    candidate = candidates[best_idx]
+    best_detail = dict(best_detail)
+    best_detail["score"] = best_score
+    best_detail["resolved_name"] = candidate["name"]
+    best_detail["path"] = candidate["path"]
+    return candidate["path"], best_detail
 
 def _get_run_id(state: Dict[str, Any]) -> str:
     rid = state.get("run_id")
@@ -233,6 +461,88 @@ def _record_error(state: Dict[str, Any], label: str, exc: BaseException) -> None
         _write_json(base, "errors.json", errs)
     _logger.exception("Error [%s]: %s", label, exc)
 
+
+def _append_error(state: Dict[str, Any], label: str, message: str) -> None:
+    errs: List[Dict[str, Any]] = state.get("errors", [])
+    info = {
+        "label": label,
+        "type": "RuntimeError",
+        "message": message,
+        "traceback": "",
+    }
+    errs.append(info)
+    state["errors"] = errs
+    if _debug_enabled(state):
+        base = _debug_dir_for(state)
+        _write_json(base, "errors.json", errs)
+
+
+def _add_jobs_from_downloads(
+    state: Dict[str, Any],
+    jobs: List[Dict[str, Any]],
+    final_pdfs: List[str | None],
+    *,
+    idx: int,
+    song: Dict[str, Any],
+    per_song_name: str,
+    downloads: List[Dict[str, Any]],
+    debug_enabled: bool,
+    debug_base: Path | None,
+) -> None:
+    if not downloads:
+        title = str(song.get("title") or "")
+        msg = f"No song candidates found for '{title}'." if title else "No song candidates found."
+        _append_error(state, f"{per_song_name}_no_candidates", msg)
+        final_pdfs.append(None)
+        return
+
+    for match_idx, dl in enumerate(downloads, 1):
+        image_dir = dl.get("image_dir")
+        existing_pdf = dl.get("existing_pdf")
+        if not image_dir and not existing_pdf:
+            final_pdfs.append(None)
+            continue
+
+        variant_suffix = f"_match{match_idx}"
+        result_index = len(final_pdfs)
+        final_pdfs.append(None)
+
+        meta = dl.get("meta") or {}
+        actual_key = meta.get("key") or song.get("key", "")
+        actual_instrument = meta.get("instrument") or song.get("instrument", "")
+        actual_title_for_name = meta.get("title") or song.get("title", "Unknown Title")
+        safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
+        safe_key = sanitize_title(actual_key or "Unknown Key")
+        safe_title_for_name = sanitize_title(actual_title_for_name)
+        idx_str = str(idx + 1).zfill(2)
+        rank_str = str(match_idx).zfill(2)
+        filename = f"{idx_str}_{rank_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
+
+        job: Dict[str, Any] = {
+            "song_index": idx,
+            "song": song,
+            "meta": meta,
+            "result_index": result_index,
+            "per_song_name": per_song_name,
+            "variant_suffix": variant_suffix,
+            "filename": filename,
+            "assembly_meta": {
+                "title": actual_title_for_name,
+                "artist": meta.get("artist", ""),
+                "instrument": actual_instrument,
+                "key": actual_key,
+            },
+            "existing_pdf": existing_pdf,
+            "download_dir": image_dir,
+            "abs_download_dir": os.path.abspath(image_dir) if image_dir else None,
+            "rank_str": rank_str,
+        }
+        jobs.append(job)
+
+        if debug_enabled and debug_base is not None and image_dir:
+            rm_input = {"input_dir": image_dir}
+            _write_json(debug_base, f"{per_song_name}{variant_suffix}_remove_watermark_input.json", rm_input)
+
 def _start_timer() -> float:
     return time.perf_counter()
 
@@ -247,7 +557,7 @@ def _record_timing(state: Dict[str, Any], segment: str, seconds: float) -> None:
         base = _debug_dir_for(state)
         _write_json(base, "timings.json", timings)
 
-MAX_LLM_RETRIES = int(os.getenv("ORDER_MAX_LLM_RETRIES", "2"))
+MAX_LLM_RETRIES = int(os.getenv("ORDER_MAX_LLM_RETRIES", "1"))
 
 def _extract_json_from_llm_output(raw: Any) -> Any:
     s = str(raw or "").strip()
@@ -314,14 +624,20 @@ def _run_llm_strict_json(
         this_prompt = prompt if attempt == 1 else (prompt + strict_suffix)
 
         # Persist prompt
+        prompt_path = None
         if base is not None:
-            _write_text(base, f"{label}_prompt.attempt{attempt}.txt", this_prompt)
+            prompt_path = _write_text(base, f"{label}_prompt.attempt{attempt}.txt", this_prompt)
 
         # Call LLM
         raw = None
         err_msg = None
         parsed: Any = None
+        prev_label = os.environ.get("WMRA_LLM_TRACE_LABEL")
+        prev_prompt = os.environ.get("WMRA_LLM_TRACE_PROMPT_PATH")
         try:
+            os.environ["WMRA_LLM_TRACE_LABEL"] = attempt_label
+            if prompt_path:
+                os.environ["WMRA_LLM_TRACE_PROMPT_PATH"] = prompt_path
             raw = run_instruction(this_prompt)
             # Also log centrally under output/logs/<RUN_TS>/prompts
             try:
@@ -347,7 +663,7 @@ def _run_llm_strict_json(
             # Success
             attempts_log.append({"attempt": attempt, "status": "ok", "raw_len": len(str(raw))})
             break
-
+        
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             attempts_log.append({"attempt": attempt, "status": "fail", "error": err_msg})
@@ -356,6 +672,15 @@ def _run_llm_strict_json(
                 if base is not None:
                     _write_json(base, f"{label}_attempts.json", attempts_log)
                 raise
+        finally:
+            if prev_label is None:
+                os.environ.pop("WMRA_LLM_TRACE_LABEL", None)
+            else:
+                os.environ["WMRA_LLM_TRACE_LABEL"] = prev_label
+            if prev_prompt is None:
+                os.environ.pop("WMRA_LLM_TRACE_PROMPT_PATH", None)
+            else:
+                os.environ["WMRA_LLM_TRACE_PROMPT_PATH"] = prev_prompt
 
     # Persist attempts summary
     if base is not None:
@@ -407,6 +732,19 @@ def _read_pdf_text(pdf_path: str) -> str:
         _logger.exception("pdfminer failed during PDF processing: %s", pdf_path)
         raise RuntimeError("pdfminer could not read the PDF.") from exc
 
+
+def _get_pdf_text_cached(state: Dict[str, Any], pdf_path: str) -> str:
+    """Return cached PDF text for a path, reading from disk only once."""
+    cache = state.get("_pdf_text_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        state["_pdf_text_cache"] = cache
+    cached = cache.get(pdf_path)
+    if isinstance(cached, str):
+        return cached
+    text = _read_pdf_text(pdf_path)
+    cache[pdf_path] = text
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +876,54 @@ def _build_date_extractor_prompt(pdf_text: str) -> str:
     )
     return system + "\n\nRAW TEXT:\n" + pdf_text[:6000] + "\n\nReturn ONLY JSON."
 
+
+def _build_song_and_date_extractor_prompt(pdf_text: str, user_req: str | None) -> str:
+    """Prompt to extract both date and songs in one pass."""
+    rules = (
+        "You are a precise parser for 'order of worship' text. "
+        "Return STRICT JSON with exactly two keys: "
+        "date (string, MM_DD_YYYY or empty), "
+        "songs (object mapping zero-based indices to {title, artist, key}). "
+        "If details cannot be found for a field, use an empty string. "
+        "Do not fabricate songs not present in the text."
+    )
+    date_rules = (
+        "\n\nDATE RULES:\n"
+        "- Prefer dates near phrases like 'Date of Service', 'Service Date', "
+        "'Order of Worship for', or weekday names.\n"
+        "- Return MM_DD_YYYY (zero-padded) or an empty string if missing.\n"
+    )
+    song_rules = (
+        "\n\nSONG DETECTION RULES:\n"
+        "- Treat any line of the form '<Title> [ <Artist> in <Key> ]' as a SONG entry.\n"
+        "- Allow a leading timestamp (e.g., '3:25' or '4:56') before the title; still a SONG.\n"
+        "- Include titles even if they look like generic labels (e.g., 'Praise', 'Response'):\n"
+        "  if they appear with '[ <Artist> in <Key> ]', they are SONGS.\n"
+        "- Ignore obvious non-songs without '[ Artist in Key ]' like 'Pre Service', 'Announcements',\n"
+        "  'Offering Prayer', 'Sermon', 'Scripture', 'Rehearsal Times', or 'Length in mins'.\n"
+        "- Keep duplicate titles if they appear in different keys or at different times.\n"
+        "- Accept 'Default Arrangement' as a valid artist.\n"
+        "- Example: '4:56 Praise [ Elevation Worship in E ]' -> title='Praise', artist='Elevation Worship', key='E'.\n"
+        "- If a key is a modulation like 'F-G', return only the starting key (e.g., 'F').\n"
+    )
+    selection_rules = (
+        "\n\nSELECTION RULES (apply strictly if present):\n"
+        "- Respect user instructions like 'do not download <title>' or 'only download the fourth song'.\n"
+        "- Interpret ordinals in the order of appearance.\n"
+        "- If indices are provided, treat them as 1-based unless clearly zero-based.\n"
+        "- Exclusions first, then inclusions.\n"
+        "- Never fabricate songs; only pick from RAW TEXT.\n"
+    )
+    user_section = f"\n\nUSER REQUESTS:\n{user_req}" if user_req else ""
+    return (
+        rules
+        + date_rules
+        + song_rules
+        + selection_rules
+        + user_section
+        + f"\n\nRAW ORDER OF WORSHIP TEXT:\n{pdf_text}\n\nReturn ONLY JSON."
+    )
+
 def _extract_service_date_with_llm(state: Dict[str, Any], pdf_text: str) -> str | None:
     if run_instruction is None:
         return None
@@ -564,10 +950,10 @@ def _extract_service_date_with_llm(state: Dict[str, Any], pdf_text: str) -> str 
     return None
 
 def _determine_order_folder_from_pdf(state: Dict[str, Any], pdf_path: str) -> str:
-    """Read PDF text, then use LLM (preferred) or heuristics to produce MM_DD_YYYY, else 'unknown'."""
+    """Read PDF text (cached) and use heuristics to produce MM_DD_YYYY, else 'unknown'."""
     _logger.info("Determining order folder from PDF: %s", pdf_path)
     try:
-        raw = _read_pdf_text(pdf_path)
+        raw = _get_pdf_text_cached(state, pdf_path)
     except Exception as e:
         _logger.exception("Failed to read PDF text for date extraction: %s", pdf_path)
         _record_error(state, "date_extractor.read_pdf_exception", e)
@@ -579,17 +965,11 @@ def _determine_order_folder_from_pdf(state: Dict[str, Any], pdf_path: str) -> st
         _write_text(base, "pdf_text.txt", raw)
 
     if raw:
-        _logger.info("PDF text extracted; length=%d. Proceeding to date extraction.", len(raw))
+        _logger.info("PDF text extracted; length=%d. Proceeding to heuristic date extraction.", len(raw))
     else:
-        _logger.warning("No text available from PDF; LLM/heuristic date extraction may fail.")
+        _logger.warning("No text available from PDF; heuristic date extraction may fail.")
 
-    # First try LLM
-    _logger.info("Invoking LLM-based date extractor.")
-    date = _extract_service_date_with_llm(state, raw)
-    # Fallback to heuristics
-    if not date:
-        _logger.info("LLM date extractor returned empty result; falling back to heuristics.")
-        date = _extract_service_date_heuristic(raw)
+    date = _extract_service_date_heuristic(raw)
 
     if not date:
         _logger.warning("Unable to extract service date; defaulting to 'unknown'.")
@@ -667,6 +1047,78 @@ def _ensure_order_pdf_copied(state: Dict[str, Any]) -> None:
 
     except Exception as e:
         _record_error(state, "ensure_order_pdf_copied.exception", e)
+
+
+# ---------------------------------------------------------------------------
+# Parallel Scrape Worker (separate process + browser)
+# ---------------------------------------------------------------------------
+
+def _scrape_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Scrape a single song in an isolated process and return downloads."""
+    import os as _os
+    import traceback as _tb
+    from typing import Any as _Any, Dict as _Dict, List as _List
+
+    errors: _List[str] = []
+    idx: int = int(payload.get("idx", 0))
+    song: _Dict[str, _Any] = dict(payload.get("song") or {})
+    input_dir: str = str(payload.get("input_dir") or "data/samples")
+    top_n: int = int(payload.get("top_n", 3) or 3)
+    log_dir: str = str(payload.get("log_dir") or "")
+    run_ts: str = str(payload.get("run_ts") or "")
+
+    try:
+        from watermark_remover.agent.tools import (
+            scrape_music as _scrape,
+            SCRAPE_METADATA as _META,
+            init_pipeline_logging as _init_logging,
+        )
+    except Exception as e:  # pragma: no cover
+        errors.append(f"imports: {e}")
+        return {"idx": idx, "downloads": [], "errors": errors}
+
+    if run_ts:
+        _os.environ["RUN_TS"] = run_ts
+    if log_dir:
+        _os.environ["WMRA_LOG_DIR"] = log_dir
+    try:
+        _init_logging()
+    except Exception:
+        pass
+
+    downloads: _List[_Dict[str, _Any]] = []
+    try:
+        raw = _scrape.invoke({
+            "title": song.get("title", ""),
+            "instrument": song.get("instrument", ""),
+            "key": song.get("key", ""),
+            "artist": song.get("artist", ""),
+            "input_dir": input_dir,
+            "top_n": top_n,
+        })
+        if isinstance(raw, list):
+            for it in raw:
+                if isinstance(it, dict):
+                    if it.get("image_dir") or it.get("existing_pdf"):
+                        downloads.append({
+                            "image_dir": it.get("image_dir"),
+                            "existing_pdf": it.get("existing_pdf"),
+                            "meta": it.get("meta", {}),
+                        })
+        elif isinstance(raw, str):
+            downloads.append({
+                "image_dir": raw,
+                "meta": {
+                    "title": _META.get("title", song.get("title", "")),
+                    "artist": _META.get("artist", song.get("artist", "")),
+                    "instrument": _META.get("instrument", song.get("instrument", "")),
+                    "key": _META.get("key", song.get("key", "")),
+                },
+            })
+    except Exception as e:  # pragma: no cover
+        errors.append(f"scrape: {e}\n{_tb.format_exc()}")
+
+    return {"idx": idx, "downloads": downloads, "errors": errors}
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +1241,12 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
         errors.append(f"scrape: {e}\n{_tb.format_exc()}")
     step_times["scrape"] = _time.time() - _t0
 
+
     # Early exit if nothing to process
     if not downloads:
+        title = str(song.get("title") or "")
+        message = f"No song candidates found for '{title}'." if title else "No song candidates found."
+        errors.append(message)
         return {"idx": idx, "pdfs": [], "errors": errors}
 
     # 2) Remove watermark, 3) Upscale
@@ -901,6 +1357,17 @@ def _song_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"idx": idx, "pdfs": pdfs, "errors": errors}
 
+
+def _terminate_executor_processes(executor: _PPExecutor) -> None:
+    procs = getattr(executor, "_processes", None)
+    if not isinstance(procs, dict):
+        return
+    for proc in procs.values():
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
 # Prompts moved to centralized module: watermark_remover.agent.prompts
 
 # ---------------------------------------------------------------------------
@@ -931,11 +1398,16 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
         _record_timing(new_state, "parser_node", _stop_timer(start))
         return new_state
 
+    available_candidates = _list_pdf_candidates(new_state)
+    new_state["_available_order_pdfs"] = [c["name"] for c in available_candidates]
+    available_context = _format_available_pdfs_for_prompt(available_candidates, _display_input_root(new_state))
+
     try:
-        prompt = build_order_parser_prompt(instruction) if build_order_parser_prompt else (
+        instruction_for_prompt = instruction + available_context
+        prompt = build_order_parser_prompt(instruction_for_prompt) if build_order_parser_prompt else (
             "You are a precise data extraction assistant. Given an instruction about processing an 'order of worship' PDF, "
             "return a strict JSON with pdf_name, default_instrument, overrides, order_folder."
-            f"\n\nInstruction:\n{instruction}\n\nReturn ONLY the JSON object."
+            f"\n\nInstruction:\n{instruction}\n{available_context}\n\nReturn ONLY the JSON object."
         )
         try:
             if 'order' in instruction.lower():
@@ -959,18 +1431,22 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
         overrides_raw = data.get("overrides") or {}
         order_folder_llm = (data.get("order_folder") or "").strip()
 
-        # Compute order_folder (MM_DD_YYYY) from the PDF text (LLM preferred; fallback to heuristics)
+        resolved_pdf_path: str | None = None
+        resolution_meta: dict[str, Any] | None = None
         try:
-            # Resolve a likely path to PDF
-            pdf_path = pdf_name
-            if not os.path.isabs(pdf_path):
-                root_dir = new_state.get("pdf_root") or new_state.get("input_dir") or "input"
-                candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
-                pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
-            order_folder_computed = _determine_order_folder_from_pdf(new_state, pdf_path) if os.path.exists(pdf_path) else "unknown"
-        except Exception as e:
-            _record_error(new_state, "parser_node.compute_order_folder_exception", e)
-            order_folder_computed = "unknown"
+            resolved_pdf_path, resolution_meta = _resolve_pdf_from_instruction(
+                new_state,
+                pdf_name,
+                instruction,
+                available_candidates,
+            )
+        except Exception as exc:
+            _record_error(new_state, "parser_node.pdf_resolution_exception", exc)
+            resolved_pdf_path = None
+
+        final_pdf_name = resolved_pdf_path or pdf_name
+
+        order_folder_computed = (new_state.get("order_folder") or "").strip() or "unknown"
         new_state["order_folder"] = order_folder_llm or order_folder_computed
 
         
@@ -986,17 +1462,26 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     # Keep it debuggable; skip invalid keys
                     pass
 
+        if final_pdf_name:
+            new_state["pdf_name"] = final_pdf_name
+
+        if resolution_meta:
+            meta = dict(resolution_meta)
+            meta.setdefault("available_candidates", [c["name"] for c in available_candidates])
+            new_state["_pdf_resolution"] = meta
+
         if _debug_enabled(new_state):
             base = _debug_dir_for(new_state)
+            _write_json(base, "available_pdfs.json", [c["name"] for c in available_candidates])
+            if resolution_meta:
+                _write_json(base, "pdf_resolution.json", resolution_meta)
             _write_json(base, "parser_output.json", {
-                "pdf_name": pdf_name,
+                "pdf_name": final_pdf_name,
                 "default_instrument": default_instrument,
                 "overrides": overrides,
                 "order_folder": new_state.get("order_folder")
             })
 
-        if pdf_name and not new_state.get("pdf_name"):
-            new_state["pdf_name"] = pdf_name
         if default_instrument and not new_state.get("default_instrument"):
             new_state["default_instrument"] = default_instrument
         # Normalize any LLM/heuristic-provided order_folder already stored in state
@@ -1053,13 +1538,6 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         candidate = os.path.join(os.getcwd(), root_dir, pdf_path)
         pdf_path = candidate if os.path.exists(candidate) else os.path.join(os.getcwd(), pdf_path)
 
-    # Ensure order_folder derived from PDF text (LLM preferred; fallback to heuristics)
-    try:
-        date_folder = _get_order_folder(new_state)
-        new_state["order_folder"] = date_folder
-    except Exception as e:
-        _record_error(new_state, "extract_songs_node.ensure_order_folder_exception", e)
-
     if run_instruction is None:
         err = RuntimeError("LLM 'run_instruction' is unavailable; cannot extract songs from PDF text.")
         _record_error(new_state, "extract_songs_node.run_instruction_missing", err)
@@ -1069,74 +1547,61 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         # Read raw PDF text and persist it for troubleshooting
-        pdf_text = _read_pdf_text(pdf_path)
+        pdf_text = _get_pdf_text_cached(new_state, pdf_path)
         if _debug_enabled(new_state):
             base = _debug_dir_for(new_state)
             _write_text(base, "pdf_text.txt", pdf_text)
 
-        # LLM prompt to extract songs (JSON only), honoring any user constraints in user_input
+        # LLM prompt to extract date + songs (JSON only), honoring any user constraints in user_input
         user_req = (new_state.get("user_input") or "").strip()
-        if build_song_extractor_prompt:
-            prompt = build_song_extractor_prompt(pdf_text, user_req)
-        else:
-            # Strengthen detection hints so the LLM includes entries like
-            # "4:56 Praise [ Elevation Worship in E ]" which are easy to
-            # mistake for section headers, but are actual songs.
-            rules = (
-                "\n\nSELECTION RULES (apply strictly if present):\n"
-                "- Respect user instructions like 'do not download <title>' or 'only download the fourth song'.\n"
-                "- Interpret ordinals in the order of appearance.\n"
-                "- If indices are provided, treat them as 1-based unless clearly zero-based.\n"
-                "- Exclusions first, then inclusions.\n"
-                "- Never fabricate songs; only pick from RAW TEXT.\n"
-            )
-            hints = (
-                "\n\nSONG DETECTION HINTS:\n"
-                "- Treat any line of the form '<Title> [ <Artist> in <Key> ]' as a SONG entry.\n"
-                "- Allow a leading timestamp (e.g., '3:25' or '4:56') before the title; still a SONG.\n"
-                "- Include titles even if they look like generic labels (e.g., 'Praise', 'Response'):\n"
-                "  if they appear with '[ <Artist> in <Key> ]', they are SONGS.\n"
-                "- Ignore obvious non-songs without '[ Artist in Key ]' like 'Pre Service', 'Announcements',\n"
-                "  'Offering Prayer', 'Sermon', 'Scripture', 'Rehearsal Times', or 'Length in mins'.\n"
-                "- Keep duplicate titles if they appear in different keys or at different times.\n"
-                "- Accept 'Default Arrangement' as a valid artist.\n"
-                "- Example: '4:56 Praise [ Elevation Worship in E ]' -> title='Praise', artist='Elevation Worship', key='E'.\n"
-            )
-            ui = ("\n\nUSER REQUESTS:\n" + user_req) if user_req else ""
-            prompt = (
-                "You are a precise parser for 'order of worship' text. Return strict JSON mapping indices to {title, artist, key}."
-                + rules
-                + hints
-                + ui
-                + f"\n\nRAW ORDER OF WORSHIP TEXT:\n{pdf_text}\n\nReturn ONLY the JSON object."
-            )
+        prompt = _build_song_and_date_extractor_prompt(pdf_text, user_req)
         try:
-            log_prompt("song_extractor", prompt)
+            log_prompt("song_and_date_extractor", prompt)
         except Exception:
             pass
 
         data = _run_llm_strict_json(
             state=new_state,
-            label="song_extractor",
+            label="song_and_date_extractor",
             prompt=prompt,
-            expected="object_or_array",
+            expected="object",
         )
 
-        # Accept dict or list; normalize to {idx: obj}
-        if isinstance(data, list):
-            normalized = {i: v for i, v in enumerate(data)}
-        elif isinstance(data, dict):
-            normalized = data
-        else:
+        if not isinstance(data, dict):
             raise ValueError(f"Unexpected JSON type from song extractor: {type(data).__name__}")
 
         if _debug_enabled(new_state):
             base = _debug_dir_for(new_state)
-            _write_json(base, "songs_llm_output.json", normalized)
+            _write_json(base, "songs_and_date_llm_output.json", data)
+
+        date_raw = (data.get("date") or "").strip()
+        if date_raw and not re.fullmatch(r"\d{2}_\d{2}_\d{4}", date_raw):
+            try:
+                ff = _try_parse_date_fragment(date_raw)
+                if ff:
+                    _, _, y, m, d = ff[0]
+                    date_raw = _normalize_date_mm_dd_yyyy(y, m, d)
+            except Exception:
+                pass
+        if not date_raw:
+            date_raw = _extract_service_date_heuristic(pdf_text) or ""
+
+        date_folder = sanitize_title(date_raw) if date_raw else "unknown"
+        new_state["order_folder"] = date_folder
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_text(base, "date_of_service.txt", date_raw or "unknown")
 
         # Normalize song entries + attach instrument (structure only)
         songs: Dict[int, Dict[str, Any]] = {}
-        for k, v in normalized.items():
+        raw_songs = data.get("songs") if isinstance(data.get("songs"), (dict, list)) else {}
+        if isinstance(raw_songs, list):
+            normalized_songs = {i: v for i, v in enumerate(raw_songs)}
+        elif isinstance(raw_songs, dict):
+            normalized_songs = raw_songs
+        else:
+            normalized_songs = {}
+        for k, v in normalized_songs.items():
             try:
                 idx = int(k)
             except Exception:
@@ -1145,7 +1610,7 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             title = (v.get("title") or "").strip()
             artist = (v.get("artist") or "").strip()
-            key = (v.get("key") or "").strip()
+            key = _normalize_extracted_key((v.get("key") or "").strip())
             instrument = overrides.get(idx, default_instrument)
             songs[idx] = {
                 "title": title,
@@ -1170,8 +1635,11 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
     return new_state
 
 
-def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Sequentially process songs via tools; capture step-by-step IO and errors for each song."""
+def process_songs_node(
+    state: Dict[str, Any],
+    progress_cb: Callable[[str, int, int], None] | None = None,
+) -> Dict[str, Any]:
+    """Scrape all songs first (optionally in parallel), then batch process images."""
     _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
     start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
@@ -1182,10 +1650,17 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         _ensure_file_handler(new_state, debug_base)
         _logger.debug("process_songs_node: begin")
 
+    if _cancel_requested(new_state):
+        _mark_cancelled(new_state, "process_songs_node")
+        new_state["final_pdfs"] = []
+        _record_timing(new_state, "process_songs_node", _stop_timer(start))
+        return new_state
+
     songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
     final_pdfs: List[str | None] = []
     jobs: List[Dict[str, Any]] = []
     input_dir_override = new_state.get("input_dir", "data/samples")
+    cancelled = False
 
     date_folder = _get_order_folder(new_state)
     try:
@@ -1193,13 +1668,37 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         _record_error(new_state, "process_songs_node.ensure_order_pdf_copied_exception", e)
 
-    for idx in sorted(songs.keys()):
-        song = songs[idx]
-        safe_title = sanitize_title(song.get("title", "Unknown Title"))
-        per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
-        per_song_name = f"{per_song_prefix}_{safe_title}"
-
+    def _report_progress(stage: str, done: int, total: int) -> None:
+        if not progress_cb or total <= 0:
+            return
         try:
+            progress_cb(stage, done, total)
+        except Exception:
+            pass
+
+    parallel_flag = new_state.get("parallel_scrape")
+    if isinstance(parallel_flag, bool):
+        parallel_scrape = parallel_flag
+    else:
+        parallel_scrape = _env_truthy(os.getenv("ORDER_PARALLEL", ""))
+    if parallel_scrape and songs:
+        run_id = _get_run_id(new_state)
+        run_ts = os.environ.get("RUN_TS") or run_id
+        os.environ.setdefault("RUN_TS", run_ts)
+        tasks: list[dict] = []
+        per_song_names: dict[int, str] = {}
+        total_scrapes = len(songs)
+        _report_progress("scrape", 0, total_scrapes)
+        for idx in sorted(songs.keys()):
+            if _cancel_requested(new_state):
+                cancelled = True
+                _mark_cancelled(new_state, "process_songs_node")
+                break
+            song = songs[idx]
+            safe_title = sanitize_title(song.get("title", "Unknown Title"))
+            per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
+            per_song_name = f"{per_song_prefix}_{safe_title}"
+            per_song_names[idx] = per_song_name
             scrape_input = {
                 "title": song.get("title", ""),
                 "instrument": song.get("instrument", ""),
@@ -1210,102 +1709,203 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }
             if debug_enabled and debug_base is not None:
                 _write_json(debug_base, f"{per_song_name}_scrape_input.json", scrape_input)
+            log_dir = ""
+            if debug_base is not None:
+                log_dir = str((debug_base / "songs" / per_song_name))
+            tasks.append({
+                "idx": int(idx),
+                "song": song,
+                "input_dir": input_dir_override,
+                "top_n": int(new_state.get("top_n", 3) or 3),
+                "log_dir": log_dir,
+                "run_ts": run_ts,
+            })
+        if not cancelled:
+            val = os.getenv("ORDER_MAX_PROCS", "")
+            try:
+                max_workers = int(val) if val.strip() else -1
+            except Exception:
+                max_workers = -1
+            if max_workers <= 0:
+                max_workers = len(tasks)
+            else:
+                max_workers = max(1, min(max_workers, len(tasks)))
+
+            results: dict[int, list[dict[str, Any]]] = {}
+            errors_all: list[dict[str, Any]] = []
+            ctx = _mp.get_context("spawn")
+            futures: dict[Any, int] = {}
+            ex = _PPExecutor(max_workers=max_workers, mp_context=ctx)
+            completed = 0
+            try:
+                futures = {ex.submit(_scrape_worker, t): t["idx"] for t in tasks}
+                for fut in _as_completed(futures):
+                    if _cancel_requested(new_state):
+                        cancelled = True
+                        _mark_cancelled(new_state, "process_songs_node")
+                        for pending in futures:
+                            pending.cancel()
+                        _terminate_executor_processes(ex)
+                        break
+                    idx = futures[fut]
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        title = (songs.get(idx) or {}).get("title") or ""
+                        msg = f"{title}: {e}" if title else str(e)
+                        errors_all.append({"label": f"parallel_scrape_{idx + 1}.exception", "message": msg})
+                        results[idx] = []
+                    else:
+                        if isinstance(res, dict):
+                            downloads = list(res.get("downloads") or [])
+                            results[idx] = downloads
+                            for err in list(res.get("errors") or []):
+                                title = (songs.get(idx) or {}).get("title") or ""
+                                msg = f"{title}: {err}" if title else str(err)
+                                errors_all.append({"label": f"parallel_scrape_{idx + 1}.error", "message": msg})
+                        else:
+                            results[idx] = []
+                    completed += 1
+                    _report_progress("scrape", completed, total_scrapes)
+            finally:
+                if cancelled:
+                    try:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                else:
+                    ex.shutdown(wait=True)
+
+            for err in errors_all:
+                label = str(err.get("label") or "parallel_scrape_error")
+                message = str(err.get("message") or err)
+                _append_error(new_state, label, message)
+
+            for idx in sorted(songs.keys()):
+                song = songs[idx]
+                per_song_name = per_song_names.get(idx) or f"song_{str(idx + 1).zfill(2)}"
+                downloads = results.get(idx, [])
+                if debug_enabled and debug_base is not None:
+                    _write_text(debug_base, f"{per_song_name}_scrape_output.txt", str(downloads))
+                _add_jobs_from_downloads(
+                    new_state,
+                    jobs,
+                    final_pdfs,
+                    idx=idx,
+                    song=song,
+                    per_song_name=per_song_name,
+                    downloads=downloads,
+                    debug_enabled=debug_enabled,
+                    debug_base=debug_base,
+                )
+    else:
+        total_scrapes = len(songs)
+        completed = 0
+        _report_progress("scrape", 0, total_scrapes)
+        for idx in sorted(songs.keys()):
+            if _cancel_requested(new_state):
+                cancelled = True
+                _mark_cancelled(new_state, "process_songs_node")
+                break
+            song = songs[idx]
+            safe_title = sanitize_title(song.get("title", "Unknown Title"))
+            per_song_prefix = f"song_{str(idx + 1).zfill(2)}"
+            per_song_name = f"{per_song_prefix}_{safe_title}"
 
             try:
-                download_dir = scrape_music.invoke(scrape_input)
-            except Exception as e:
-                download_dir = None
-                _record_error(new_state, f"{per_song_name}_scrape_exception", e)
+                scrape_input = {
+                    "title": song.get("title", ""),
+                    "instrument": song.get("instrument", ""),
+                    "key": song.get("key", ""),
+                    "input_dir": input_dir_override,
+                    "artist": song.get("artist", ""),
+                    "top_n": int(new_state.get("top_n", 3) or 3),
+                }
+                if debug_enabled and debug_base is not None:
+                    _write_json(debug_base, f"{per_song_name}_scrape_input.json", scrape_input)
 
-            if debug_enabled and debug_base is not None:
-                _write_text(debug_base, f"{per_song_name}_scrape_output.txt", str(download_dir))
+                try:
+                    from watermark_remover.agent.tools import init_pipeline_logging as _init_tools_log  # type: ignore
+                    if debug_base is not None:
+                        os.environ["WMRA_LOG_DIR"] = str((debug_base / "songs" / per_song_name))
+                    _init_tools_log()
+                except Exception:
+                    pass
 
-            downloads: List[Dict[str, Any]] = []
-            if isinstance(download_dir, list):
-                for it in download_dir:
-                    if not isinstance(it, dict):
-                        continue
-                    if it.get("image_dir") or it.get("existing_pdf"):
-                        downloads.append(
-                            {
-                                "image_dir": it.get("image_dir"),
-                                "existing_pdf": it.get("existing_pdf"),
-                                "meta": it.get("meta", {}),
-                            }
-                        )
-            elif isinstance(download_dir, str):
-                downloads.append(
-                    {
-                        "image_dir": download_dir,
-                        "meta": {
-                            "title": SCRAPE_METADATA.get("title", song.get("title", "")),
-                            "artist": SCRAPE_METADATA.get("artist", song.get("artist", "")),
-                            "instrument": SCRAPE_METADATA.get("instrument", song.get("instrument", "")),
-                            "key": SCRAPE_METADATA.get("key", song.get("key", "")),
-                        },
-                    }
+                try:
+                    download_dir = scrape_music.invoke(scrape_input)
+                except Exception as e:
+                    download_dir = None
+                    _record_error(new_state, f"{per_song_name}_scrape_exception", e)
+
+                if debug_enabled and debug_base is not None:
+                    _write_text(debug_base, f"{per_song_name}_scrape_output.txt", str(download_dir))
+
+                downloads: List[Dict[str, Any]] = []
+                if isinstance(download_dir, list):
+                    for it in download_dir:
+                        if not isinstance(it, dict):
+                            continue
+                        if it.get("image_dir") or it.get("existing_pdf"):
+                            downloads.append(
+                                {
+                                    "image_dir": it.get("image_dir"),
+                                    "existing_pdf": it.get("existing_pdf"),
+                                    "meta": it.get("meta", {}),
+                                }
+                            )
+                elif isinstance(download_dir, str):
+                    downloads.append(
+                        {
+                            "image_dir": download_dir,
+                            "meta": {
+                                "title": SCRAPE_METADATA.get("title", song.get("title", "")),
+                                "artist": SCRAPE_METADATA.get("artist", song.get("artist", "")),
+                                "instrument": SCRAPE_METADATA.get("instrument", song.get("instrument", "")),
+                                "key": SCRAPE_METADATA.get("key", song.get("key", "")),
+                            },
+                        }
+                    )
+
+                _add_jobs_from_downloads(
+                    new_state,
+                    jobs,
+                    final_pdfs,
+                    idx=idx,
+                    song=song,
+                    per_song_name=per_song_name,
+                    downloads=downloads,
+                    debug_enabled=debug_enabled,
+                    debug_base=debug_base,
                 )
 
-            if not downloads:
+            except Exception as e:
+                _record_error(new_state, f"{per_song_name}_outer_exception", e)
                 final_pdfs.append(None)
-                continue
+            completed += 1
+            _report_progress("scrape", completed, total_scrapes)
 
-            for match_idx, dl in enumerate(downloads, 1):
-                image_dir = dl.get("image_dir")
-                existing_pdf = dl.get("existing_pdf")
-                if not image_dir and not existing_pdf:
-                    final_pdfs.append(None)
-                    continue
+    if cancelled:
+        new_state["final_pdfs"] = final_pdfs
+        _record_timing(new_state, "process_songs_node", _stop_timer(start))
+        return new_state
 
-                variant_suffix = f"_match{match_idx}"
-                result_index = len(final_pdfs)
-                final_pdfs.append(None)
-
-                meta = dl.get("meta") or {}
-                actual_key = meta.get("key") or song.get("key", "")
-                actual_instrument = meta.get("instrument") or song.get("instrument", "")
-                actual_title_for_name = meta.get("title") or song.get("title", "Unknown Title")
-                safe_instrument = sanitize_title(actual_instrument or "Unknown Instrument")
-                safe_key = sanitize_title(actual_key or "Unknown Key")
-                safe_title_for_name = sanitize_title(actual_title_for_name)
-                idx_str = str(idx + 1).zfill(2)
-                rank_str = str(match_idx).zfill(2)
-                filename = f"{idx_str}_{rank_str}_{safe_title_for_name}_{safe_instrument}_{safe_key}.pdf"
-
-                job: Dict[str, Any] = {
-                    "song_index": idx,
-                    "song": song,
-                    "meta": meta,
-                    "result_index": result_index,
-                    "per_song_name": per_song_name,
-                    "variant_suffix": variant_suffix,
-                    "filename": filename,
-                    "assembly_meta": {
-                        "title": actual_title_for_name,
-                        "artist": meta.get("artist", ""),
-                        "instrument": actual_instrument,
-                        "key": actual_key,
-                    },
-                    "existing_pdf": existing_pdf,
-                    "download_dir": image_dir,
-                    "abs_download_dir": os.path.abspath(image_dir) if image_dir else None,
-                    "rank_str": rank_str,
-                }
-                jobs.append(job)
-
-                if debug_enabled and debug_base is not None and image_dir:
-                    rm_input = {"input_dir": image_dir}
-                    _write_json(debug_base, f"{per_song_name}{variant_suffix}_remove_watermark_input.json", rm_input)
-
-        except Exception as e:
-            _record_error(new_state, f"{per_song_name}_outer_exception", e)
-            final_pdfs.append(None)
+    if _cancel_requested(new_state):
+        _mark_cancelled(new_state, "process_songs_node")
+        new_state["final_pdfs"] = final_pdfs
+        _record_timing(new_state, "process_songs_node", _stop_timer(start))
+        return new_state
 
     # Batch watermark removal
     wm_jobs = [job for job in jobs if job.get("abs_download_dir")]
     if wm_jobs:
         abs_dirs = [job["abs_download_dir"] for job in wm_jobs if job.get("abs_download_dir")]
-        wm_results, wm_errors = remove_watermark_batch(abs_dirs)
+        total_wm = len(abs_dirs)
+        _report_progress("watermark", 0, total_wm)
+        wm_results, wm_errors = remove_watermark_batch(
+            abs_dirs,
+            progress_cb=lambda done, total: _report_progress("watermark", done, total),
+        )
         for job in wm_jobs:
             abs_dir = job.get("abs_download_dir")
             processed_dir = wm_results.get(abs_dir) if abs_dir else None
@@ -1328,11 +1928,22 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     RuntimeError("remove_watermark returned no output"),
                 )
 
+    if _cancel_requested(new_state):
+        _mark_cancelled(new_state, "process_songs_node")
+        new_state["final_pdfs"] = final_pdfs
+        _record_timing(new_state, "process_songs_node", _stop_timer(start))
+        return new_state
+
     # Batch upscaling
     up_jobs = [job for job in jobs if job.get("abs_processed_dir")]
     if up_jobs:
         processed_dirs = [job["abs_processed_dir"] for job in up_jobs if job.get("abs_processed_dir")]
-        up_results, up_errors = upscale_images_batch(processed_dirs)
+        total_up = len(processed_dirs)
+        _report_progress("upscale", 0, total_up)
+        up_results, up_errors = upscale_images_batch(
+            processed_dirs,
+            progress_cb=lambda done, total: _report_progress("upscale", done, total),
+        )
         for job in up_jobs:
             abs_processed = job.get("abs_processed_dir")
             upscaled_dir = up_results.get(abs_processed) if abs_processed else None
@@ -1358,8 +1969,17 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     RuntimeError("upscale_images returned no output"),
                 )
 
+    if _cancel_requested(new_state):
+        _mark_cancelled(new_state, "process_songs_node")
+        new_state["final_pdfs"] = final_pdfs
+        _record_timing(new_state, "process_songs_node", _stop_timer(start))
+        return new_state
+
     # Assemble sequentially to honour user-facing order
     for job in jobs:
+        if _cancel_requested(new_state):
+            _mark_cancelled(new_state, "process_songs_node")
+            break
         result_index = job["result_index"]
         pdf_path: Optional[str] = None
         upscaled_dir = job.get("upscaled_dir")
@@ -1437,7 +2057,7 @@ def process_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         _write_json(
             debug_base,
             "final_state.json",
-            {k: v for k, v in new_state.items() if k not in ("songs",)},
+            {k: v for k, v in new_state.items() if k not in ("songs", "_cancel_event")},
         )
 
     _record_timing(new_state, "process_songs_node", _stop_timer(start))
@@ -1740,123 +2360,26 @@ def should_continue(state: Dict[str, Any]) -> str:
         return "end"
 
 
-def process_songs_parallel_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Process all songs concurrently using separate processes and browsers.
-
-    Each song is handled by a child process via ``_song_worker``. This provides
-    full isolation of Selenium sessions and mutable tool state.
-    """
+def process_songs_parallel_node(
+    state: Dict[str, Any],
+    progress_cb: Callable[[str, int, int], None] | None = None,
+) -> Dict[str, Any]:
+    """Scrape in parallel, then batch watermark removal/upscaling in order."""
     _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
     start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
-
-    songs: Dict[int, Dict[str, Any]] = new_state.get("songs", {}) or {}
-    if not songs:
-        new_state["final_pdfs"] = []
-        _record_timing(new_state, "process_songs_parallel_node", _stop_timer(start))
-        return new_state
-
-    # Prepare payloads
-    run_id = _get_run_id(new_state)
-    date_folder = _get_order_folder(new_state)
-    input_dir = new_state.get("input_dir", "data/samples")
-    top_n = int(new_state.get("top_n", 3) or 3)
-
-    # Ensure 00_ Order Of Worship file is copied alongside song outputs
-    try:
-        _ensure_order_pdf_copied(new_state)
-    except Exception as e:
-        _record_error(new_state, "process_songs_parallel_node.ensure_order_pdf_copied_exception", e)
-
-    tasks: list[dict] = []
-    for idx in sorted(songs.keys()):
-        tasks.append({
-            "idx": int(idx),
-            "song": songs[idx],
-            "input_dir": input_dir,
-            "date_folder": date_folder,
-            "top_n": top_n,
-            "run_id": run_id,
-        })
-
-    # Max workers controlled by env; default to min(#songs, cpu_count or 2)
-    # Determine concurrency: default to start ALL songs at once.
-    val = os.getenv("ORDER_MAX_PROCS", "")
-    try:
-        max_workers = int(val) if val.strip() else -1
-    except Exception:
-        max_workers = -1
-    if max_workers <= 0:
-        max_workers = len(tasks)
-    else:
-        max_workers = max(1, min(max_workers, len(tasks)))
-
-    # Launch worker processes
-    results: dict[int, list[str | None]] = {}
-    errors_all: list[dict[str, Any]] = []
-    # Use 'spawn' for cross‑platform safety (Chrome + Selenium friendly)
-    ctx = _mp.get_context("spawn")
-    with _PPExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-        futures = {ex.submit(_song_worker, t): t["idx"] for t in tasks}
-        for fut in _as_completed(futures):
-            idx = futures[fut]
-            try:
-                res = fut.result()
-            except Exception as e:  # pragma: no cover
-                errors_all.append({"idx": idx, "error": str(e)})
-                results[idx] = []
-                continue
-            # Normalize
-            if isinstance(res, dict):
-                results[idx] = list(res.get("pdfs") or [])
-                if res.get("errors"):
-                    errors_all.append({"idx": idx, "errors": res.get("errors")})
-            else:
-                results[idx] = []
-
-    # Collate in song index order
-    final_pdfs: list[str | None] = []
-    summary: dict[str, Any] = {"per_song": {}, "date_folder": date_folder, "run_id": run_id}
-    for idx in sorted(songs.keys()):
-        # If multiple matches, append each; otherwise ensure alignment
-        vals = results.get(idx, [])
-        summary["per_song"][str(idx)] = {
-            "title": (songs[idx] or {}).get("title", ""),
-            "matches": len([v for v in vals if v]),
-            "pdfs": [v for v in vals if v],
-        }
-        if not vals:
-            final_pdfs.append(None)
-        else:
-            final_pdfs.extend(vals)
-
-    new_state["final_pdfs"] = final_pdfs
-    if errors_all:
-        # Merge into state's error log for visibility
-        errs: list[dict[str, Any]] = list(new_state.get("errors", []) or [])
-        errs.extend(errors_all)
-        new_state["errors"] = errs
-
-    # Persist a summary (and any parallel errors) to the debug directory for quick inspection
-    try:
-        if _debug_enabled(new_state):
-            base = _debug_dir_for(new_state)
-            _write_json(base, "parallel_summary.json", summary)
-            if errors_all:
-                _write_json(base, "parallel_errors.json", errors_all)
-    except Exception:
-        pass
-
-    _record_timing(new_state, "process_songs_parallel_node", _stop_timer(start))
-    return new_state
+    new_state["parallel_scrape"] = True
+    result = process_songs_node(new_state, progress_cb=progress_cb)
+    _record_timing(result, "process_songs_parallel_node", _stop_timer(start))
+    return result
 
 
 def compile_graph() -> Any:
     """Construct and compile the order-of-worship graph.
 
-    By default, songs are processed in parallel using separate processes
-    and Selenium browsers (ORDER_PARALLEL truthy). Set ORDER_PARALLEL=0 to
-    fall back to the original sequential per-song loop.
+    By default, scraping runs in parallel using separate processes for Selenium
+    (ORDER_PARALLEL truthy), then watermark removal/upscaling run in batch order.
+    Set ORDER_PARALLEL=0 to keep scraping sequential.
     """
     graph = StateGraph(dict)
     # Shared prefix
@@ -1871,25 +2394,9 @@ def compile_graph() -> Any:
         graph.add_edge("extractor", "process_parallel")
         graph.add_edge("process_parallel", END)
     else:
-        # Sequential per‑song loop
-        graph.add_node("init", init_loop_node)
-        graph.add_node("scraper", scraper_node)
-        graph.add_node("watermark", watermark_node)
-        graph.add_node("upscaler", upscaler_node)
-        graph.add_node("assembler", assembler_node)
-        graph.add_edge("extractor", "init")
-        graph.add_edge("init", "scraper")
-        graph.add_edge("scraper", "watermark")
-        graph.add_edge("watermark", "upscaler")
-        graph.add_edge("upscaler", "assembler")
-        graph.add_conditional_edges(
-            "assembler",
-            should_continue,
-            {
-                "continue": "scraper",
-                "end": END,
-            },
-        )
+        graph.add_node("process_batch", process_songs_node)
+        graph.add_edge("extractor", "process_batch")
+        graph.add_edge("process_batch", END)
 
     return graph.compile()
 

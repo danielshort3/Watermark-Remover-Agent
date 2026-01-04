@@ -87,7 +87,7 @@ def _get_llm() -> Any:
         raise ImportError(
             "ChatOllama is not available; install langchain-ollama to use the parser node."
         )
-    model = os.environ.get("OLLAMA_MODEL", "qwen3:30b")
+    model = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
     base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
     keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
     # Temperature is set to zero for deterministic JSON extraction.

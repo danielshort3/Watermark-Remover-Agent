@@ -67,6 +67,8 @@ from utils.transposition_utils import (
 from utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 from PIL import Image
 
+SCRAPER_LOOP_LIMIT = max(3, int(os.getenv("WMRA_SCRAPER_LOOP_LIMIT", "12")))
+
 # Optional LLM ranking support (uses local Ollama-backed agent if available).
 # The import is deferred to avoid circular dependencies with graph_ollama.
 _llm_run_instruction: Callable[[str], Any] | None = None
@@ -1651,7 +1653,16 @@ def scrape_music(
             scraped = []
             skips: set[tuple[str, str]] = set()
             for _i in range(int(top_n)):
-                tmp = _scrape_with_selenium(title, instrument, key, artist=artist, top_n=1, _retry=False, skip_idents=skips)  # type: ignore[call-arg]
+                tmp = _scrape_with_selenium(
+                    title,
+                    instrument,
+                    key,
+                    artist=artist,
+                    top_n=1,
+                    preserve_order=True,
+                    _retry=False,
+                    skip_idents=skips,
+                )
                 if not tmp:
                     break
                 # tmp may be a string path or a list of dicts (e.g., existing_pdf cases)
@@ -1923,7 +1934,18 @@ def scrape_music(
 # scraping fails for any reason, the function returns ``None`` so
 # ``scrape_music`` can fall back to other logic.
 
-def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optional[str] = None, *, top_n: int = 1, _retry: bool = False, skip_idents: Optional[set[tuple[str, str]]] = None) -> Optional[str] | Optional[list[dict]]:
+def _scrape_with_selenium(
+    title: str,
+    instrument: str,
+    key: str,
+    artist: Optional[str] = None,
+    *,
+    top_n: int = 1,
+    preserve_order: bool = False,
+    _retry: bool = False,
+    skip_idents: Optional[set[tuple[str, str]]] = None,
+    _loop_guard: int = 0,
+) -> Optional[str] | Optional[list[dict]]:
     """Attempt to scrape sheet music from an online catalogue.
 
     This helper uses a headless Chrome browser (via Selenium WebDriver) to
@@ -1961,6 +1983,15 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
         from webdriver_manager.chrome import ChromeDriverManager  # type: ignore
     except Exception as e:
         logger.error("SCRAPER: Selenium or webdriver_manager not installed: %s", e)
+        return None
+
+    loop_count = _loop_guard
+    if loop_count >= SCRAPER_LOOP_LIMIT:
+        logger.error(
+            "SCRAPER: exceeded loop limit (%d) while searching for '%s'. Giving up.",
+            SCRAPER_LOOP_LIMIT,
+            title,
+        )
         return None
 
     # Sanitise the title using the unified helper.  This collapses runs
@@ -2205,6 +2236,8 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
             songs_parent_el = SeleniumHelper.find_element(driver, XPATHS['songs_parent'], timeout=10, log_func=logger.debug)
             if not songs_parent_el:
                 return []
+            # Give the page a moment to populate the results list.
+            time.sleep(2)
             # Collect children list items
             children = songs_parent_el.find_elements("xpath", './app-product-list-item')
             candidates: list[dict[str, Any]] = []
@@ -2259,21 +2292,42 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
 
         # Build the initial list of song candidates
         song_candidates = perform_search()
-        # Reorder candidates using strict exact(ish) match preference then LLM/fuzzy
-        try:
-            song_candidates = _reorder_candidates(title, artist, song_candidates) or song_candidates
-        except Exception:
-            pass
-        # Belt-and-suspenders: compute the set of exact(ish) candidates to enforce at iteration time
-        try:
-            req_t_norm = (title or "").strip()
-            exactish_idents: set[tuple[str, str]] = set()
-            for c in song_candidates:
-                ct = str(c.get('title', '') or '')
-                ca = str(c.get('artist', '') or '')
-                if _title_matches_exactish(req_t_norm, ct):
-                    exactish_idents.add((ct, ca))
-        except Exception:
+        if not song_candidates:
+            logger.warning(
+                "SCRAPER: PraiseCharts returned zero song candidates for '%s' (loop %d).",
+                title,
+                _loop_guard + 1,
+            )
+            return _scrape_with_selenium(
+                title,
+                instrument,
+                key,
+                artist=artist,
+                top_n=top_n,
+                preserve_order=preserve_order,
+                _retry=True,
+                skip_idents=skip_idents,
+                _loop_guard=_loop_guard + 1,
+            )
+        preserve = preserve_order or _env_truthy(os.environ.get("WMRA_SCRAPER_PRESERVE_ORDER"))
+        if not preserve:
+            # Reorder candidates using strict exact(ish) match preference then LLM/fuzzy
+            try:
+                song_candidates = _reorder_candidates(title, artist, song_candidates) or song_candidates
+            except Exception:
+                pass
+            # Belt-and-suspenders: compute the set of exact(ish) candidates to enforce at iteration time
+            try:
+                req_t_norm = (title or "").strip()
+                exactish_idents: set[tuple[str, str]] = set()
+                for c in song_candidates:
+                    ct = str(c.get('title', '') or '')
+                    ca = str(c.get('artist', '') or '')
+                    if _title_matches_exactish(req_t_norm, ct):
+                        exactish_idents.add((ct, ca))
+            except Exception:
+                exactish_idents = set()
+        else:
             exactish_idents = set()
         # Set of attempted song identifiers to avoid infinite loops
         attempted: set[tuple[str, str]] = set()
@@ -2373,10 +2427,82 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                     )
                     # Pause briefly
                     time.sleep(random.uniform(0.5, 1.0))
-                    orch_ok = SeleniumHelper.click_element(
-                        driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug
-                    )
-                    time.sleep(random.uniform(0.5, 1.0))
+                    orch_ok = False
+
+                    def _modal_keywords_for_instrument(instrument_name: str) -> list[str]:
+                        inst = (instrument_name or "").lower()
+                        keywords: list[str] = []
+                        if any(word in inst for word in ("horn", "trumpet", "trombone", "tuba", "brass")):
+                            keywords.append("brass")
+                        if any(word in inst for word in ("violin", "viola", "cello", "string")):
+                            keywords.append("string")
+                        if any(word in inst for word in ("flute", "oboe", "clarinet", "bassoon", "woodwind")):
+                            keywords.append("woodwind")
+                        if "sax" in inst:
+                            keywords.append("sax")
+                        if "guitar" in inst:
+                            keywords.append("guitar")
+                        if "piano" in inst or "keyboard" in inst:
+                            keywords.extend(["piano", "keyboard"])
+                        if "vocal" in inst or "choir" in inst:
+                            keywords.append("vocal")
+                        return keywords
+
+                    def _select_product_from_modal() -> bool:
+                        try:
+                            items = driver.find_elements(By.XPATH, XPATHS.get("product_modal_items", ""))
+                        except Exception:
+                            items = []
+                        if not items:
+                            return False
+                        candidates: list[tuple[str, Any]] = []
+                        for el in items:
+                            try:
+                                text = (el.text or "").strip()
+                            except Exception:
+                                text = ""
+                            if text:
+                                candidates.append((text, el))
+                        if not candidates:
+                            return False
+                        chosen = None
+                        for keyword in _modal_keywords_for_instrument(instrument):
+                            for text, el in candidates:
+                                if keyword in text.lower():
+                                    chosen = el
+                                    break
+                            if chosen:
+                                break
+                        if chosen is None:
+                            chosen = candidates[0][1]
+                        try:
+                            logger.info("SCRAPER: selecting product '%s' from modal", (chosen.text or "").strip())
+                        except Exception:
+                            pass
+                        try:
+                            chosen.click()
+                        except Exception:
+                            try:
+                                driver.execute_script("arguments[0].click();", chosen)
+                            except Exception:
+                                return False
+                        # Wait briefly for modal to close or page to update.
+                        for _ in range(30):
+                            time.sleep(0.2)
+                            try:
+                                if not driver.find_elements(By.XPATH, "//ngb-modal-window"):
+                                    break
+                            except Exception:
+                                break
+                        return True
+
+                    if _select_product_from_modal():
+                        orch_ok = True
+                    else:
+                        orch_ok = SeleniumHelper.click_element(
+                            driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug
+                        )
+                        time.sleep(random.uniform(0.5, 1.0))
                 except Exception:
                     orch_ok = False
                 if not orch_ok:
@@ -2455,7 +2581,17 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
                         driver.quit()
                     except Exception:
                         pass
-                    return _scrape_with_selenium(title, instrument, key, _retry=True)
+                    return _scrape_with_selenium(
+                        title,
+                        instrument,
+                        key,
+                        artist=artist,
+                        top_n=top_n,
+                        preserve_order=preserve_order,
+                        _retry=True,
+                        skip_idents=skip_idents,
+                        _loop_guard=_loop_guard + 1,
+                    )
                 return None
         # End of candidate selection loop
         # At this point we are on the product page for the selected song.  We
@@ -3211,7 +3347,17 @@ def _scrape_with_selenium(title: str, instrument: str, key: str, artist: Optiona
         # Merge skip sets
         new_skips = set(skip_idents) if skip_idents else set()
         new_skips.add(sel_ident)
-        return _scrape_with_selenium(title, instrument, key, artist=artist, top_n=top_n, _retry=_retry, skip_idents=new_skips)
+        return _scrape_with_selenium(
+            title,
+            instrument,
+            key,
+            artist=artist,
+            top_n=top_n,
+            preserve_order=preserve_order,
+            _retry=_retry,
+            skip_idents=new_skips,
+            _loop_guard=_loop_guard + 1,
+        )
     except Exception as e:
         logger.error("SCRAPER: exception during scraping: %s", e)
         return None
@@ -3226,11 +3372,13 @@ def remove_watermark_batch(
     input_dirs: Sequence[str],
     model_dir: str = "models/Watermark_Removal",
     output_dir: str = "processed",
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, Optional[str]], dict[str, Exception]]:
     """Process one or more directories through the watermark removal model.
 
     Returns a tuple ``(results, errors)`` mapping each input directory to its
     processed output path (or ``None`` on failure) and any raised exceptions.
+    If provided, ``progress_cb`` receives ``(done, total)`` after each directory.
     """
     if _import_error is not None:
         raise ImportError(
@@ -3270,7 +3418,13 @@ def remove_watermark_batch(
         results: dict[str, Optional[str]] = {}
         errors: dict[str, Exception] = {}
         batch_start = time.perf_counter()
-        for directory in unique_dirs:
+        total = len(unique_dirs)
+        if progress_cb:
+            try:
+                progress_cb(0, total)
+            except Exception:
+                pass
+        for idx, directory in enumerate(unique_dirs, start=1):
             dir_start = time.perf_counter()
             try:
                 processed_dir = output_dir
@@ -3312,6 +3466,11 @@ def remove_watermark_batch(
                 results[directory] = None
                 errors[directory] = exc
                 logger.exception("WMR: failed to process %s", directory)
+            if progress_cb:
+                try:
+                    progress_cb(idx, total)
+                except Exception:
+                    pass
         total_elapsed = time.perf_counter() - batch_start
         success_count = sum(1 for path, out in results.items() if out)
         logger.info(
@@ -3727,8 +3886,12 @@ def upscale_images_batch(
     input_dirs: Sequence[str],
     model_dir: str = "models/VDSR",
     output_dir: str = "upscaled",
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, Optional[str]], dict[str, Exception]]:
-    """Process one or more directories through the upscaling model."""
+    """Process one or more directories through the upscaling model.
+
+    If provided, ``progress_cb`` receives ``(done, total)`` after each directory.
+    """
     if _import_error is not None:
         raise ImportError(
             f"Cannot import VDSR and related utilities: {_import_error}. "
@@ -3771,7 +3934,13 @@ def upscale_images_batch(
         results: dict[str, Optional[str]] = {}
         errors: dict[str, Exception] = {}
         batch_start = time.perf_counter()
-        for directory in unique_dirs:
+        total = len(unique_dirs)
+        if progress_cb:
+            try:
+                progress_cb(0, total)
+            except Exception:
+                pass
+        for idx, directory in enumerate(unique_dirs, start=1):
             dir_start = time.perf_counter()
             try:
                 target_dir = output_dir
@@ -3832,6 +4001,11 @@ def upscale_images_batch(
                 results[directory] = None
                 errors[directory] = exc
                 logger.exception("UPSCALE: failed to process %s", directory)
+            if progress_cb:
+                try:
+                    progress_cb(idx, total)
+                except Exception:
+                    pass
         total_elapsed = time.perf_counter() - batch_start
         success_count = sum(1 for path, out in results.items() if out)
         logger.info(

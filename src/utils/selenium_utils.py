@@ -19,6 +19,7 @@ debug messages.
 from __future__ import annotations
 # Moved to src/utils for shared helpers.
 
+import random
 import threading
 import time
 from typing import Any
@@ -41,24 +42,26 @@ selenium_lock = threading.Lock()
 
 # Centralised dictionary of XPaths used by the application
 xpaths: dict[str, str] = {
-    'search_bar': '//*[@id="search-input-wrap"]/input',
-    'songs_parent': '//*[@id="page-wrapper"]/ion-router-outlet/app-page-search/ion-content/div/div/div/app-search/div',
-    'song_title': './div/a/div/h5',
-    'song_text3': './div/a/div/span/span',
-    'song_text2': './div/a/div/span',
-    'song_image': './div/div[1]/div/app-product-audio-preview-image/div/img',
-    'click_song': '//*[@id="page-wrapper"]/ion-router-outlet/app-page-search/ion-content/div/div/div/app-search/div/app-product-list-item[{index}]/div/a/div',
-    'chords_button': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[1]/button',
+    'search_bar': '//*[@id="search-input-wrap"]//input',
+    'songs_parent': '//*[@id="page-wrapper"]//app-page-search//app-search//div',
+    'song_title': './/h5',
+    'song_text3': './/span/span',
+    'song_text2': './/span',
+    'song_image': './/app-product-audio-preview-image//img',
+    'click_song': '//*[@id="page-wrapper"]//app-page-search//app-product-list-item[{index}]//a//div',
+    'chords_button': '//*[@id="page-wrapper"]//app-product-sheet-selector//button[.//div[contains(normalize-space(.), "Chords")]]',
+    # Modal product list shown after selecting "Chords & Lyrics".
+    'product_modal_items': '//*[@id="products-sheet-music"]//h3',
     # Avoid clicking orchestration sections labelled with "Finale".  We use
     # translate() to perform a case‑insensitive check for 'orchestration'
     # and exclude ancestors whose text contains 'finale'.
-    'orchestration_header': "//h3[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'orchestration')]/ancestor::div[4][not(contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'finale'))]",
-    'key_button': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[3]/app-product-selector-key/div/button',
-    'key_parent': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[3]/app-product-selector-key/div/ul',
-    'parts_button': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[2]/div/button',
-    'parts_parent': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content/div/div/div[3]/div/div[1]/div[2]/div[1]/app-product-sheet-selector/div/div[2]/div/ul',
-    'parts_list': '//*[@id="page-wrapper"]/ion-router-outlet/app-product-page/ion-content//ul/li/button',
-    'image_element': '//*[@id="preview-sheets"]/div/div[1]/div/img',
+    'orchestration_header': "//app-product-page//h3[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'orchestration')]/ancestor::div[4][not(contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'finale'))]",
+    'key_button': '//*[@id="page-wrapper"]//app-product-selector-key//button[contains(@class, "dropdown-toggle")]',
+    'key_parent': '//*[@id="page-wrapper"]//app-product-selector-key//ul',
+    'parts_button': '//*[@id="page-wrapper"]//app-product-sheet-selector//button[contains(@class, "type-selector")]',
+    'parts_parent': '//*[@id="page-wrapper"]//app-product-sheet-selector//button[contains(@class, "type-selector")]/following::ul[1]',
+    'parts_list': '//*[@id="page-wrapper"]//app-product-sheet-selector//button[contains(@class, "type-selector")]/following::ul[1]/li/button',
+    'image_element': '//*[@id="preview-sheets"]//img',
     'next_button': "//button[contains(@class, 'sheet-nav-gradient-button-right')]",
 }
 
@@ -299,6 +302,11 @@ class SeleniumHelper:
                     except TypeError:
                         # Some log functions may not accept extra; fallback to plain log
                         log_func(msg_attempt)
+                # Add a small jitter so actions are not uniformly spaced.
+                try:
+                    time.sleep(random.uniform(0.0, 1.0))
+                except Exception:
+                    pass
                 # Perform the click
                 element.click()
                 # Capture current URL again after the click, which may have
@@ -405,6 +413,11 @@ class SeleniumHelper:
                 element = WebDriverWait(driver, timeout).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
+                # Add a small jitter so actions are not uniformly spaced.
+                try:
+                    time.sleep(random.uniform(0.0, 1.0))
+                except Exception:
+                    pass
                 element.clear()
                 element.send_keys(keys)
             return True
