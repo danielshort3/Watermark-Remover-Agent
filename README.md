@@ -109,6 +109,7 @@ Workflow:
 - Upload the PDF and add any instruction text (used for extraction filters).
 - Confirm the Ollama URL/model and click "Check Ollama" if you want a fresh health check.
 - If you run Ollama inside WSL, set `OLLAMA_HOST`/`OLLAMA_MODELS` and use "Start Ollama (WSL)" if needed.
+- Use the capture toggles to save Selenium screenshots/HTML (optionally only on errors).
   `OLLAMA_MODELS` should be a WSL path to your Windows models directory
   (for example `/mnt/c/Users/<you>/AppData/Local/Ollama/models`).
   The GUI now auto-detects common Windows model paths under `/mnt/c/Users/*/`.

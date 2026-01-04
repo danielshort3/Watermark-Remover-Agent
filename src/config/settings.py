@@ -16,7 +16,7 @@ DEFAULT_CONCISE_DEBUG = False
 
 # Order-of-worship graph defaults
 ORDER_PARALLEL_DEFAULT = True
-ORDER_MAX_PROCS_DEFAULT = 0  # 0 or <=0 means 'all songs'
+ORDER_MAX_PROCS_DEFAULT = 2  # 0 or <=0 means 'all songs' when overridden.
 DEFAULT_TOP_N = 3
 
 # Selenium timeouts (seconds)

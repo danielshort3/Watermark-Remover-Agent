@@ -1293,7 +1293,7 @@ def init_pipeline_logging() -> None:
         if not any(f == os.path.join(base, "pipeline.csv") for f in existing_files):
             class CsvFormatter(logging.Formatter):
                 def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
-                    for attr in ("button_text", "xpath", "url", "screenshot", "msg", "message"):
+                    for attr in ("button_text", "xpath", "url", "screenshot", "html", "msg", "message"):
                         if not hasattr(record, attr):
                             setattr(record, attr, "")
                         else:
@@ -1303,7 +1303,7 @@ def init_pipeline_logging() -> None:
                     return super().format(record)
             cf = logging.FileHandler(csv_path)
             cf.setLevel(getattr(logging, _log_level, logging.INFO))
-            cf.setFormatter(CsvFormatter("%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,\"%(message)s\""))
+            cf.setFormatter(CsvFormatter("%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,%(html)s,\"%(message)s\""))
             logger.addHandler(cf)
         ensure_concise_filters(logger)
     except Exception:
@@ -1368,8 +1368,10 @@ try:
                 setattr(record, "url", "")
             if not hasattr(record, "screenshot"):
                 setattr(record, "screenshot", "")
+            if not hasattr(record, "html"):
+                setattr(record, "html", "")
             # Sanitise newlines in all fields to prevent premature row breaks
-            for attr in ("button_text", "xpath", "url", "screenshot", "msg", "message"):
+            for attr in ("button_text", "xpath", "url", "screenshot", "html", "msg", "message"):
                 try:
                     val = getattr(record, attr)
                 except AttributeError:
@@ -1380,7 +1382,7 @@ try:
             return super().format(record)
 
     csv_formatter = CsvFormatter(
-        "%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,\"%(message)s\""
+        "%(asctime)s,%(levelname)s,%(name)s,%(button_text)s,%(xpath)s,%(url)s,%(screenshot)s,%(html)s,\"%(message)s\""
     )
     csv_handler.setFormatter(csv_formatter)
     # Avoid adding duplicate handlers if this module is imported

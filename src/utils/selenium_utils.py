@@ -82,6 +82,107 @@ xpath_labels[xpaths['key_button']] = "Key"
 xpath_labels[xpaths['parts_button']] = "Instrument"
 
 
+def _env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _capture_settings() -> tuple[bool, bool, bool]:
+    save_screens = _env_truthy(os.environ.get("WMRA_SAVE_SCREENSHOTS", "0"))
+    save_html = _env_truthy(os.environ.get("WMRA_SAVE_HTML", "0"))
+    errors_only = _env_truthy(os.environ.get("WMRA_SAVE_ON_ERROR_ONLY", "1"))
+    return save_screens, save_html, errors_only
+
+
+def _capture_artifacts(
+    driver: Any,
+    *,
+    label: str,
+    xpath: str,
+    element: Any | None,
+    save_screens: bool,
+    save_html: bool,
+    suffix: str = "",
+) -> tuple[str, str]:
+    screenshot_path = ""
+    html_path = ""
+    if not save_screens and not save_html:
+        return screenshot_path, html_path
+    try:
+        base_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "output"))
+        ts = int(time.time() * 1000)
+        safe_label = "".join(c if c.isalnum() else "_" for c in (label or xpath or "element"))[:30]
+        tag = f"{ts}_{safe_label}"
+        if suffix:
+            tag = f"{tag}_{suffix}"
+    except Exception:
+        base_dir = os.path.join(os.getcwd(), "output")
+        tag = str(int(time.time() * 1000))
+
+    if save_screens:
+        try:
+            out_dir = os.path.join(base_dir, "screenshots")
+            os.makedirs(out_dir, exist_ok=True)
+            file_path = os.path.join(out_dir, f"{tag}.png")
+            driver.save_screenshot(file_path)
+            if element is not None:
+                try:
+                    rect = element.rect
+                    x = rect.get("x", 0) or 0
+                    y = rect.get("y", 0) or 0
+                    w = rect.get("width", 0) or 0
+                    h = rect.get("height", 0) or 0
+                    scroll_x = 0
+                    scroll_y = 0
+                    try:
+                        scroll_x = driver.execute_script(
+                            "return window.pageXOffset || document.documentElement.scrollLeft || document.body.scrollLeft || 0;"
+                        ) or 0
+                        scroll_y = driver.execute_script(
+                            "return window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;"
+                        ) or 0
+                    except Exception:
+                        scroll_x = 0
+                        scroll_y = 0
+                    dpr = 1
+                    try:
+                        dpr = driver.execute_script("return window.devicePixelRatio || 1;") or 1
+                    except Exception:
+                        dpr = 1
+                    x_pix = int((x + scroll_x) * dpr)
+                    y_pix = int((y + scroll_y) * dpr)
+                    w_pix = int(w * dpr)
+                    h_pix = int(h * dpr)
+                    img = Image.open(file_path)
+                    draw = ImageDraw.Draw(img)
+                    draw.rectangle(
+                        [x_pix, y_pix, x_pix + w_pix, y_pix + h_pix],
+                        outline=(255, 0, 0),
+                        width=3,
+                    )
+                    img.save(file_path)
+                except Exception:
+                    pass
+            screenshot_path = os.path.relpath(file_path, os.getcwd())
+        except Exception:
+            screenshot_path = ""
+
+    if save_html:
+        try:
+            out_dir = os.path.join(base_dir, "html")
+            os.makedirs(out_dir, exist_ok=True)
+            file_path = os.path.join(out_dir, f"{tag}.html")
+            html = driver.page_source or ""
+            with open(file_path, "w", encoding="utf-8", errors="ignore") as handle:
+                handle.write(html)
+            html_path = os.path.relpath(file_path, os.getcwd())
+        except Exception:
+            html_path = ""
+
+    return screenshot_path, html_path
+
+
 class SeleniumHelper:
     """Utility methods for common Selenium operations.
 
@@ -100,6 +201,12 @@ class SeleniumHelper:
         include the visible text of the element (if any) alongside the
         XPath so callers can see which button or link was pressed.
         """
+        element = None
+        label = ""
+        screenshot_path = ""
+        html_path = ""
+        save_screens, save_html, errors_only = _capture_settings()
+        capture_enabled = save_screens or save_html
         try:
             with selenium_lock:
                 # Wait for the element to be clickable
@@ -194,11 +301,15 @@ class SeleniumHelper:
                 except Exception:
                     url = ""
 
-                # Prepare a placeholder for the screenshot path.  This
-                # variable will be populated before the actual click and
-                # reused when logging the success message.  Define it
-                # here to ensure it exists across the nested scopes.
-                screenshot_path = ""
+                if capture_enabled and not errors_only:
+                    screenshot_path, html_path = _capture_artifacts(
+                        driver,
+                        label=label,
+                        xpath=xpath,
+                        element=element,
+                        save_screens=save_screens,
+                        save_html=save_html,
+                    )
                 # Log the click attempt with the label, xpath and URL.  Pass the
                 # structured data via the extra dict so that the CSV handler can
                 # populate separate columns for button_text, xpath and url.
@@ -211,85 +322,6 @@ class SeleniumHelper:
                     if url:
                         msg_attempt += f" at {url}"
                     try:
-                        # Prepare screenshot of the entire viewport to show where the click will occur
-                        screenshot_path = ""
-                        try:
-                            # Determine the base directory for logs/screenshots.  Use the
-                            # WMRA_LOG_DIR environment variable if set by tools.py; fall
-                            # back to a local ``output`` directory otherwise.
-                            base_dir = os.environ.get("WMRA_LOG_DIR", os.path.join(os.getcwd(), "output"))
-                            out_dir = os.path.join(base_dir, "screenshots")
-                            os.makedirs(out_dir, exist_ok=True)
-                            # Build a filename using the label and timestamp
-                            ts = int(time.time() * 1000)
-                            safe_label = ''.join(c if c.isalnum() else '_' for c in (label or 'element'))[:30]
-                            # Prepend the timestamp to the filename so that
-                            # screenshots sort in chronological order.  The
-                            # timestamp is placed at the beginning of the
-                            # filename, followed by a sanitized label.  This
-                            # ensures all screenshots are unique and easy to
-                            # order when reviewing a large number of images.
-                            filename = f"{ts}_{safe_label}.png"
-                            file_path = os.path.join(out_dir, filename)
-                            # Capture full viewport screenshot
-                            driver.save_screenshot(file_path)
-                            # Highlight the element on the screenshot by drawing a red rectangle
-                            try:
-                                # Determine element bounds relative to the current viewport.
-                                rect = element.rect  # x, y relative to the viewport in CSS pixels
-                                x = rect.get('x', 0) or 0
-                                y = rect.get('y', 0) or 0
-                                w = rect.get('width', 0) or 0
-                                h = rect.get('height', 0) or 0
-                                # Retrieve scroll offsets to translate viewport coordinates into
-                                # absolute page coordinates.  Without this adjustment the
-                                # rectangle may be drawn at the wrong vertical position on
-                                # full‑page screenshots when the page is scrolled.
-                                scroll_x = 0
-                                scroll_y = 0
-                                try:
-                                    scroll_x = driver.execute_script(
-                                        "return window.pageXOffset || document.documentElement.scrollLeft || document.body.scrollLeft || 0;"
-                                    ) or 0
-                                    scroll_y = driver.execute_script(
-                                        "return window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;"
-                                    ) or 0
-                                except Exception:
-                                    scroll_x = 0
-                                    scroll_y = 0
-                                # Retrieve device pixel ratio to convert CSS pixels to screenshot pixels.
-                                # On some platforms the screenshot resolution may differ from CSS pixel
-                                # dimensions (e.g. high‑DPI displays).  Multiply coordinates by the
-                                # ratio to align the annotation correctly.
-                                dpr = 1
-                                try:
-                                    dpr = driver.execute_script("return window.devicePixelRatio || 1;") or 1
-                                except Exception:
-                                    dpr = 1
-                                # Compute absolute coordinates in screenshot pixel space
-                                x_pix = int((x + scroll_x) * dpr)
-                                y_pix = int((y + scroll_y) * dpr)
-                                w_pix = int(w * dpr)
-                                h_pix = int(h * dpr)
-                                # Open image and draw rectangle
-                                img = Image.open(file_path)
-                                draw = ImageDraw.Draw(img)
-                                # Use red outline with thickness 3
-                                draw.rectangle([
-                                    x_pix,
-                                    y_pix,
-                                    x_pix + w_pix,
-                                    y_pix + h_pix,
-                                ], outline=(255, 0, 0), width=3)
-                                img.save(file_path)
-                            except Exception:
-                                # If annotation fails, continue with plain screenshot
-                                pass
-                            # Store relative path from current working directory
-                            screenshot_path = os.path.relpath(file_path, os.getcwd())
-                        except Exception:
-                            screenshot_path = ""
-                        # Log with structured data, including the screenshot path
                         log_func(
                             msg_attempt,
                             extra={
@@ -297,10 +329,10 @@ class SeleniumHelper:
                                 "xpath": xpath,
                                 "url": url,
                                 "screenshot": screenshot_path,
+                                "html": html_path,
                             },
                         )
                     except TypeError:
-                        # Some log functions may not accept extra; fallback to plain log
                         log_func(msg_attempt)
                 # Add a small jitter so actions are not uniformly spaced.
                 try:
@@ -332,6 +364,7 @@ class SeleniumHelper:
                                 "xpath": xpath,
                                 "url": url_after,
                                 "screenshot": screenshot_path,
+                                "html": html_path,
                             },
                         )
                     except TypeError:
@@ -339,10 +372,33 @@ class SeleniumHelper:
             return True
         except ElementClickInterceptedException as e:
             # If another element is in front, attempt fallback via JavaScript
-            if log_func:
-                log_func(
-                    f"[DEBUG] Element click intercepted at xpath: {xpath} - {str(e)}"
+            screenshot_path = ""
+            html_path = ""
+            if capture_enabled:
+                screenshot_path, html_path = _capture_artifacts(
+                    driver,
+                    label=label or "",
+                    xpath=xpath,
+                    element=element,
+                    save_screens=save_screens,
+                    save_html=save_html,
+                    suffix="error",
                 )
+            if log_func:
+                msg = f"[DEBUG] Element click intercepted at xpath: {xpath} - {str(e)}"
+                try:
+                    log_func(
+                        msg,
+                        extra={
+                            "button_text": label or "",
+                            "xpath": xpath,
+                            "url": "",
+                            "screenshot": screenshot_path,
+                            "html": html_path,
+                        },
+                    )
+                except TypeError:
+                    log_func(msg)
             try:
                 with selenium_lock:
                     driver.execute_script("arguments[0].click();", element)
@@ -363,8 +419,33 @@ class SeleniumHelper:
                     )
                 return False
         except (StaleElementReferenceException, NoSuchElementException, TimeoutException) as e:
+            screenshot_path = ""
+            html_path = ""
+            if capture_enabled:
+                screenshot_path, html_path = _capture_artifacts(
+                    driver,
+                    label=label or "",
+                    xpath=xpath,
+                    element=element,
+                    save_screens=save_screens,
+                    save_html=save_html,
+                    suffix="error",
+                )
             if log_func:
-                log_func(f"Error clicking element at xpath: {xpath} - {str(e)}")
+                msg = f"Error clicking element at xpath: {xpath} - {str(e)}"
+                try:
+                    log_func(
+                        msg,
+                        extra={
+                            "button_text": label or "",
+                            "xpath": xpath,
+                            "url": "",
+                            "screenshot": screenshot_path,
+                            "html": html_path,
+                        },
+                    )
+                except TypeError:
+                    log_func(msg)
             return False
 
     @staticmethod
@@ -408,11 +489,25 @@ class SeleniumHelper:
     @staticmethod
     def send_keys_to_element(driver: Any, xpath: str, keys: str, timeout: float = 2, log_func: Any | None = None) -> bool:
         """Send keys to an element specified by XPath.  Returns True on success."""
+        element = None
+        screenshot_path = ""
+        html_path = ""
+        save_screens, save_html, errors_only = _capture_settings()
+        capture_enabled = save_screens or save_html
         try:
             with selenium_lock:
                 element = WebDriverWait(driver, timeout).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
+                if capture_enabled and not errors_only:
+                    screenshot_path, html_path = _capture_artifacts(
+                        driver,
+                        label="send_keys",
+                        xpath=xpath,
+                        element=element,
+                        save_screens=save_screens,
+                        save_html=save_html,
+                    )
                 # Add a small jitter so actions are not uniformly spaced.
                 try:
                     time.sleep(random.uniform(0.0, 1.0))
@@ -422,8 +517,33 @@ class SeleniumHelper:
                 element.send_keys(keys)
             return True
         except (StaleElementReferenceException, NoSuchElementException, TimeoutException) as e:
+            screenshot_path = ""
+            html_path = ""
+            if capture_enabled:
+                screenshot_path, html_path = _capture_artifacts(
+                    driver,
+                    label="send_keys",
+                    xpath=xpath,
+                    element=element,
+                    save_screens=save_screens,
+                    save_html=save_html,
+                    suffix="error",
+                )
             if log_func:
-                log_func(f"Error sending keys to element at xpath: {xpath} - {str(e)}")
+                msg = f"Error sending keys to element at xpath: {xpath} - {str(e)}"
+                try:
+                    log_func(
+                        msg,
+                        extra={
+                            "button_text": "",
+                            "xpath": xpath,
+                            "url": "",
+                            "screenshot": screenshot_path,
+                            "html": html_path,
+                        },
+                    )
+                except TypeError:
+                    log_func(msg)
             return False
 
     @staticmethod

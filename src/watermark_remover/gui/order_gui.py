@@ -113,6 +113,16 @@ def _cancel_requested() -> bool:
         return False
 
 
+def _apply_capture_env(
+    save_screens: bool,
+    save_html: bool,
+    errors_only: bool,
+) -> None:
+    os.environ["WMRA_SAVE_SCREENSHOTS"] = "1" if save_screens else "0"
+    os.environ["WMRA_SAVE_HTML"] = "1" if save_html else "0"
+    os.environ["WMRA_SAVE_ON_ERROR_ONLY"] = "1" if errors_only else "0"
+
+
 def _resolve_ollama_env(
     ollama_url: str,
     ollama_model: str,
@@ -990,6 +1000,9 @@ def run_processing(
     max_procs: int,
     top_n: int,
     debug: bool,
+    save_screens: bool,
+    save_html: bool,
+    save_errors_only: bool,
     progress: gr.Progress = gr.Progress(),  # type: ignore[assignment]
 ) -> Iterable[Tuple[str, str | None]]:
     """Process verified songs and stream progress updates."""
@@ -1012,6 +1025,8 @@ def run_processing(
             log_lines.append("Cancelled by user.")
             yield "\n".join(log_lines), None
             return
+
+        _apply_capture_env(save_screens, save_html, save_errors_only)
 
         url, model, _, _ = _apply_ollama_env(
             ollama_url,
@@ -1144,6 +1159,9 @@ def run_single_song(
     ollama_models_path: str,
     ollama_debug: bool,
     debug: bool,
+    save_screens: bool,
+    save_html: bool,
+    save_errors_only: bool,
     progress: gr.Progress = gr.Progress(),  # type: ignore[assignment]
 ) -> Iterable[Tuple[str, str | None]]:
     """Run the single-song scrape -> watermark -> upscale -> PDF pipeline."""
@@ -1156,6 +1174,7 @@ def run_single_song(
     _new_cancel_event(False)
     try:
         run_ts = _new_run_ts()
+        _apply_capture_env(save_screens, save_html, save_errors_only)
         url, model, _, _ = _apply_ollama_env(
             ollama_url,
             ollama_model,
@@ -1443,7 +1462,7 @@ def build_app() -> gr.Blocks:
         initial_models: List[str] = [MODEL_PLACEHOLDER]
         initial_model = MODEL_PLACEHOLDER
 
-        with gr.Accordion("Ollama & Global Settings", open=True):
+        with gr.Accordion("Ollama & Global Settings", open=False):
             with gr.Row():
                 ollama_url = gr.Textbox(
                     label="OLLAMA_URL",
@@ -1492,6 +1511,10 @@ def build_app() -> gr.Blocks:
                 )
                 debug = gr.Checkbox(label="Debug logging", value=False)
                 ollama_debug = gr.Checkbox(label="Ollama debug", value=False)
+            with gr.Row():
+                save_screens = gr.Checkbox(label="Save screenshots", value=False)
+                save_html = gr.Checkbox(label="Save HTML", value=False)
+                save_errors_only = gr.Checkbox(label="Only save on errors", value=True)
 
         with gr.Tabs():
             with gr.TabItem("Order of Worship"):
@@ -1520,11 +1543,11 @@ def build_app() -> gr.Blocks:
                     )
                     parallel_processing = gr.Checkbox(
                         label="Parallel scraping (multi-process)",
-                        value=False,
+                        value=True,
                     )
                     max_procs = gr.Number(
                         label="Max parallel processes (0 = all)",
-                        value=0,
+                        value=2,
                         precision=0,
                     )
 
@@ -1648,6 +1671,9 @@ def build_app() -> gr.Blocks:
                 max_procs,
                 top_n,
                 debug,
+                save_screens,
+                save_html,
+                save_errors_only,
             ],
             outputs=[progress_log, output_zip],
         )
@@ -1724,6 +1750,9 @@ def build_app() -> gr.Blocks:
                 ollama_models_path,
                 ollama_debug,
                 debug,
+                save_screens,
+                save_html,
+                save_errors_only,
             ],
             outputs=[single_log, single_pdf],
         )
