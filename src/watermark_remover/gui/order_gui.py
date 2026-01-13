@@ -43,6 +43,22 @@ DEFAULT_OLLAMA_HOST = "127.0.0.1:11434"
 MODEL_PLACEHOLDER = "(connect to Ollama to load models)"
 _CANCEL_LOCK = threading.Lock()
 _CANCEL_EVENT: Any | None = None
+ORDER_GUI_CSS = """
+#order-upload .file,
+#order-upload .file-upload,
+#order-upload .file-preview {
+  min-height: 140px;
+}
+#instruction-prompt textarea {
+  min-height: 140px;
+  height: 140px;
+}
+#download-zip .file,
+#download-zip .file-upload,
+#download-zip .file-preview {
+  min-height: 72px;
+}
+"""
 
 
 def _ensure_dir(path: Path) -> None:
@@ -459,6 +475,14 @@ def cancel_order_processing() -> Tuple[str, None, List[Tuple[str, str]]]:
     return message, None, []
 
 
+def _enable_cancel_button() -> gr.update:
+    return gr.update(interactive=True)
+
+
+def _disable_cancel_button() -> gr.update:
+    return gr.update(interactive=False)
+
+
 
 
 def check_ollama(
@@ -777,6 +801,31 @@ def _build_song_rows(
     return rows
 
 
+def _sanitize_song_rows(
+    rows: Any,
+    base_rows: Any,
+) -> Tuple[List[List[Any]], List[List[Any]]]:
+    current = _coerce_rows(rows)
+    base = _coerce_rows(base_rows)
+    sanitized: List[List[Any]] = []
+
+    if not base:
+        for row in current:
+            fixed = list(row)[: len(TABLE_HEADERS)]
+            if len(fixed) < len(TABLE_HEADERS):
+                fixed.extend([""] * (len(TABLE_HEADERS) - len(fixed)))
+            fixed[0] = bool(fixed[0])
+            sanitized.append(fixed)
+        return sanitized, sanitized
+
+    for idx, base_row in enumerate(base):
+        include = bool(base_row[0]) if base_row else True
+        if idx < len(current) and current[idx]:
+            include = bool(current[idx][0])
+        sanitized.append([include] + list(base_row[1:]))
+    return sanitized, sanitized
+
+
 def _coerce_rows(rows: Any) -> List[List[Any]]:
     if rows is None:
         return []
@@ -937,16 +986,16 @@ def analyze_order(
     ollama_models_path: str,
     ollama_debug: bool,
     debug: bool,
-) -> Tuple[List[List[Any]], Dict[str, Any], str, str, None, str, str]:
+) -> Tuple[List[List[Any]], Dict[str, Any], str, str, None, str, str, List[List[Any]]]:
     """Extract songs from an order-of-worship PDF for review."""
     if not pdf_file:
-        return [], {}, "Upload a PDF to begin.", "", None, "", ""
+        return [], {}, "Upload a PDF to begin.", "", None, "", "", []
 
     try:
         stored_path = _store_upload(pdf_file)
     except Exception as exc:
         LOGGER.exception("Failed to store upload")
-        return [], {}, f"Failed to store upload: {exc}", "", None, "", ""
+        return [], {}, f"Failed to store upload: {exc}", "", None, "", "", []
 
     url, model, host, models_path = _apply_ollama_env(
         ollama_url,
@@ -978,7 +1027,7 @@ def analyze_order(
             tail = _read_llm_trace_tail()
             if tail:
                 debug_text = f"{debug_text}\n\nLLM trace (tail):\n{tail}"
-        return [], {}, health_status, "", None, health_status, debug_text
+        return [], {}, health_status, "", None, health_status, debug_text, []
 
     state: Dict[str, Any] = {
         "pdf_name": stored_path,
@@ -996,7 +1045,7 @@ def analyze_order(
             tail = _read_llm_trace_tail()
             if tail:
                 debug_text = f"{debug_text}\n\nLLM trace (tail):\n{tail}"
-        return [], {}, f"Song extraction failed: {exc}", "", None, health_status, debug_text
+        return [], {}, f"Song extraction failed: {exc}", "", None, health_status, debug_text, []
 
     songs = extracted.get("songs", {}) or {}
     rows = _build_song_rows(songs, _safe_str(default_instrument))
@@ -1026,7 +1075,16 @@ def analyze_order(
         tail = _read_llm_trace_tail()
         if tail:
             debug_text = f"{debug_text}\n\nLLM trace (tail):\n{tail}"
-    return rows, order_state, status, "", None, health_status, debug_text
+    return (
+        rows,
+        order_state,
+        status,
+        "",
+        None,
+        health_status,
+        debug_text,
+        rows,
+    )
 
 
 def run_processing(
@@ -1616,41 +1674,42 @@ def build_app() -> gr.Blocks:
                     label="Show Selenium preview (snapshots)",
                     value=False,
                 )
+            with gr.Row():
+                top_n = gr.Slider(
+                    1,
+                    5,
+                    value=3,
+                    step=1,
+                    label="Max candidates per song",
+                )
+                parallel_processing = gr.Checkbox(
+                    label="Parallel scraping (multi-process)",
+                    value=True,
+                )
+                max_procs = gr.Number(
+                    label="Max parallel processes (0 = all)",
+                    value=2,
+                    precision=0,
+                )
 
         with gr.Tabs():
             with gr.TabItem("Order of Worship"):
                 gr.Markdown(
                     "Upload a service order, extract songs, confirm selections, then run the pipeline."
                 )
-                with gr.Row():
-                    pdf_file = gr.File(
-                        label="Order of Worship PDF",
-                        file_types=[".pdf"],
-                        type="filepath",
-                    )
-                    instruction = gr.Textbox(
-                        label="Instruction / prompt (used for extraction)",
-                        value="Download the songs for the French Horn.",
-                        lines=4,
-                    )
-
-                with gr.Row():
-                    top_n = gr.Slider(
-                        1,
-                        5,
-                        value=3,
-                        step=1,
-                        label="Max candidates per song",
-                    )
-                    parallel_processing = gr.Checkbox(
-                        label="Parallel scraping (multi-process)",
-                        value=True,
-                    )
-                    max_procs = gr.Number(
-                        label="Max parallel processes (0 = all)",
-                        value=2,
-                        precision=0,
-                    )
+                pdf_file = gr.File(
+                    label="Order of Worship PDF",
+                    file_types=[".pdf"],
+                    type="filepath",
+                    height=140,
+                    elem_id="order-upload",
+                )
+                instruction = gr.Textbox(
+                    label="Instruction / prompt (used for extraction)",
+                    value="Download the songs for the French Horn.",
+                    lines=4,
+                    elem_id="instruction-prompt",
+                )
 
                 analyze_btn = gr.Button("Analyze order")
                 status = gr.Markdown()
@@ -1658,14 +1717,16 @@ def build_app() -> gr.Blocks:
                 songs_table = gr.Dataframe(
                     headers=TABLE_HEADERS,
                     datatype=TABLE_TYPES,
-                    row_count=(1, "dynamic"),
-                    col_count=(len(TABLE_HEADERS), "fixed"),
+                    row_count=1,
+                    column_count=(len(TABLE_HEADERS), "fixed"),
                     interactive=True,
-                    label="Detected songs (edit before running)",
+                    static_columns=list(range(1, len(TABLE_HEADERS))),
+                    label="Detected songs",
                 )
 
-                run_btn = gr.Button("Run pipeline")
-                cancel_btn = gr.Button("Cancel run")
+                with gr.Row():
+                    run_btn = gr.Button("Run pipeline")
+                    cancel_btn = gr.Button("Cancel run", interactive=False)
                 progress_log = gr.Textbox(
                     label="Progress",
                     lines=12,
@@ -1676,7 +1737,7 @@ def build_app() -> gr.Blocks:
                     columns=2,
                     visible=False,
                 )
-                output_zip = gr.File(label="Download zip")
+                output_zip = gr.File(label="Download zip", height=72, elem_id="download-zip")
 
             with gr.TabItem("Single Song"):
                 gr.Markdown(
@@ -1737,6 +1798,7 @@ def build_app() -> gr.Blocks:
                 manual_pdf = gr.File(label="Manual images PDF")
 
         order_state = gr.State({})
+        song_rows_state = gr.State([])
         ollama_proc_state = gr.State({})
 
         analyze_btn.click(
@@ -1760,10 +1822,16 @@ def build_app() -> gr.Blocks:
                 output_zip,
                 ollama_status,
                 ollama_debug_out,
+                song_rows_state,
             ],
         )
 
-        run_btn.click(
+        run_event = run_btn.click(
+            _enable_cancel_button,
+            outputs=[cancel_btn],
+            queue=False,
+        )
+        run_event = run_event.then(
             run_processing,
             inputs=[
                 songs_table,
@@ -1787,6 +1855,12 @@ def build_app() -> gr.Blocks:
                 output_zip,
                 preview_gallery,
             ],
+            show_progress_on=progress_log,
+        )
+        run_event.then(
+            _disable_cancel_button,
+            outputs=[cancel_btn],
+            queue=False,
         )
 
         cancel_btn.click(
@@ -1796,6 +1870,12 @@ def build_app() -> gr.Blocks:
                 output_zip,
                 preview_gallery,
             ],
+        )
+
+        songs_table.change(
+            _sanitize_song_rows,
+            inputs=[songs_table, song_rows_state],
+            outputs=[songs_table, song_rows_state],
         )
 
         preview_enabled.change(
@@ -1929,6 +2009,7 @@ def launch(host: str = "127.0.0.1", port: int = 7860, share: bool = True) -> Non
         server_port=port,
         share=share,
         allowed_paths=[str(Path(os.getcwd()) / "output")],
+        css=ORDER_GUI_CSS,
     )
 
 

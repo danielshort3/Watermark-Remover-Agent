@@ -59,6 +59,12 @@ def _create_dummy_images(directory: str, count: int = 2) -> Iterable[str]:
 
 def test_image_processing_pipeline() -> None:
     """End‑to‑end test of watermark removal, upscaling and PDF assembly."""
+    try:
+        import torch  # type: ignore
+    except Exception:
+        # Skip the heavy pipeline if torch is unavailable
+        return
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create an input directory with dummy images
         input_dir = os.path.join(tmpdir, "input")
@@ -69,93 +75,62 @@ def test_image_processing_pipeline() -> None:
         vdsr_model = os.path.join(tmpdir, "vdsr_model")
         os.makedirs(wmr_model)
         os.makedirs(vdsr_model)
-    try:
-        import torch  # type: ignore
-    except Exception:
-        # Skip the heavy pipeline if torch is unavailable
-        return
-    # Run watermark removal (random weights if no checkpoints)
-    processed_dir = remove_watermark(input_dir=input_dir, model_dir=wmr_model, output_dir=os.path.join(tmpdir, "processed"))
-    assert os.path.isdir(processed_dir)
-    processed_images = [f for f in os.listdir(processed_dir) if f.lower().endswith(".png")]
-    assert len(processed_images) == 3
-    # Run upscaling (random weights if no checkpoints)
-    upscaled_dir = upscale_images(input_dir=processed_dir, model_dir=vdsr_model, output_dir=os.path.join(tmpdir, "upscaled"))
-    assert os.path.isdir(upscaled_dir)
-    upscaled_images = [f for f in os.listdir(upscaled_dir) if f.lower().endswith(".png")]
-    assert len(upscaled_images) == 3
-    # Assemble into a PDF
-    pdf_path = assemble_pdf(image_dir=upscaled_dir, output_pdf=os.path.join(tmpdir, "output.pdf"))
-    assert os.path.isfile(pdf_path)
+
+        # Run watermark removal (random weights if no checkpoints)
+        processed_dir = remove_watermark.invoke(
+            {"input_dir": input_dir, "model_dir": wmr_model, "output_dir": os.path.join(tmpdir, "processed")}
+        )
+        assert os.path.isdir(processed_dir)
+        processed_images = [f for f in os.listdir(processed_dir) if f.lower().endswith(".png")]
+        assert len(processed_images) == 3
+        # Run upscaling (random weights if no checkpoints)
+        upscaled_dir = upscale_images.invoke(
+            {"input_dir": processed_dir, "model_dir": vdsr_model, "output_dir": os.path.join(tmpdir, "upscaled")}
+        )
+        assert os.path.isdir(upscaled_dir)
+        upscaled_images = [f for f in os.listdir(upscaled_dir) if f.lower().endswith(".png")]
+        assert len(upscaled_images) == 3
+        # Assemble into a PDF
+        pdf_path = assemble_pdf.invoke({"image_dir": upscaled_dir, "output_pdf": os.path.join(tmpdir, "output.pdf")})
+        assert os.path.isfile(pdf_path)
 
 
-def test_scrape_music_found_and_missing_key() -> None:
-    """scrape_music should locate a matching title and key or raise a ValueError with suggestions."""
-    # Create a temporary library under the project's data/samples directory.  We use
-    # the repository root to match scrape_music's hardcoded search path.
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    data_samples = os.path.join(repo_root, "data", "samples")
-    # Ensure the data/samples directory exists
-    os.makedirs(data_samples, exist_ok=True)
-    # Record the directories we create for cleanup
-    created_paths = []
-    try:
-        # Create a song directory with two keys
-        song_dir = os.path.join(data_samples, "FurElise")
-        key_c_dir = os.path.join(song_dir, "C")
-        key_g_dir = os.path.join(song_dir, "G")
-        for path in [key_c_dir, key_g_dir]:
-            os.makedirs(path, exist_ok=True)
-            created_paths.append(path)
-            # Populate with dummy images
-            img = Image.new("RGB", (64, 64), color=(255, 255, 255))
-            img.save(os.path.join(path, "page1.png"))
-        # Change working directory to the repository root so that
-        # scrape_music resolves "data/samples" correctly
-        cwd = os.getcwd()
-        os.chdir(repo_root)
+def test_scrape_music_uses_explicit_directory() -> None:
+    """scrape_music should copy images from an explicit input_dir without network access."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_dir = os.path.join(tmpdir, "input")
+        os.makedirs(input_dir, exist_ok=True)
+        # Include a key token in the filename so extract_key_from_filename can infer it.
+        img = Image.new("RGB", (64, 64), color=(255, 255, 255))
+        img_name = "dummy_E_001.png"
+        img_path = os.path.join(input_dir, img_name)
+        img.save(img_path)
+
+        old_cwd = os.getcwd()
+        old_run_ts = os.environ.get("RUN_TS")
+        os.environ["RUN_TS"] = "TEST_RUN"
+        os.chdir(tmpdir)
         try:
-            # 1. Exact match for C key
-            result = scrape_music(title="FurElise", instrument="piano", key="C", input_dir=os.path.join(repo_root, "does_not_exist"))
-            assert result.endswith(os.path.join("FurElise", "C"))
-            # 2. Missing key should raise ValueError with suggestions
-            try:
-                scrape_music(title="FurElise", instrument="piano", key="Bb", input_dir=os.path.join(repo_root, "still_missing"))
-            except ValueError as ex:
-                msg = str(ex)
-                assert "Requested key" in msg
-                assert "Available keys" in msg
-            else:
-                # If no error, the test fails
-                assert False, "Expected ValueError when key is missing"
-            # 3. Missing title should raise FileNotFoundError
-            try:
-                scrape_music(title="NoSong", instrument="piano", key="C", input_dir=os.path.join(repo_root, "nope"))
-            except FileNotFoundError:
-                pass
-            else:
-                assert False, "Expected FileNotFoundError when title not found"
+            out_dir = scrape_music.invoke(
+                {
+                    "title": "FurElise",
+                    "instrument": "piano",
+                    "key": "C",
+                    "input_dir": input_dir,
+                }
+            )
         finally:
-            # Restore the previous working directory
-            os.chdir(cwd)
-    finally:
-        # Cleanup the directories we created
-        for path in created_paths:
-            # Remove dummy image
-            try:
-                os.remove(os.path.join(path, "page1.png"))
-            except Exception:
-                pass
-            # Remove directory
-            try:
-                os.rmdir(path)
-            except Exception:
-                pass
-        # Remove the song directory and possibly the samples directory if empty
-        try:
-            os.rmdir(os.path.join(data_samples, "FurElise"))
-        except Exception:
-            pass
+            os.chdir(old_cwd)
+            if old_run_ts is None:
+                os.environ.pop("RUN_TS", None)
+            else:
+                os.environ["RUN_TS"] = old_run_ts
+
+        assert isinstance(out_dir, str)
+        assert os.path.isdir(out_dir)
+        assert os.path.isfile(os.path.join(out_dir, img_name))
+        # The inferred key ("E") should be reflected in the log folder structure.
+        assert out_dir.endswith(os.path.join("FurElise", "unknown", "E", "piano", "1_original"))
 
 
 def test_ensure_order_pdf_creates_zero_index_file() -> None:

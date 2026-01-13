@@ -1475,28 +1475,11 @@ def scrape_music(
 ) -> str | list[dict]:
     """Return a directory (or directories) of sheet music images for the requested title/key.
 
-    This implementation searches a local library under ``data/samples`` for a
-    matching piece.  If the exact title and key are not found, it will
-    attempt to locate the title in a different key and generate
-    transposition suggestions using the helper functions in
-    ``watermark_remover.utils.transposition_utils``.  These suggestions
-    allow the agent to ask the user to choose an alternate instrument
-    and key when the requested key does not exist.
-
-    In summary, the search proceeds as follows:
-
-    * If ``input_dir`` exists and contains images, return it directly.
-    * Otherwise, search ``data/samples`` for a subdirectory whose name
-      matches the requested ``title`` (case‑insensitive).  This
-      directory is expected to contain subdirectories for each key or
-      arrangement.
-    * Within the matching title directory, look for a subdirectory
-      matching ``key`` (case‑insensitive).  If found, return it.
-    * If the key is not available, compute alternative instrument/key
-      combinations via ``get_transposition_suggestions`` and raise a
-      ``ValueError`` with a descriptive message.  The agent can use
-      this message to ask the user how to proceed.
-    * If no matching title directory is found, raise ``FileNotFoundError``.
+    Behavior:
+    - If ``input_dir`` is provided (and is not the default library root) and contains images,
+      copy them into the run log folder structure and return the ``1_original`` directory.
+    - Otherwise, scrape preview sheet images from PraiseCharts via Selenium.
+    - When ``top_n`` > 1, may return multiple candidates with per-candidate metadata.
 
     Parameters
     ----------
@@ -1521,11 +1504,7 @@ def scrape_music(
     Raises
     ------
     FileNotFoundError
-        If no suitable piece is found in the local library.
-    ValueError
-        If the title is found but the requested key is missing.  The
-        exception message includes suggestions for alternative keys and
-        instruments.
+        If no downloadable preview can be found for the requested title.
     """
     start = time.perf_counter()
     # Normalise key for matching and suggestions
@@ -1797,19 +1776,11 @@ def scrape_music(
                 pass
             return results[0]['image_dir']  # type: ignore[index]
         return results
-    # If scraping failed, compute transposition suggestions for the agent to
-    # potentially present to the user.  We always raise an error here
-    # because there is no local library fallback.
-    suggestions = []
-    try:
-        suggestions = get_transposition_suggestions(instrument, norm_key)
-    except Exception:
-        suggestions = []
-    sugg_str = ", ".join([
-        f"{inst}/{k}" for inst, k in suggestions
-    ]) if suggestions else "none"
+    # If scraping failed, raise a clear error. We intentionally avoid including
+    # transposition suggestions here because we do not have a reliable list of
+    # available keys/instruments without a successful match.
     raise FileNotFoundError(
-        f"No matching piece for '{title}' in key '{key}'. Suggestions: {sugg_str}"
+        f"No matching downloadable preview found for '{title}' (instrument '{instrument}', key '{key}')."
     )
 
     # ------------------------------------------------------------------
@@ -2378,6 +2349,7 @@ def _scrape_with_selenium(
         # Set of attempted song identifiers to avoid infinite loops
         attempted: set[tuple[str, str]] = set()
         selected = None
+        selected_product_label: str | None = None
         artist_name = ''
         song_index = None
         # Loop until a song with orchestration is found or candidates are exhausted
@@ -2466,6 +2438,7 @@ def _scrape_with_selenium(
                     continue
                 # Allow the page to load
                 time.sleep(random.uniform(1.0, 2.0))
+                candidate_product_label: str | None = None
                 # Now operate within the new tab: click chords and orchestration
                 try:
                     SeleniumHelper.click_element(
@@ -2494,13 +2467,17 @@ def _scrape_with_selenium(
                             keywords.append("vocal")
                         return keywords
 
-                    def _select_product_from_modal() -> bool:
+                    def _select_product_from_modal() -> str | None:
                         try:
-                            items = driver.find_elements(By.XPATH, XPATHS.get("product_modal_items", ""))
+                            items = driver.find_elements(
+                                By.XPATH,
+                                XPATHS.get("product_modal_items", ""),
+                            )
                         except Exception:
                             items = []
                         if not items:
-                            return False
+                            return None
+
                         candidates: list[tuple[str, Any]] = []
                         for el in items:
                             try:
@@ -2510,28 +2487,40 @@ def _scrape_with_selenium(
                             if text:
                                 candidates.append((text, el))
                         if not candidates:
-                            return False
-                        chosen = None
+                            return None
+
+                        chosen_el: Any | None = None
                         for keyword in _modal_keywords_for_instrument(instrument):
                             for text, el in candidates:
                                 if keyword in text.lower():
-                                    chosen = el
+                                    chosen_el = el
                                     break
-                            if chosen:
+                            if chosen_el:
                                 break
-                        if chosen is None:
-                            chosen = candidates[0][1]
+                        if chosen_el is None:
+                            chosen_el = candidates[0][1]
+
                         try:
-                            logger.info("SCRAPER: selecting product '%s' from modal", (chosen.text or "").strip())
+                            chosen_text = (chosen_el.text or "").strip()
                         except Exception:
-                            pass
+                            chosen_text = ""
+                        if chosen_text:
+                            try:
+                                logger.info(
+                                    "SCRAPER: selecting product '%s' from modal",
+                                    chosen_text,
+                                )
+                            except Exception:
+                                pass
+
                         try:
-                            chosen.click()
+                            chosen_el.click()
                         except Exception:
                             try:
-                                driver.execute_script("arguments[0].click();", chosen)
+                                driver.execute_script("arguments[0].click();", chosen_el)
                             except Exception:
-                                return False
+                                return None
+
                         # Wait briefly for modal to close or page to update.
                         for _ in range(30):
                             time.sleep(0.2)
@@ -2540,78 +2529,131 @@ def _scrape_with_selenium(
                                     break
                             except Exception:
                                 break
-                        return True
+                        return chosen_text
 
-                    if _select_product_from_modal():
+                    modal_label = _select_product_from_modal()
+                    if modal_label is not None:
                         orch_ok = True
+                        candidate_product_label = modal_label or None
                     else:
                         orch_ok = SeleniumHelper.click_element(
-                            driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug
+                            driver,
+                            XPATHS['orchestration_header'],
+                            timeout=5,
+                            log_func=logger.debug,
                         )
                         time.sleep(random.uniform(0.5, 1.0))
                 except Exception:
                     orch_ok = False
+
                 if not orch_ok:
-                    # Try LLM-guided recovery to open orchestration before skipping
-                    advice = _llm_error_doctor({
-                        "step": "open_orchestration",
-                        "url": driver.current_url if hasattr(driver, 'current_url') else '',
-                        "title": cand.get('title', 'unknown'),
-                    })
+                    # Try LLM-guided recovery to open orchestration before skipping.
+                    advice = _llm_error_doctor(
+                        {
+                            "step": "open_orchestration",
+                            "url": driver.current_url if hasattr(driver, 'current_url') else '',
+                            "title": cand.get('title', 'unknown'),
+                        }
+                    )
                     action = advice.get("action") if isinstance(advice, dict) else None
                     if action:
                         try:
                             logger.info(
-                                "ERROR_DOCTOR action=%s why=%s", action, advice.get('why', ''),
-                                extra={"button_text": "", "xpath": XPATHS.get('orchestration_header', ''), "url": driver.current_url, "screenshot": ""},
+                                "ERROR_DOCTOR action=%s why=%s",
+                                action,
+                                advice.get("why", ""),
+                                extra={
+                                    "button_text": "",
+                                    "xpath": XPATHS.get("orchestration_header", ""),
+                                    "url": driver.current_url,
+                                    "screenshot": "",
+                                },
                             )
                         except Exception:
                             pass
                     try:
                         if action == "scroll_to_orchestration":
-                            el = SeleniumHelper.find_element(driver, XPATHS['orchestration_header'], timeout=3, log_func=None)
+                            el = SeleniumHelper.find_element(
+                                driver, XPATHS["orchestration_header"], timeout=3, log_func=None
+                            )
                             if el:
                                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                                 time.sleep(0.3)
-                                orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                                orch_ok = SeleniumHelper.click_element(
+                                    driver, XPATHS["orchestration_header"], timeout=5, log_func=logger.debug
+                                )
                         elif action == "click_chords_then_orchestration":
-                            SeleniumHelper.click_element(driver, XPATHS['chords_button'], timeout=5, log_func=logger.debug)
+                            SeleniumHelper.click_element(driver, XPATHS["chords_button"], timeout=5, log_func=logger.debug)
                             time.sleep(0.4)
-                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                            orch_ok = SeleniumHelper.click_element(
+                                driver, XPATHS["orchestration_header"], timeout=5, log_func=logger.debug
+                            )
                         elif action == "refresh_page":
                             driver.refresh()
                             time.sleep(1.0)
-                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                            orch_ok = SeleniumHelper.click_element(
+                                driver, XPATHS["orchestration_header"], timeout=5, log_func=logger.debug
+                            )
                         elif action == "wait_longer":
                             time.sleep(1.0)
-                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                            orch_ok = SeleniumHelper.click_element(
+                                driver, XPATHS["orchestration_header"], timeout=5, log_func=logger.debug
+                            )
                         elif action == "reopen_orchestration":
-                            orch_ok = SeleniumHelper.click_element(driver, XPATHS['orchestration_header'], timeout=5, log_func=logger.debug)
+                            orch_ok = SeleniumHelper.click_element(
+                                driver, XPATHS["orchestration_header"], timeout=5, log_func=logger.debug
+                            )
                         elif action == "back_to_results":
                             orch_ok = False
                     except Exception:
                         pass
-                    if not orch_ok:
-                        # Close the tab and switch back to the original search results tab.
-                        try:
-                            driver.close()
-                        except Exception:
-                            pass
-                        try:
-                            driver.switch_to.window(original_window)
-                        except Exception:
-                            pass
-                        logger.info(
-                            "SCRAPER: candidate '%s' has no orchestration; skipping",
-                            cand.get('title', 'unknown'),
-                        )
-                        # Skip to the next candidate without re‑running the search.
-                        continue
-                else:
-                    # Orchestration opened successfully in the new tab
+
+                if orch_ok:
+                    # Orchestration/product selection succeeded.
                     selected = cand
+                    selected_product_label = candidate_product_label
                     found_candidate = True
                     break
+
+                # Some products (e.g., chords/lyrics) have preview sheets but no orchestration section.
+                # If preview images are present, proceed without orchestration instead of skipping.
+                try:
+                    preview_els = SeleniumHelper.find_elements(
+                        driver,
+                        XPATHS.get("image_element", ""),
+                        timeout=2,
+                        log_func=None,
+                    )
+                except Exception:
+                    preview_els = []
+                if preview_els:
+                    try:
+                        logger.info(
+                            "SCRAPER: candidate '%s' has no orchestration; proceeding with preview sheets only",
+                            cand.get("title", "unknown"),
+                        )
+                    except Exception:
+                        pass
+                    selected = cand
+                    selected_product_label = candidate_product_label
+                    found_candidate = True
+                    break
+
+                # Close the tab and switch back to the original search results tab.
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+                try:
+                    driver.switch_to.window(original_window)
+                except Exception:
+                    pass
+                logger.info(
+                    "SCRAPER: candidate '%s' has no orchestration; skipping",
+                    cand.get("title", "unknown"),
+                )
+                # Skip to the next candidate without re-running the search.
+                continue
             # Break outer loop if a candidate with orchestration was found
             if found_candidate:
                 break
@@ -2901,27 +2943,34 @@ def _scrape_with_selenium(
         # Gather available instruments
         available_instruments: list[str] = []
         selected_instrument: str | None = None
-        # Open parts (instrument) menu.  If it cannot be opened, skip this candidate.
+        # Open parts (instrument) menu. If it cannot be opened, continue with the default preview.
         parts_menu_ok = SeleniumHelper.click_element(
             driver, XPATHS['parts_button'], timeout=5, log_func=logger.debug
         )
         # Random delay to mimic human interaction after opening the parts menu
         time.sleep(random.uniform(0.3, 0.8))
         if not parts_menu_ok:
-            logger.info(
-                "SCRAPER: unable to open parts menu for '%s'; skipping candidate",
-                selected.get('title', title) if selected else title,
-            )
+            # Not all products have per-instrument parts (e.g., chords/lyrics).
+            # Proceed with the currently selected preview, using the modal product label as a best-effort
+            # instrument name for output naming/metadata.
             try:
-                driver.back()
-                time.sleep(1)
+                chosen_title = selected.get('title', title) if selected else title
+            except Exception:
+                chosen_title = title
+            selected_instrument = (selected_product_label or instrument) or None
+            try:
+                logger.info(
+                    "SCRAPER: unable to open parts menu for '%s'; proceeding without part selection",
+                    chosen_title,
+                )
             except Exception:
                 pass
-            return None
         # Locate the parent element for the parts menu and collect buttons
-        parts_parent_el = SeleniumHelper.find_element(
-            driver, XPATHS['parts_parent'], timeout=5, log_func=logger.debug
-        )
+        parts_parent_el = None
+        if parts_menu_ok:
+            parts_parent_el = SeleniumHelper.find_element(
+                driver, XPATHS['parts_parent'], timeout=5, log_func=logger.debug
+            )
         parts_buttons = []
         try:
             from selenium.webdriver.common.by import By  # type: ignore

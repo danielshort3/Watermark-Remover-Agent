@@ -366,6 +366,18 @@ def _resolve_pdf_from_instruction(
     best_detail["score"] = best_score
     best_detail["resolved_name"] = candidate["name"]
     best_detail["path"] = candidate["path"]
+
+    if combined_dates and "matched_pdf_date" not in best_detail:
+        pdf_date = candidate.get("pdf_date")
+        if pdf_date is None:
+            try:
+                pdf_date = _determine_order_folder_from_pdf(state, candidate["path"])
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                _record_error(state, "pdf_resolution.date_probe_exception", exc)
+                pdf_date = None
+            candidate["pdf_date"] = pdf_date
+        if pdf_date and pdf_date in combined_dates:
+            best_detail["matched_pdf_date"] = pdf_date
     return candidate["path"], best_detail
 
 def _get_run_id(state: Dict[str, Any]) -> str:
