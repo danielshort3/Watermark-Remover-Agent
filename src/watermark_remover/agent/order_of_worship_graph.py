@@ -1,10 +1,10 @@
 """LangGraph pipeline for processing an order of worship PDF with extensive debugging
-and LLM-only natural-language handling (no heuristic NLP).
+and LLM-assisted natural-language handling.
 
 Key changes:
 - Adds robust debugging (run IDs, per-node timings, structured errors, persisted artifacts).
-- Delegates parsing to run_instruction (agent-backed, with direct-LLM fallback) to extract song metadata.
-- Removes all regex/rule-based NLP parsing for instructions and songs.
+- Delegates parsing to run_instruction (agent-backed, with direct-LLM fallback) to extract metadata.
+- Uses deterministic bracket-pattern extraction as song ground truth and reconciles LLM output against it.
 
 Debug artifacts are written to:
   output/logs/<RUN_TS>/orders/<order_folder or 'unknown_date'>/<run_id>/
@@ -209,6 +209,163 @@ def _normalize_extracted_key(value: str) -> str:
         normalized = normalize_key(match.group(1))
         return normalized or raw
     return raw
+
+
+def _normalize_song_token(value: str) -> str:
+    """Normalize free-form song text for stable matching."""
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _split_artist_and_key(segment: str) -> Tuple[str, str]:
+    """Split '<artist> in <key>' text, using the final ' in ' delimiter."""
+    text = (segment or "").strip()
+    if not text:
+        return "", ""
+    matches = list(re.finditer(r"\s+in\s+", text, flags=re.IGNORECASE))
+    if not matches:
+        return "", ""
+    last = matches[-1]
+    artist = text[: last.start()].strip()
+    key = _normalize_extracted_key(text[last.end() :].strip())
+    return artist, key
+
+
+def _extract_bracket_songs_from_text(pdf_text: str) -> Dict[int, Dict[str, str]]:
+    """Deterministically extract songs from '[ Artist in Key ]' lines."""
+    songs: Dict[int, Dict[str, str]] = {}
+    idx = 0
+    for raw_line in (pdf_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or "[" not in line or "]" not in line:
+            continue
+        match = re.match(r"^(?P<title>.+?)\s*\[\s*(?P<meta>[^\]]+)\s*\]\s*$", line)
+        if not match:
+            continue
+        title = re.sub(r"^\d{1,2}:\d{2}\s+", "", (match.group("title") or "").strip()).strip()
+        if not title:
+            continue
+        artist, key = _split_artist_and_key(match.group("meta") or "")
+        if not key:
+            continue
+        songs[idx] = {"title": title, "artist": artist, "key": key}
+        idx += 1
+    return songs
+
+
+def _normalize_llm_song_map(raw_songs: Any) -> Dict[int, Dict[str, str]]:
+    """Normalize LLM songs payload into index -> {title, artist, key}."""
+    songs: Dict[int, Dict[str, str]] = {}
+    if isinstance(raw_songs, list):
+        iterator = enumerate(raw_songs)
+    elif isinstance(raw_songs, dict):
+        iterator = raw_songs.items()
+    else:
+        return songs
+    for k, v in iterator:
+        try:
+            idx = int(k)
+        except Exception:
+            continue
+        if not isinstance(v, dict):
+            continue
+        songs[idx] = {
+            "title": (v.get("title") or "").strip(),
+            "artist": (v.get("artist") or "").strip(),
+            "key": _normalize_extracted_key((v.get("key") or "").strip()),
+        }
+    return songs
+
+
+def _reconcile_song_map_with_ground_truth(
+    llm_songs: Dict[int, Dict[str, str]],
+    ground_truth_songs: Dict[int, Dict[str, str]],
+) -> Tuple[Dict[int, Dict[str, str]], List[int], List[int]]:
+    """Reconcile extracted songs against deterministic bracket-line ground truth.
+
+    Returns:
+      - reconciled song map
+      - indices that were backfilled due to missing entries
+      - indices that were replaced due to title/index mismatch
+    """
+    reconciled: Dict[int, Dict[str, str]] = {}
+    backfilled: List[int] = []
+    replaced: List[int] = []
+    for idx in sorted(ground_truth_songs.keys()):
+        truth = ground_truth_songs[idx]
+        current = llm_songs.get(idx)
+        if current is None:
+            reconciled[idx] = dict(truth)
+            backfilled.append(idx)
+            continue
+        if _normalize_song_token(current.get("title", "")) != _normalize_song_token(truth.get("title", "")):
+            reconciled[idx] = dict(truth)
+            replaced.append(idx)
+            continue
+        reconciled[idx] = {
+            "title": current.get("title") or truth.get("title", ""),
+            "artist": current.get("artist") or truth.get("artist", ""),
+            "key": _normalize_extracted_key(current.get("key") or truth.get("key", "")),
+        }
+    return reconciled, backfilled, replaced
+
+
+_SONG_SELECTION_CONSTRAINT_PATTERNS: Tuple[str, ...] = (
+    r"\bonly\b",
+    r"\bdo\s+not\b",
+    r"\bdon'?t\b",
+    r"\bexclude\b",
+    r"\bexcept\b",
+    r"\bskip\b",
+    r"\bwithout\b",
+    r"\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
+    r"\b\d+(?:st|nd|rd|th)\b",
+    r"\b(?:song|songs)\s+#?\d+\b",
+    r"\b(?:index|indices)\b",
+)
+
+
+def _has_song_selection_constraints(user_req: str) -> bool:
+    """Best-effort check for include/exclude constraints in user requests."""
+    req = (user_req or "").strip().lower()
+    if not req:
+        return False
+    return any(re.search(pattern, req) is not None for pattern in _SONG_SELECTION_CONSTRAINT_PATTERNS)
+
+
+def _normalize_artist_token(value: str) -> str:
+    """Normalize artist/arrangement text for stable matching."""
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _normalize_key_token(value: str) -> str:
+    """Normalize key text for stable matching."""
+    key = _normalize_extracted_key(value)
+    if not key:
+        return ""
+    normalized = normalize_key(key)
+    return (normalized or key).strip().lower()
+
+
+def _deduplicate_song_entries(
+    songs: Dict[int, Dict[str, str]],
+) -> Tuple[List[Tuple[int, Dict[str, str]]], List[int]]:
+    """Deduplicate songs by normalized title + artist + key, preserving first occurrence."""
+    unique_entries: List[Tuple[int, Dict[str, str]]] = []
+    dropped_indices: List[int] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for idx in sorted(songs.keys()):
+        song = songs[idx]
+        identity = (
+            _normalize_song_token(song.get("title", "")),
+            _normalize_artist_token(song.get("artist", "")),
+            _normalize_key_token(song.get("key", "")),
+        )
+        if identity in seen:
+            dropped_indices.append(idx)
+            continue
+        seen.add(identity)
+        unique_entries.append((idx, song))
+    return unique_entries, dropped_indices
 
 def _normalized_dates_from_string(value: str) -> set[str]:
     """Extract normalized MM_DD_YYYY strings from arbitrary text."""
@@ -569,7 +726,7 @@ def _record_timing(state: Dict[str, Any], segment: str, seconds: float) -> None:
         base = _debug_dir_for(state)
         _write_json(base, "timings.json", timings)
 
-MAX_LLM_RETRIES = int(os.getenv("ORDER_MAX_LLM_RETRIES", "1"))
+MAX_LLM_RETRIES = int(os.getenv("ORDER_MAX_LLM_RETRIES", "2"))
 
 def _extract_json_from_llm_output(raw: Any) -> Any:
     s = str(raw or "").strip()
@@ -583,33 +740,67 @@ def _extract_json_from_llm_output(raw: Any) -> Any:
     if isinstance(raw, (dict, list)):
         return raw
 
-    # Try to extract the outermost JSON object or array
-    lcb, rcb = s.find("{"), s.rfind("}")
-    if lcb != -1 and rcb != -1 and rcb > lcb:
-        try:
-            return json.loads(s[lcb : rcb + 1])
-        except Exception as e:
-            # fall through to try array
-            pass
+    def _strip_code_fences(text: str) -> str:
+        t = (text or "").strip()
+        if not t.startswith("```"):
+            return t
+        # Drop leading fence line (optionally ```json) and trailing ``` if present.
+        lines = t.splitlines()
+        if not lines:
+            return ""
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
 
-    lsb, rsb = s.find("["), s.rfind("]")
-    if lsb != -1 and rsb != -1 and rsb > lsb:
+    def _parse_jsonish(text: str) -> Any:
+        # 1) Strict JSON first.
         try:
-            return json.loads(s[lsb : rsb + 1])
+            return json.loads(text)
         except Exception:
             pass
 
-    # Last attempt: try the whole string (might already be pure JSON)
-    try:
-        return json.loads(s)
-    except Exception as e:
-        raise ValueError(f"Failed to parse LLM output as JSON. First 200 chars: {s[:200]!r}") from e
+        # 2) Safe Python-literal fallback for common LLM mistakes such as:
+        #    {"songs": {0: {...}}} (numeric keys) or single quotes.
+        import ast
+
+        candidate = _strip_code_fences(text)
+        try:
+            obj = ast.literal_eval(candidate)
+        except Exception:
+            obj = None
+        if isinstance(obj, (dict, list)):
+            return obj
+        raise ValueError("Unparseable JSON-ish content.")
+
+    # Try to extract the outermost JSON object or array.
+    attempts: list[str] = []
+    lcb, rcb = s.find("{"), s.rfind("}")
+    if lcb != -1 and rcb != -1 and rcb > lcb:
+        attempts.append(s[lcb : rcb + 1])
+
+    lsb, rsb = s.find("["), s.rfind("]")
+    if lsb != -1 and rsb != -1 and rsb > lsb:
+        attempts.append(s[lsb : rsb + 1])
+
+    attempts.append(s)
+
+    last_err: Exception | None = None
+    for attempt in attempts:
+        try:
+            return _parse_jsonish(attempt)
+        except Exception as exc:
+            last_err = exc
+
+    raise ValueError(f"Failed to parse LLM output as JSON. First 200 chars: {s[:200]!r}") from last_err
 
 def _run_llm_strict_json(
     state: Dict[str, Any],
     label: str,
     prompt: str,
     expected: str = "object",   # "object", "array", or "object_or_array"
+    validator: Optional[Callable[[Any], Tuple[bool, str]]] = None,
 ) -> Any:
     """
     Calls run_instruction with retries and strict 'JSON only' guardrails.
@@ -671,6 +862,11 @@ def _run_llm_strict_json(
                 raise ValueError(f"Expected a JSON array, got {type(parsed).__name__}.")
             if expected == "object_or_array" and not isinstance(parsed, (dict, list)):
                 raise ValueError(f"Expected a JSON object or array, got {type(parsed).__name__}.")
+
+            if validator is not None:
+                is_valid, reason = validator(parsed)
+                if not is_valid:
+                    raise ValueError(reason or "Validator rejected LLM response.")
 
             # Success
             attempts_log.append({"attempt": attempt, "status": "ok", "raw_len": len(str(raw))})
@@ -1531,7 +1727,7 @@ def parser_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """LLM-only extraction of songs from the PDF text; attaches instrument based on defaults and overrides."""
+    """Extract songs from PDF text with LLM + deterministic reconciliation."""
     _ensure_logger_configured(logging.DEBUG if _debug_enabled(state) else logging.INFO)
     start = _start_timer()
     new_state: Dict[str, Any] = dict(state)
@@ -1572,20 +1768,61 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
             base = _debug_dir_for(new_state)
             _write_text(base, "pdf_text.txt", pdf_text)
 
-        # LLM prompt to extract date + songs (JSON only), honoring any user constraints in user_input
+        # Build deterministic ground truth first from bracket-pattern lines.
         user_req = (new_state.get("user_input") or "").strip()
+        ground_truth_songs = _extract_bracket_songs_from_text(pdf_text)
+        has_selection_constraints = _has_song_selection_constraints(user_req)
+        enforce_complete_coverage = bool(ground_truth_songs) and not has_selection_constraints
+        if _debug_enabled(new_state):
+            base = _debug_dir_for(new_state)
+            _write_json(base, "songs_bracket_ground_truth.json", ground_truth_songs)
+
+        # LLM prompt to extract date + songs (JSON only), honoring user constraints in user_input.
         prompt = _build_song_and_date_extractor_prompt(pdf_text, user_req)
         try:
             log_prompt("song_and_date_extractor", prompt)
         except Exception:
             pass
 
-        data = _run_llm_strict_json(
-            state=new_state,
-            label="song_and_date_extractor",
-            prompt=prompt,
-            expected="object",
-        )
+        def _song_payload_validator(payload: Any) -> Tuple[bool, str]:
+            if not enforce_complete_coverage:
+                return True, ""
+            if not isinstance(payload, dict):
+                return False, "Song extractor must return a JSON object."
+            llm_song_map = _normalize_llm_song_map(payload.get("songs"))
+            if len(llm_song_map) < len(ground_truth_songs):
+                return (
+                    False,
+                    f"Incomplete song extraction ({len(llm_song_map)}/{len(ground_truth_songs)} songs).",
+                )
+            for idx, truth in sorted(ground_truth_songs.items()):
+                current = llm_song_map.get(idx)
+                if current is None:
+                    return False, f"Missing song index {idx} in extractor output."
+                if _normalize_song_token(current.get("title", "")) != _normalize_song_token(truth.get("title", "")):
+                    return (
+                        False,
+                        f"Song mismatch at index {idx}: expected '{truth.get('title', '')}', got '{current.get('title', '')}'.",
+                    )
+            return True, ""
+
+        used_fallback = False
+        try:
+            data = _run_llm_strict_json(
+                state=new_state,
+                label="song_and_date_extractor",
+                prompt=prompt,
+                expected="object",
+                validator=_song_payload_validator,
+            )
+        except Exception as exc:
+            used_fallback = True
+            _record_error(new_state, "extract_songs_node.song_extractor_fallback", exc)
+            _logger.warning(
+                "extract_songs_node: falling back to deterministic bracket parser after extractor failure: %s",
+                exc,
+            )
+            data = {"date": "", "songs": ground_truth_songs}
 
         if not isinstance(data, dict):
             raise ValueError(f"Unexpected JSON type from song extractor: {type(data).__name__}")
@@ -1593,6 +1830,8 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
         if _debug_enabled(new_state):
             base = _debug_dir_for(new_state)
             _write_json(base, "songs_and_date_llm_output.json", data)
+            if used_fallback:
+                _write_text(base, "song_extractor_fallback.txt", "Used deterministic bracket parser fallback.")
 
         date_raw = (data.get("date") or "").strip()
         if date_raw and not re.fullmatch(r"\d{2}_\d{2}_\d{4}", date_raw):
@@ -1612,27 +1851,47 @@ def extract_songs_node(state: Dict[str, Any]) -> Dict[str, Any]:
             base = _debug_dir_for(new_state)
             _write_text(base, "date_of_service.txt", date_raw or "unknown")
 
-        # Normalize song entries + attach instrument (structure only)
+        # Normalize song entries + attach instrument (structure only).
         songs: Dict[int, Dict[str, Any]] = {}
-        raw_songs = data.get("songs") if isinstance(data.get("songs"), (dict, list)) else {}
-        if isinstance(raw_songs, list):
-            normalized_songs = {i: v for i, v in enumerate(raw_songs)}
-        elif isinstance(raw_songs, dict):
-            normalized_songs = raw_songs
-        else:
-            normalized_songs = {}
-        for k, v in normalized_songs.items():
-            try:
-                idx = int(k)
-            except Exception:
-                continue
-            if not isinstance(v, dict):
-                continue
+        normalized_songs = _normalize_llm_song_map(data.get("songs"))
+        if enforce_complete_coverage:
+            normalized_songs, backfilled_idxs, replaced_idxs = _reconcile_song_map_with_ground_truth(
+                llm_songs=normalized_songs,
+                ground_truth_songs=ground_truth_songs,
+            )
+            if backfilled_idxs or replaced_idxs:
+                _logger.warning(
+                    "extract_songs_node: reconciled songs with deterministic parser; backfilled=%s replaced=%s",
+                    backfilled_idxs,
+                    replaced_idxs,
+                )
+                if _debug_enabled(new_state):
+                    base = _debug_dir_for(new_state)
+                    _write_json(
+                        base,
+                        "songs_reconciliation.json",
+                        {
+                            "backfilled_indices": backfilled_idxs,
+                            "replaced_indices": replaced_idxs,
+                        },
+                    )
+
+        deduped_entries, dropped_duplicate_idxs = _deduplicate_song_entries(normalized_songs)
+        if dropped_duplicate_idxs:
+            _logger.info(
+                "extract_songs_node: dropped duplicate songs at indices %s (same title+artist+key)",
+                dropped_duplicate_idxs,
+            )
+            if _debug_enabled(new_state):
+                base = _debug_dir_for(new_state)
+                _write_json(base, "songs_deduplicated.json", {"dropped_indices": dropped_duplicate_idxs})
+
+        for new_idx, (src_idx, v) in enumerate(deduped_entries):
             title = (v.get("title") or "").strip()
             artist = (v.get("artist") or "").strip()
             key = _normalize_extracted_key((v.get("key") or "").strip())
-            instrument = overrides.get(idx, default_instrument)
-            songs[idx] = {
+            instrument = overrides.get(src_idx, default_instrument)
+            songs[new_idx] = {
                 "title": title,
                 "artist": artist,
                 "key": key,

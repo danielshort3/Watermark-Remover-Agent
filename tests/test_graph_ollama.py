@@ -23,6 +23,7 @@ repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(repo_root, "src"))
 sys.path.insert(0, repo_root)
 
+from watermark_remover.agent import graph_ollama
 from watermark_remover.agent.graph_ollama import run_instruction
 
 try:
@@ -63,3 +64,13 @@ def test_get_ollama_agent_missing_dependencies():
         return
     # If no exception was raised, ensure the returned agent object is truthy
     assert True
+
+
+def test_strict_json_prompt_detection() -> None:
+    prompt = "Return STRICT JSON with exactly two keys. Return ONLY JSON."
+    assert graph_ollama._looks_like_strict_json_prompt(prompt) is True
+
+
+def test_non_json_prompt_detection() -> None:
+    prompt = "Download 'Only King Forever' for French Horn in A."
+    assert graph_ollama._looks_like_strict_json_prompt(prompt) is False

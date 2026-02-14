@@ -176,6 +176,20 @@ def _trace_event(payload: Dict[str, Any]) -> None:
         pass
 
 
+def _looks_like_strict_json_prompt(prompt: str) -> bool:
+    """Return True when a prompt explicitly asks for JSON-only output."""
+    lowered = (prompt or "").lower()
+    markers = (
+        "return only json",
+        "return only the json",
+        "return strict json",
+        "strict json",
+        "return a single strict json object",
+        "expected top-level type:",
+    )
+    return any(marker in lowered for marker in markers)
+
+
 def _get_llm(base_url: str, model: str) -> Any:
     if ChatOllama is None:
         raise ImportError("ChatOllama is not available; install langchain-ollama.")
@@ -260,22 +274,25 @@ def run_instruction(instruction: str) -> str:
         )
     prompt = user_prompt
     lowered = user_prompt.lower()
-    if ".pdf" in lowered and ("order of worship" in lowered or "order" in lowered):
-        prompt = (
-            user_prompt
-            + "\n\nReminder: When processing an order-of-worship PDF you MUST call the "
-              "ensure_order_pdf tool to copy the source PDF into the output/orders/<date>/ "
-              "directory using a '00_' prefix (e.g. '00_October_12_2025_Order_Of_Worship.pdf')."
-        )
-    elif ".pdf" not in lowered and any(
-        keyword in lowered for keyword in ("download", "find", "locate", "fetch")
-    ):
-        prompt = (
-            user_prompt
-            + "\n\nReminder: When the user requests a specific song (not an order PDF), "
-              "use the scrape_music tool with the requested title/instrument/key, then run "
-              "remove_watermark, upscale_images, and assemble_pdf for that song only."
-        )
+    if not _looks_like_strict_json_prompt(user_prompt):
+        if ".pdf" in lowered and ("order of worship" in lowered or "order" in lowered):
+            prompt = (
+                user_prompt
+                + "\n\nReminder: When processing an order-of-worship PDF you MUST call the "
+                  "ensure_order_pdf tool to copy the source PDF into output/orders/<MM_DD_YYYY>/ "
+                  "directory using a '00_' prefix (for example: "
+                  "00_<Month>_<DD>_<YYYY>_Order_Of_Worship.pdf). "
+                  "Use the date from the user's instruction or the PDF filename; do not assume a fixed date."
+            )
+        elif ".pdf" not in lowered and any(
+            keyword in lowered for keyword in ("download", "find", "locate", "fetch")
+        ):
+            prompt = (
+                user_prompt
+                + "\n\nReminder: When the user requests a specific song (not an order PDF), "
+                  "use the scrape_music tool with the requested title/instrument/key, then run "
+                  "remove_watermark, upscale_images, and assemble_pdf for that song only."
+            )
     base_url_env = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
     model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
     start_ts = time.perf_counter()

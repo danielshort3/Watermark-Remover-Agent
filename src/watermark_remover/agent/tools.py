@@ -67,8 +67,6 @@ from utils.transposition_utils import (
 from utils.selenium_utils import SeleniumHelper, xpaths as XPATHS
 from PIL import Image
 
-SCRAPER_LOOP_LIMIT = max(3, int(os.getenv("WMRA_SCRAPER_LOOP_LIMIT", "12")))
-
 # Optional LLM ranking support (uses local Ollama-backed agent if available).
 # The import is deferred to avoid circular dependencies with graph_ollama.
 _llm_run_instruction: Callable[[str], Any] | None = None
@@ -1641,7 +1639,6 @@ def scrape_music(
                     artist=artist,
                     top_n=1,
                     preserve_order=True,
-                    _retry=False,
                     skip_idents=skips,
                 )
                 if not tmp:
@@ -1915,9 +1912,7 @@ def _scrape_with_selenium(
     *,
     top_n: int = 1,
     preserve_order: bool = False,
-    _retry: bool = False,
     skip_idents: Optional[set[tuple[str, str]]] = None,
-    _loop_guard: int = 0,
 ) -> Optional[str] | Optional[list[dict]]:
     """Attempt to scrape sheet music from an online catalogue.
 
@@ -1956,15 +1951,6 @@ def _scrape_with_selenium(
         from webdriver_manager.chrome import ChromeDriverManager  # type: ignore
     except Exception as e:
         logger.error("SCRAPER: Selenium or webdriver_manager not installed: %s", e)
-        return None
-
-    loop_count = _loop_guard
-    if loop_count >= SCRAPER_LOOP_LIMIT:
-        logger.error(
-            "SCRAPER: exceeded loop limit (%d) while searching for '%s'. Giving up.",
-            SCRAPER_LOOP_LIMIT,
-            title,
-        )
         return None
 
     # Sanitise the title using the unified helper.  This collapses runs
@@ -2311,21 +2297,10 @@ def _scrape_with_selenium(
         song_candidates = perform_search()
         if not song_candidates:
             logger.warning(
-                "SCRAPER: PraiseCharts returned zero song candidates for '%s' (loop %d).",
+                "SCRAPER: PraiseCharts returned zero song candidates for '%s'.",
                 title,
-                _loop_guard + 1,
             )
-            return _scrape_with_selenium(
-                title,
-                instrument,
-                key,
-                artist=artist,
-                top_n=top_n,
-                preserve_order=preserve_order,
-                _retry=True,
-                skip_idents=skip_idents,
-                _loop_guard=_loop_guard + 1,
-            )
+            return None
         preserve = preserve_order or _env_truthy(os.environ.get("WMRA_SCRAPER_PRESERVE_ORDER"))
         if not preserve:
             # Reorder candidates using strict exact(ish) match preference then LLM/fuzzy
@@ -2663,23 +2638,6 @@ def _scrape_with_selenium(
                     "SCRAPER: no orchestration found for any search result of '%s'",
                     title,
                 )
-                # Retry once by restarting search if not yet retried
-                if not _retry:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                    return _scrape_with_selenium(
-                        title,
-                        instrument,
-                        key,
-                        artist=artist,
-                        top_n=top_n,
-                        preserve_order=preserve_order,
-                        _retry=True,
-                        skip_idents=skip_idents,
-                        _loop_guard=_loop_guard + 1,
-                    )
                 return None
         # End of candidate selection loop
         # At this point we are on the product page for the selected song.  We
@@ -3422,7 +3380,7 @@ def _scrape_with_selenium(
             except Exception:
                 pass
             return out_dir
-        # Otherwise, scraping failed for this candidate; close tab and try next candidate via recursive retry
+        # Otherwise, scraping failed for this candidate; close tab and stop.
         logger.warning("SCRAPER: no images downloaded for title '%s'", title)
         try:
             driver.close()
@@ -3432,29 +3390,7 @@ def _scrape_with_selenium(
             driver.switch_to.window(original_window)
         except Exception:
             pass
-        # Build skip set to avoid re-selecting the same candidate
-        try:
-            sel_ident = (selected.get('title', title) if selected else title, artist_name or '')
-        except Exception:
-            sel_ident = (title, artist_name or '')
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        # Merge skip sets
-        new_skips = set(skip_idents) if skip_idents else set()
-        new_skips.add(sel_ident)
-        return _scrape_with_selenium(
-            title,
-            instrument,
-            key,
-            artist=artist,
-            top_n=top_n,
-            preserve_order=preserve_order,
-            _retry=_retry,
-            skip_idents=new_skips,
-            _loop_guard=_loop_guard + 1,
-        )
+        return None
     except Exception as e:
         logger.error("SCRAPER: exception during scraping: %s", e)
         return None
